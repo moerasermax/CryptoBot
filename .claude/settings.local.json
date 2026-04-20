@@ -34,7 +34,9 @@
       "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d[0]['parameters'],indent=2\\)\\)\")",
       "Bash(git init *)",
       "Bash(git config *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git -c user.email=moerasermax@gmail.com -c user.name=Moera commit -m ' *)",
+      "Bash(git -c user.email=\"moerasermax@gmail.com\" -c user.name=\"Moera\" tag -a v0.1-beta -m \"First usable beta release with modular UI, SMA backtesting, and architectural manifesto\")"
     ]
   }
 }
