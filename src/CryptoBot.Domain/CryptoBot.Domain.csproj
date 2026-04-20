@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <RootNamespace>CryptoBot.Domain</RootNamespace>
+  </PropertyGroup>
+
+  <!-- 
+    注意: Domain 層不應該有任何外部依賴
+    這是 Clean Architecture 的核心原則
+  -->
+
+</Project>

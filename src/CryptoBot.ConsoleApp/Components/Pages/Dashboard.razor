@@ -1,0 +1,206 @@
+@page "/"
+@using System.Collections.Generic
+@using System.Linq
+@using CryptoBot.Application.Realtime
+@using CryptoBot.ConsoleApp.Api.Dtos
+@using CryptoBot.ConsoleApp.Realtime
+@using CryptoBot.ConsoleApp.Services
+@using CryptoBot.Domain.Repositories
+@inject IServiceScopeFactory ScopeFactory
+@inject DashboardEventBus Bus
+@implements IDisposable
+
+<PageTitle>CryptoBot · Dashboard</PageTitle>
+
+<section class="grid-cards">
+    <article class="card">
+        <span class="card-label">Total Equity (USDT)</span>
+        <span class="card-value @(_stats is null ? "" : _stats.TotalEquity >= 0 ? "pos" : "neg")">
+            @FormatMoney(_stats?.TotalEquity)
+        </span>
+        <span class="card-footnote">Balance + Unrealized</span>
+    </article>
+
+    <article class="card">
+        <span class="card-label">Today P&amp;L</span>
+        <span class="card-value @(_stats is null ? "" : _stats.TodayPnL >= 0 ? "pos" : "neg")">
+            @FormatSignedMoney(_stats?.TodayPnL)
+        </span>
+        <span class="card-footnote">Realized + Unrealized since UTC 00:00</span>
+    </article>
+
+    <article class="card">
+        <span class="card-label">Active Strategies</span>
+        <span class="card-value">
+            @(_stats?.ActiveStrategyCount.ToString() ?? "—")
+        </span>
+        <span class="card-footnote">Status = Running</span>
+    </article>
+</section>
+
+<section class="panel">
+    <header class="panel-header">
+        <h2>Active Positions</h2>
+        <span class="panel-sub">@(_openPositions.Count) open</span>
+    </header>
+
+    @if (_openPositions.Count == 0)
+    {
+        <div class="empty">No open positions — bot is flat.</div>
+    }
+    else
+    {
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Entry</th>
+                    <th>Mark</th>
+                    <th>uPnL</th>
+                    <th>uPnL %</th>
+                    <th>Opened</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var p in _openPositions)
+                {
+                    <tr>
+                        <td>@p.Symbol</td>
+                        <td class="@(p.Side == "Long" ? "pos" : "neg")">@p.Side</td>
+                        <td>@p.Quantity.ToString("N4")</td>
+                        <td>@p.EntryPrice.ToString("N2")</td>
+                        <td>@(p.CurrentPrice?.ToString("N2") ?? "—")</td>
+                        <td class="@(p.UnrealizedPnL >= 0 ? "pos" : "neg")">@p.UnrealizedPnL.ToString("N4")</td>
+                        <td class="@(p.UnrealizedPnLPercent >= 0 ? "pos" : "neg")">@p.UnrealizedPnLPercent.ToString("N2")%</td>
+                        <td>@p.OpenedAt.ToLocalTime().ToString("HH:mm:ss")</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+<section class="panel">
+    <header class="panel-header">
+        <h2>Recent Trades</h2>
+        <span class="panel-sub">last 10</span>
+    </header>
+
+    @if (_recentTrades.Count == 0)
+    {
+        <div class="empty">No trades yet — waiting for the first signal.</div>
+    }
+    else
+    {
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Avg Fill</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var t in _recentTrades)
+                {
+                    <tr>
+                        <td>@t.CreatedAt.ToLocalTime().ToString("HH:mm:ss")</td>
+                        <td>@t.Symbol</td>
+                        <td class="@(t.Side == "Buy" ? "pos" : "neg")">@t.Side @t.PositionSide</td>
+                        <td>@t.Quantity.ToString("N4")</td>
+                        <td>@(t.AverageFillPrice?.ToString("N2") ?? "—")</td>
+                        <td>@t.Status</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+@code {
+    private DashboardStatsUpdate? _stats;
+    private List<OpenPositionDto> _openPositions = new();
+    private List<RecentTradeDto> _recentTrades = new();
+
+    private Action<DashboardStatsUpdate>? _statsHandler;
+    private Action<TradeFilledUpdate>? _tradeHandler;
+
+    protected override async Task OnInitializedAsync()
+    {
+        // 1) 首屏快照（不等 2s 心跳）
+        await RefreshSnapshotAsync();
+
+        // 2) 訂閱即時推播 — 後續只差異更新，不再整包重拉
+        _statsHandler = OnStatsUpdate;
+        _tradeHandler = OnTradeFilled;
+        Bus.StatsUpdated += _statsHandler;
+        Bus.TradeFilled += _tradeHandler;
+    }
+
+    private async Task RefreshSnapshotAsync()
+    {
+        await using var scope = ScopeFactory.CreateAsyncScope();
+        var sp = scope.ServiceProvider;
+
+        var statsSvc = sp.GetRequiredService<DashboardStatsService>();
+        _stats = await statsSvc.GetAsync();
+
+        var positionRepo = sp.GetRequiredService<IPositionRepository>();
+        var openPositions = await positionRepo.GetOpenPositionsAsync();
+        _openPositions = openPositions.Select(p => new OpenPositionDto(
+            Id: p.Id,
+            Symbol: p.Symbol.BingXFormat,
+            Side: p.Side.ToString(),
+            Quantity: p.Quantity.Value,
+            EntryPrice: p.EntryPrice.Value,
+            CurrentPrice: p.CurrentPrice?.Value,
+            UnrealizedPnL: p.UnrealizedPnL,
+            UnrealizedPnLPercent: p.UnrealizedPnLPercent,
+            OpenedAt: p.OpenedAt)).ToList();
+
+        var orderRepo = sp.GetRequiredService<IOrderRepository>();
+        var orders = await orderRepo.GetRecentAsync(10);
+        _recentTrades = orders
+            .Select(o => new RecentTradeDto(
+                OrderId: o.Id,
+                CreatedAt: o.CreatedAt,
+                Symbol: o.Symbol.BingXFormat,
+                Side: o.Side.ToString(),
+                PositionSide: o.PositionSide.ToString(),
+                Quantity: o.Quantity.Value,
+                AverageFillPrice: o.AverageFillPrice?.Value,
+                Status: o.Status.ToString()))
+            .ToList();
+    }
+
+    private void OnStatsUpdate(DashboardStatsUpdate update)
+    {
+        _stats = update;
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnTradeFilled(TradeFilledUpdate update)
+    {
+        // 收到新成交就整包重拉一次（簡單且精準 — 新 Position / 新 Order 都涵蓋）
+        _ = InvokeAsync(async () =>
+        {
+            await RefreshSnapshotAsync();
+            StateHasChanged();
+        });
+    }
+
+    private static string FormatMoney(decimal? v) => v is null ? "—" : v.Value.ToString("N4");
+    private static string FormatSignedMoney(decimal? v) =>
+        v is null ? "—" : (v.Value >= 0 ? "+" : "") + v.Value.ToString("N4");
+
+    public void Dispose()
+    {
+        if (_statsHandler is not null) Bus.StatsUpdated -= _statsHandler;
+        if (_tradeHandler is not null) Bus.TradeFilled -= _tradeHandler;
+    }
+}

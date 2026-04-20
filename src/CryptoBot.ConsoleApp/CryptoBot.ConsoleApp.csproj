@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>CryptoBot.ConsoleApp</RootNamespace>
+    <!--
+      S15/S16：這個 project 現在同時肩負 CLI 子命令 (backtest) 與 Web UI 指揮中心。
+      Sdk.Web 自動把 Microsoft.AspNetCore.App shared framework 納入，
+      Blazor Server / SignalR / Minimal APIs 都不用額外裝 NuGet。
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Serilog 給 WebApplication 也能用（Serilog.Extensions.Hosting 透過 IHostBuilder 掛接） -->
+    <PackageReference Include="Serilog.Extensions.Hosting" Version="8.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+    <PackageReference Include="Serilog.Settings.Configuration" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CryptoBot.Application\CryptoBot.Application.csproj" />
+    <ProjectReference Include="..\CryptoBot.Infrastructure\CryptoBot.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <!--
+    .NET 10 SDK 下 <Content Include CopyToOutputDirectory> 不會實際拷貝，
+    所以改用明確的 AfterBuild Target + <Copy> 任務強制拷貝 appsettings.json 到 $(OutDir)。
+  -->
+  <Target Name="CopyAppSettings" AfterTargets="Build">
+    <Copy SourceFiles="appsettings.json"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

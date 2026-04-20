@@ -1,0 +1,27 @@
+@inherits LayoutComponentBase
+
+<div class="app-shell">
+    <header class="app-header">
+        <div class="brand">
+            <span class="brand-mark">⟨⟩</span>
+            <span class="brand-text">CryptoBot <span class="brand-sub">/ Command Center</span></span>
+        </div>
+        <nav class="app-nav">
+            <NavLink class="nav-link" href="/" Match="NavLinkMatch.All">Dashboard</NavLink>
+            <NavLink class="nav-link" href="/lab">Backtest · 回測與優化</NavLink>
+        </nav>
+        <div class="status-pill">
+            <span class="dot"></span>
+            <span>Live — BingX Demo</span>
+        </div>
+    </header>
+
+    <main class="app-main">
+        @Body
+    </main>
+
+    <footer class="app-footer">
+        <span>Phase 3 · Backtest + Optimizer + Web UI</span>
+        <span>© @DateTime.UtcNow.Year CryptoBot</span>
+    </footer>
+</div>

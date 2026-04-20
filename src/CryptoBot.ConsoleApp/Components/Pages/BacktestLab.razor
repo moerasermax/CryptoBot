@@ -1,0 +1,384 @@
+@page "/lab"
+@using System.Globalization
+@using System.Net.Http.Json
+@using CryptoBot.ConsoleApp.Api.Dtos
+@using CryptoBot.ConsoleApp.Components.Lab
+@using CryptoBot.ConsoleApp.Lab
+@using CryptoBot.ConsoleApp.Realtime
+@using CryptoBot.ConsoleApp.Services
+@using CryptoBot.Domain.Aggregates.StrategyAggregate
+@using CryptoBot.Domain.Enums
+@using CryptoBot.Domain.Repositories
+@using Microsoft.AspNetCore.Components
+@inject OptimizationOrchestrator Orchestrator
+@inject IServiceScopeFactory ScopeFactory
+@inject IHttpClientFactory HttpFactory
+@inject NavigationManager Nav
+@inject StrategyCatalog Catalog
+@inject LabStateContainer State
+@implements IDisposable
+
+<PageTitle>CryptoBot · Backtest Lab</PageTitle>
+
+@*
+    回測實驗室主頁。資料層全部從 LabStateContainer 拿 — 切 tab、refresh、跨 tab 都不會丟資料。
+    參數表單用 DynamicComponent 動態渲染 SelectedModel.FormComponent，所以新增策略不必碰這頁。
+*@
+
+<StrategyTabsBar />
+
+<section class="lab-banner">
+    <h1>當前決策模型：@State.SelectedModel.DisplayName · @State.SelectedModel.Subtitle</h1>
+    <span class="banner-tag">LAB / Optimizer v2 · Glass Edition</span>
+</section>
+
+<div class="lab-grid fade-in">
+    <section class="panel glass">
+        <header class="panel-header">
+            <h2>Parameter Grid</h2>
+            <span class="panel-sub">BTC-USDT · 1h · Initial 10,000 USDT</span>
+        </header>
+
+        @if (_currentFormType is null)
+        {
+            <div class="empty">此策略尚未實作參數表單 — 請選擇其他策略。</div>
+        }
+        else
+        {
+            <DynamicComponent Type="_currentFormType"
+                              Parameters="@_formParameters"
+                              @ref="_dynamicRef" />
+        }
+
+        <div class="form-row">
+            <label class="lead">Window</label>
+            <div class="field">
+                <span>Start (UTC)</span>
+                <input type="date" @bind="_startDate" disabled="@State.IsRunning" />
+            </div>
+            <div class="field">
+                <span>End (UTC)</span>
+                <input type="date" @bind="_endDate" disabled="@State.IsRunning" />
+            </div>
+            <div class="field">
+                <span>Grid size</span>
+                <input type="text" value="@GridSizeLabel" disabled readonly />
+            </div>
+        </div>
+
+        <div class="form-actions">
+            <button class="btn-primary" disabled="@State.IsRunning" @onclick="StartOptimizeAsync">
+                @(State.IsRunning ? "掃描中…" : "🚀 開始優化掃描")
+            </button>
+            @if (!string.IsNullOrEmpty(_toast))
+            {
+                <span class="lab-toast @(_toastIsError ? "err" : "ok") fade-in">@_toast</span>
+            }
+        </div>
+
+        @if (State.Progress is not null)
+        {
+            <div class="progress-wrap fade-in">
+                <div class="progress-bar">
+                    <div class="progress-fill gold" style="width: @PercentLabel"></div>
+                </div>
+                <div class="progress-label">
+                    <span class="progress-current">@State.Progress.Completed / @State.Progress.Total · @State.Progress.CurrentParams</span>
+                    <span>@PercentLabel</span>
+                </div>
+                <div class="progress-eta">
+                    <span>Elapsed @FormatTs(State.Elapsed)</span>
+                    <span>ETA @FormatTs(State.EstimatedRemaining)</span>
+                </div>
+            </div>
+        }
+    </section>
+
+    <section class="panel glass">
+        <header class="panel-header">
+            <h2>Active Strategy</h2>
+            <span class="panel-sub">套用時覆寫此策略</span>
+        </header>
+        @if (_activeStrategy is null)
+        {
+            <div class="skeleton-block">
+                <div class="skeleton-line w-60"></div>
+                <div class="skeleton-line w-40"></div>
+                <div class="skeleton-line w-80"></div>
+            </div>
+        }
+        else
+        {
+            <div class="form-row" style="grid-template-columns:1fr;">
+                <div class="field">
+                    <span>Name</span>
+                    <strong>@_activeStrategy.Name</strong>
+                </div>
+                <div class="field">
+                    <span>Status</span>
+                    <strong class="@(_activeStrategy.Status == "Running" ? "pos" : "neg")">@_activeStrategy.Status</strong>
+                </div>
+                <div class="field">
+                    <span>Current Fast / Slow</span>
+                    <strong>
+                        @(_activeStrategy.Parameters.TryGetValue("FastSmaPeriod", out var f) ? ((int)f).ToString() : "—")
+                        /
+                        @(_activeStrategy.Parameters.TryGetValue("SlowSmaPeriod", out var s) ? ((int)s).ToString() : "—")
+                    </strong>
+                </div>
+            </div>
+        }
+    </section>
+</div>
+
+<section class="panel glass">
+    <header class="panel-header">
+        <h2>Parameter Optimization Leaderboard</h2>
+        <span class="panel-sub">
+            @(State.Leaderboard is null ? "—" : $"{State.Leaderboard.Shown}/{State.Leaderboard.TotalRuns} shown · filtered (Fills < 3) = {State.Leaderboard.FilteredOut}")
+        </span>
+    </header>
+
+    @if (State.IsRunning && State.Leaderboard is null)
+    {
+        <div class="skeleton-block">
+            @for (var i = 0; i < 4; i++)
+            {
+                <div class="skeleton-row">
+                    <div class="skeleton-cell w-10"></div>
+                    <div class="skeleton-cell w-15"></div>
+                    <div class="skeleton-cell w-15"></div>
+                    <div class="skeleton-cell w-25"></div>
+                    <div class="skeleton-cell w-20"></div>
+                </div>
+            }
+        </div>
+    }
+    else if (State.Leaderboard is null)
+    {
+        <div class="empty">尚未執行優化 — 設定參數後按「開始優化掃描」。</div>
+    }
+    else if (State.Leaderboard.Rows.Count == 0)
+    {
+        <div class="empty">沒有一組參數通過 Fills ≥ 3 的過濾 — 試試擴大範圍或拉長時間窗口。</div>
+    }
+    else
+    {
+        <table class="data-table fade-in">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Fast</th>
+                    <th>Slow</th>
+                    <th>PnL (USDT)</th>
+                    <th>Return</th>
+                    <th>MaxDD</th>
+                    <th>P/DD</th>
+                    <th>Fills</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var row in State.Leaderboard.Rows)
+                {
+                    <tr class="@(row.Rank == 1 ? "rank-1" : "")">
+                        <td>@row.Rank</td>
+                        <td>@row.Fast</td>
+                        <td>@row.Slow</td>
+                        <td class="@(row.NetPnL >= 0 ? "pos" : "neg")">@row.NetPnL.ToString("N4")</td>
+                        <td class="@(row.ReturnPercent >= 0 ? "pos" : "neg")">@row.ReturnPercent.ToString("N2")%</td>
+                        <td>@row.MaxDrawdownPercent.ToString("N2")%</td>
+                        <td>@(row.IsInfiniteRatio ? "∞" : row.ProfitToDrawdownRatio.ToString("N2"))</td>
+                        <td>@row.Fills</td>
+                        <td>
+                            <button class="btn-apply"
+                                    disabled="@(_applyingFor != null || _activeStrategy is null)"
+                                    @onclick="() => ApplyRowAsync(row)">
+                                @(_applyingFor == row.Rank ? "套用中…" : "套用")
+                            </button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+
+    @if (!string.IsNullOrEmpty(State.LastError))
+    {
+        <div class="lab-error fade-in">⚠ @State.LastError</div>
+    }
+</section>
+
+@code {
+    private DateTime _startDate = DateTime.UtcNow.Date.AddDays(-30);
+    private DateTime _endDate   = DateTime.UtcNow.Date;
+
+    private string? _toast;
+    private bool _toastIsError;
+    private int? _applyingFor;
+
+    private StrategyDto? _activeStrategy;
+
+    private Type? _currentFormType;
+    private Dictionary<string, object> _formParameters = new();
+    private DynamicComponent? _dynamicRef;
+    private int _currentGridSize;
+
+    private string? _lastSelectedKey;
+
+    protected override async Task OnInitializedAsync()
+    {
+        State.StateChanged += OnStateChanged;
+        SyncFormToSelectedModel();
+        await LoadActiveStrategyAsync();
+    }
+
+    protected override void OnParametersSet() => SyncFormToSelectedModel();
+
+    private void OnStateChanged() => InvokeAsync(() =>
+    {
+        SyncFormToSelectedModel();
+        StateHasChanged();
+    });
+
+    private void SyncFormToSelectedModel()
+    {
+        if (_lastSelectedKey == State.SelectedModel.Key) return;
+
+        _lastSelectedKey   = State.SelectedModel.Key;
+        _currentFormType   = State.SelectedModel.FormComponent;
+        _currentGridSize   = 0;
+        _formParameters    = new Dictionary<string, object>
+        {
+            [nameof(StrategyParameterFormBase.Disabled)]         = State.IsRunning,
+            [nameof(StrategyParameterFormBase.ParameterChanged)] = EventCallback.Factory.Create<int>(this, OnFormGridChanged),
+        };
+    }
+
+    private void OnFormGridChanged(int gridSize)
+    {
+        _currentGridSize = gridSize;
+        StateHasChanged();
+    }
+
+    private async Task LoadActiveStrategyAsync()
+    {
+        await using var scope = ScopeFactory.CreateAsyncScope();
+        var repo = scope.ServiceProvider.GetRequiredService<IStrategyRepository>();
+        var all = await repo.GetAllAsync();
+        var s = all.FirstOrDefault(x => x.Status == StrategyStatus.Running)
+             ?? all.FirstOrDefault();
+        if (s is not null) _activeStrategy = CryptoBot.ConsoleApp.Api.StrategyEndpoints.ToDto(s);
+    }
+
+    private string GridSizeLabel => _currentGridSize <= 0 ? "—" : _currentGridSize.ToString();
+
+    private string PercentLabel
+    {
+        get
+        {
+            var p = State.Progress;
+            if (p is null || p.Total == 0) return "0%";
+            var pct = (int)Math.Round(100.0 * p.Completed / p.Total);
+            return $"{pct}%";
+        }
+    }
+
+    private static string FormatTs(TimeSpan? ts)
+    {
+        if (ts is null) return "—";
+        var t = ts.Value;
+        return t.TotalHours >= 1
+            ? $"{(int)t.TotalHours}h{t.Minutes:D2}m{t.Seconds:D2}s"
+            : t.TotalMinutes >= 1
+                ? $"{t.Minutes}m{t.Seconds:D2}s"
+                : $"{t.Seconds}s";
+    }
+
+    private async Task StartOptimizeAsync()
+    {
+        _toast = null;
+
+        if (_dynamicRef?.Instance is not StrategyParameterFormBase form)
+        {
+            _toast = "策略表單尚未就緒。";
+            _toastIsError = true;
+            return;
+        }
+
+        var startUtc = DateTime.SpecifyKind(_startDate, DateTimeKind.Utc);
+        var endUtc   = DateTime.SpecifyKind(_endDate,   DateTimeKind.Utc);
+
+        var req = form.BuildRequest(startUtc, endUtc, out var error);
+        if (req is null)
+        {
+            _toast = error ?? "參數驗證失敗。";
+            _toastIsError = true;
+            return;
+        }
+
+        State.NotifyJobStarting(_currentGridSize);
+        StateHasChanged();
+
+        using var http = HttpFactory.CreateClient();
+        http.BaseAddress = new Uri(Nav.BaseUri);
+        try
+        {
+            var resp = await http.PostAsJsonAsync("/api/lab/optimize", req);
+            if (!resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync();
+                _toast = $"HTTP {(int)resp.StatusCode}: {body}";
+                _toastIsError = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _toast = ex.Message;
+            _toastIsError = true;
+        }
+    }
+
+    private async Task ApplyRowAsync(LeaderboardRowDto row)
+    {
+        if (_activeStrategy is null) return;
+        _applyingFor = row.Rank;
+        _toast = null;
+        StateHasChanged();
+
+        using var http = HttpFactory.CreateClient();
+        http.BaseAddress = new Uri(Nav.BaseUri);
+        try
+        {
+            var resp = await http.PostAsJsonAsync(
+                $"/api/lab/apply/{_activeStrategy.Id}",
+                new ApplyParamsRequest(row.Fast, row.Slow));
+            if (resp.IsSuccessStatusCode)
+            {
+                _toast = $"✓ 已套用 Fast={row.Fast} / Slow={row.Slow} 到 {_activeStrategy.Name}";
+                _toastIsError = false;
+                await LoadActiveStrategyAsync();
+            }
+            else
+            {
+                _toast = $"套用失敗：HTTP {(int)resp.StatusCode}";
+                _toastIsError = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _toast = $"套用失敗：{ex.Message}";
+            _toastIsError = true;
+        }
+        finally
+        {
+            _applyingFor = null;
+            StateHasChanged();
+        }
+    }
+
+    public void Dispose()
+    {
+        State.StateChanged -= OnStateChanged;
+    }
+}

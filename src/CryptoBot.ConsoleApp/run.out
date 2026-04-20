@@ -1,0 +1,106 @@
+[23:33:55 INF] CryptoBot 啟動中…
+[23:33:56 INF] Executed DbCommand (19ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+PRAGMA journal_mode = 'wal';
+[23:33:57 INF] Executed DbCommand (10ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE TABLE "__EFMigrationsHistory" (
+    "MigrationId" TEXT NOT NULL CONSTRAINT "PK___EFMigrationsHistory" PRIMARY KEY,
+    "ProductVersion" TEXT NOT NULL
+);
+[23:33:57 INF] Executed DbCommand (2ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+SELECT COUNT(*) FROM "sqlite_master" WHERE "name" = '__EFMigrationsHistory' AND "type" = 'table';
+[23:33:57 INF] Executed DbCommand (1ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+SELECT "MigrationId", "ProductVersion"
+FROM "__EFMigrationsHistory"
+ORDER BY "MigrationId";
+[23:33:57 INF] Applying migration '20260420082729_InitialCreate'.
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE TABLE "Orders" (
+    "Id" TEXT NOT NULL CONSTRAINT "PK_Orders" PRIMARY KEY,
+    "Symbol" TEXT NOT NULL,
+    "Side" INTEGER NOT NULL,
+    "Type" INTEGER NOT NULL,
+    "Quantity" TEXT NOT NULL,
+    "FilledQuantity" TEXT NOT NULL,
+    "LimitPrice" TEXT NULL,
+    "StopPrice" TEXT NULL,
+    "AverageFillPrice" TEXT NULL,
+    "Status" INTEGER NOT NULL,
+    "PositionSide" INTEGER NOT NULL,
+    "Commission" TEXT NOT NULL,
+    "ClientOrderId" TEXT NULL,
+    "ExchangeOrderId" TEXT NULL,
+    "StrategyId" TEXT NULL,
+    "CreatedAt" TEXT NOT NULL,
+    "UpdatedAt" TEXT NOT NULL,
+    "RejectReason" TEXT NULL
+);
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE TABLE "Positions" (
+    "Id" TEXT NOT NULL CONSTRAINT "PK_Positions" PRIMARY KEY,
+    "Symbol" TEXT NOT NULL,
+    "Side" INTEGER NOT NULL,
+    "Quantity" TEXT NOT NULL,
+    "EntryPrice" TEXT NOT NULL,
+    "CurrentPrice" TEXT NULL,
+    "Leverage" INTEGER NOT NULL,
+    "MarginMode" INTEGER NOT NULL,
+    "StopLossPrice" TEXT NULL,
+    "TakeProfitPrice" TEXT NULL,
+    "TrailingStopPercent" TEXT NULL,
+    "TrailingStopPrice" TEXT NULL,
+    "StrategyId" TEXT NULL,
+    "OpenedAt" TEXT NOT NULL,
+    "ClosedAt" TEXT NULL,
+    "IsClosed" INTEGER NOT NULL,
+    "RealizedPnL" TEXT NOT NULL,
+    "TotalCommission" TEXT NOT NULL
+);
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE TABLE "Strategies" (
+    "Id" TEXT NOT NULL CONSTRAINT "PK_Strategies" PRIMARY KEY,
+    "Name" TEXT NOT NULL,
+    "StrategyType" TEXT NOT NULL,
+    "Configuration" TEXT NOT NULL,
+    "Status" INTEGER NOT NULL,
+    "CreatedAt" TEXT NOT NULL,
+    "StartedAt" TEXT NULL,
+    "StoppedAt" TEXT NULL,
+    "LastError" TEXT NULL,
+    "TotalTrades" INTEGER NOT NULL,
+    "WinningTrades" INTEGER NOT NULL,
+    "LosingTrades" INTEGER NOT NULL,
+    "CumulativePnL" TEXT NOT NULL,
+    "MaxDrawdown" TEXT NOT NULL,
+    "PeakPnL" TEXT NOT NULL
+);
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Orders_ClientOrderId" ON "Orders" ("ClientOrderId");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Orders_ExchangeOrderId" ON "Orders" ("ExchangeOrderId");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Orders_Status" ON "Orders" ("Status");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Orders_StrategyId" ON "Orders" ("StrategyId");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Orders_Symbol_Status" ON "Orders" ("Symbol", "Status");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Positions_IsClosed" ON "Positions" ("IsClosed");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Positions_StrategyId" ON "Positions" ("StrategyId");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Positions_Symbol_IsClosed" ON "Positions" ("Symbol", "IsClosed");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE UNIQUE INDEX "IX_Strategies_Name" ON "Strategies" ("Name");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+CREATE INDEX "IX_Strategies_Status" ON "Strategies" ("Status");
+[23:33:57 INF] Executed DbCommand (0ms) [Parameters=[], CommandType='Text', CommandTimeout='30']
+INSERT INTO "__EFMigrationsHistory" ("MigrationId", "ProductVersion")
+VALUES ('20260420082729_InitialCreate', '8.0.11');
+[23:33:57 WRN] BingX mode: DEMO
+[23:33:57 INF] CryptoBotHostedService 啟動中…
+[23:33:57 INF] Application started. Press Ctrl+C to shut down.
+[23:33:57 INF] Hosting environment: Production
+[23:33:57 INF] 開始 BingX 連線心跳 (exchange=BingX, symbol=BTC-USDT)…
+[23:33:57 INF] Content root path: C:\Users\Moera\Downloads\CryptoBot_1\CryptoBot\src\CryptoBot.ConsoleApp
+[23:33:58 INF] ✅ BingX 連線成功 — BTC-USDT 現貨報價 = 75606.85
+[23:33:58 INF] CryptoBotHostedService 已就緒，等待停止訊號…

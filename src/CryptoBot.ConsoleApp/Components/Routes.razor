@@ -1,0 +1,10 @@
+@*
+    Blazor Router — 把 URL 路由到對應的 @page-decorated 元件。
+    DefaultLayout 讓每頁套同一個黑底主題。
+*@
+<Router AppAssembly="@typeof(Program).Assembly">
+    <Found Context="routeData">
+        <RouteView RouteData="@routeData" DefaultLayout="@typeof(MainLayout)" />
+        <FocusOnNavigate RouteData="@routeData" Selector="h1" />
+    </Found>
+</Router>

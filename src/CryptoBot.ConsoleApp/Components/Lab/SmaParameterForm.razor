@@ -1,0 +1,49 @@
+@namespace CryptoBot.ConsoleApp.Components.Lab
+@inherits CryptoBot.ConsoleApp.Lab.StrategyParameterFormBase
+@using CryptoBot.ConsoleApp.Services
+
+<div class="glass-form">
+    <div class="glass-row">
+        <label class="glass-label">Fast SMA</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="1" max="500" disabled="@Disabled" @bind="_fastMin" @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="1" max="500" disabled="@Disabled" @bind="_fastMax" @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="50"  disabled="@Disabled" @bind="_fastStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">Slow SMA</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="1" max="500" disabled="@Disabled" @bind="_slowMin" @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="1" max="500" disabled="@Disabled" @bind="_slowMax" @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="50"  disabled="@Disabled" @bind="_slowStep" @bind:after="OnChanged" /></div>
+    </div>
+</div>
+
+@code {
+    private decimal _fastMin = 5, _fastMax = 20, _fastStep = 1;
+    private decimal _slowMin = 30, _slowMax = 100, _slowStep = 5;
+
+    private int FastCount => Count(_fastMin, _fastMax, _fastStep);
+    private int SlowCount => Count(_slowMin, _slowMax, _slowStep);
+    public override int CurrentGridSize => Math.Max(0, FastCount) * Math.Max(0, SlowCount);
+
+    protected override Task OnInitializedAsync() => NotifyChangedAsync();
+
+    private Task OnChanged() => NotifyChangedAsync();
+
+    private static int Count(decimal min, decimal max, decimal step)
+    {
+        if (step <= 0 || max < min) return 0;
+        return (int)Math.Floor((double)((max - min) / step)) + 1;
+    }
+
+    public override OptimizationRequest? BuildRequest(DateTime startUtc, DateTime endUtc, out string? error)
+    {
+        if (_fastStep <= 0 || _slowStep <= 0) { error = "Step must be positive."; return null; }
+        if (_fastMax < _fastMin || _slowMax < _slowMin) { error = "Max must be >= Min."; return null; }
+        if (startUtc >= endUtc) { error = "Start must be before End."; return null; }
+        error = null;
+        return new OptimizationRequest(
+            FastMin: _fastMin, FastMax: _fastMax, FastStep: _fastStep,
+            SlowMin: _slowMin, SlowMax: _slowMax, SlowStep: _slowStep,
+            StartUtc: startUtc, EndUtc: endUtc);
+    }
+}

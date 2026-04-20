@@ -1,0 +1,27 @@
+# Build
+bin/
+obj/
+*.user
+*.suo
+
+# VS
+.vs/
+*.vscode/
+
+# DB
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+*.log
+
+# Secrets
+appsettings.Local.json
+appsettings.Production.json
+secrets.json
+.env
+
+# Rider
+.idea/

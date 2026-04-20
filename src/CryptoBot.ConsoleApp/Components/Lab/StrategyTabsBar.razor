@@ -1,0 +1,76 @@
+@namespace CryptoBot.ConsoleApp.Components.Lab
+@using CryptoBot.ConsoleApp.Lab
+@inject StrategyCatalog Catalog
+@inject LabStateContainer State
+@implements IDisposable
+
+@*
+    策略大腦切換列 — 頂部 pills 型導航。
+    左側：逐一列出 StrategyCatalog 裡的策略；Locked 的畫鎖頭、不可點。
+    右側：engine load（IsRunning 時轉金黃，否則翠綠 idle）+ 連線狀態。
+    訂閱 State.StateChanged 讓「跑掃描時鎖住切換」的狀態能即時反映。
+*@
+
+<div class="tabs-bar">
+    <div class="tabs-pills">
+        @foreach (var model in Catalog.Models)
+        {
+            var isActive = model.Key == State.SelectedModel.Key;
+            var classes = "tab-pill"
+                + (isActive ? " active" : string.Empty)
+                + (model.IsLocked ? " locked" : string.Empty);
+
+            <button type="button"
+                    class="@classes"
+                    disabled="@(model.IsLocked || State.IsRunning)"
+                    @onclick="() => OnSelect(model.Key)">
+                <span class="tab-pill-title">
+                    @if (model.IsLocked)
+                    {
+                        <span class="lock-icon">🔒</span>
+                    }
+                    @model.DisplayName
+                </span>
+                <span class="tab-pill-sub">@model.Subtitle</span>
+            </button>
+        }
+
+        <button type="button" class="tab-pill add-new" disabled="@true" title="尚未開放 — 下一個策略插槽">
+            <span class="tab-pill-title">＋ Add New</span>
+            <span class="tab-pill-sub">插入新決策模型</span>
+        </button>
+    </div>
+
+    <div class="tabs-meta">
+        <div class="engine-load">
+            <span class="engine-dot @(State.IsRunning ? "busy" : "idle")"></span>
+            <span class="engine-text">
+                @(State.IsRunning ? "ENGINE · OPTIMIZING" : "ENGINE · IDLE")
+            </span>
+        </div>
+        <div class="conn-pill">
+            <span class="conn-dot"></span>
+            <span>Live · BingX Demo</span>
+        </div>
+    </div>
+</div>
+
+@code {
+    protected override void OnInitialized()
+    {
+        State.StateChanged += OnStateChanged;
+    }
+
+    private void OnStateChanged() => InvokeAsync(StateHasChanged);
+
+    private void OnSelect(string key)
+    {
+        if (State.IsRunning) return;
+        State.SelectModel(key);
+    }
+
+    public void Dispose()
+    {
+        State.StateChanged -= OnStateChanged;
+    }
+}
