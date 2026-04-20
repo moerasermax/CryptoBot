@@ -407,8 +407,9 @@ internal sealed class FakeExchangeClient : IExchangeClient
     public IReadOnlyList<Kline> PreloadKlines { get; set; } = Array.Empty<Kline>();
     public int PlaceOrderCalls { get; private set; }
     public string ExchangeName => "FAKE";
+    public string QuoteAsset => "USDT";
 
-    public Task<decimal> GetFuturesBalanceAsync(string asset = "USDT", CancellationToken ct = default) =>
+    public Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default) =>
         Task.FromResult(Balance);
     public Task<decimal> GetSpotBalanceAsync(string asset, CancellationToken ct = default) =>
         Task.FromResult(Balance);

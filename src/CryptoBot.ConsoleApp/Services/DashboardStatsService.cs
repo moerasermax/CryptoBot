@@ -33,7 +33,8 @@ public sealed class DashboardStatsService
 
     public async Task<DashboardStatsUpdate> GetAsync(CancellationToken ct = default)
     {
-        var usdtBalance = await _exchange.GetFuturesBalanceAsync("USDT", ct).ConfigureAwait(false);
+        // 不寫死 "USDT" — 在 Demo 模式下 _exchange.QuoteAsset = "VST"，永遠查得到正確的 quote 資產
+        var quoteBalance = await _exchange.GetFuturesBalanceAsync(ct: ct).ConfigureAwait(false);
 
         var openPositions = await _positionRepo.GetOpenPositionsAsync(ct).ConfigureAwait(false);
         var unrealized = openPositions.Sum(p => p.UnrealizedPnL);
@@ -48,7 +49,7 @@ public sealed class DashboardStatsService
 
         return new DashboardStatsUpdate(
             Timestamp: DateTime.UtcNow,
-            TotalEquity: usdtBalance + unrealized,
+            TotalEquity: quoteBalance + unrealized,
             TodayPnL: realizedToday + unrealized, // 把未實現也算進今日浮盈，避免卡牌靜態
             ActiveStrategyCount: running.Count);
     }

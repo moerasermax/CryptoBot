@@ -15,10 +15,19 @@ public interface IExchangeClient
     /// <summary>交易所名稱 (用於 Log / 識別)</summary>
     string ExchangeName { get; }
 
+    /// <summary>
+    /// 此 client 當前模式對應的合約 quote 資產：Live→"USDT", Demo→"VST"。
+    /// <see cref="GetFuturesBalanceAsync"/> 不傳 asset 時會用這個。
+    /// </summary>
+    string QuoteAsset { get; }
+
     // ===== 帳戶 =====
 
-    /// <summary>取得合約帳戶餘額 (USDT)</summary>
-    Task<decimal> GetFuturesBalanceAsync(string asset = "USDT", CancellationToken ct = default);
+    /// <summary>
+    /// 取得合約帳戶餘額。傳 null（預設）時會用 <see cref="QuoteAsset"/>，
+    /// 也就是「當前模式正確的那個資產」— 永遠不會在 demo 跑去查 USDT。
+    /// </summary>
+    Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default);
 
     /// <summary>取得現貨帳戶餘額 (用於對沖套利)</summary>
     Task<decimal> GetSpotBalanceAsync(string asset, CancellationToken ct = default);

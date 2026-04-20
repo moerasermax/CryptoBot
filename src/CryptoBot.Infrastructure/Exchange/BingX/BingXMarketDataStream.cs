@@ -10,6 +10,7 @@ using CryptoExchange.Net.Objects.Sockets;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using AppBingXOptions = CryptoBot.Infrastructure.Configuration.BingXOptions;
+using TradingMode = CryptoBot.Infrastructure.Configuration.TradingMode;
 
 namespace CryptoBot.Infrastructure.Exchange.BingX;
 
@@ -72,9 +73,9 @@ public sealed class BingXMarketDataStream : IMarketDataStream
 
         _socketClient = new BingXSocketClient(opts =>
         {
-            opts.Environment = _options.UseDemoTrading
-                ? global::BingX.Net.BingXEnvironment.Demo
-                : global::BingX.Net.BingXEnvironment.Live;
+            opts.Environment = _options.EffectiveMode == TradingMode.Live
+                ? global::BingX.Net.BingXEnvironment.Live
+                : global::BingX.Net.BingXEnvironment.Demo;
         });
 
         if (!string.IsNullOrWhiteSpace(_options.ApiKey) &&
@@ -112,8 +113,8 @@ public sealed class BingXMarketDataStream : IMarketDataStream
             }
 
             _started = true;
-            _logger.LogInformation("BingX market data stream started (Mode={Mode})",
-                _options.UseDemoTrading ? "DEMO" : "LIVE");
+            _logger.LogInformation("BingX market data stream started (Mode={Mode}, QuoteAsset={Asset})",
+                _options.EffectiveMode, _options.QuoteAsset);
         }
         finally
         {

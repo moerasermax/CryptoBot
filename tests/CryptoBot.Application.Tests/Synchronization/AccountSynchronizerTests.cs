@@ -432,12 +432,13 @@ internal sealed class SyncFakeMarketDataStream : IMarketDataStream
 internal sealed class SyncFakeExchangeClient : IExchangeClient
 {
     public string ExchangeName => "SYNCFAKE";
+    public string QuoteAsset => "USDT";
     public Price MarkPrice { get; set; } = Price.Create(100m);
     public IReadOnlyList<ExchangePositionInfo> OpenPositions { get; set; } = Array.Empty<ExchangePositionInfo>();
     public int RefreshOrderStatusCalls { get; private set; }
     public int GetMarkPriceCalls { get; private set; }
 
-    public Task<decimal> GetFuturesBalanceAsync(string asset = "USDT", CancellationToken ct = default) => Task.FromResult(0m);
+    public Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default) => Task.FromResult(0m);
     public Task<decimal> GetSpotBalanceAsync(string asset, CancellationToken ct = default) => Task.FromResult(0m);
     public Task SetLeverageAsync(Symbol symbol, Leverage leverage, CancellationToken ct = default) => Task.CompletedTask;
     public Task SetMarginModeAsync(Symbol symbol, MarginMode mode, CancellationToken ct = default) => Task.CompletedTask;

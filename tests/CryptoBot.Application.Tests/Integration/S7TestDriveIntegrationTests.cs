@@ -273,11 +273,12 @@ internal sealed class PipelineFakeMarketDataStream : IMarketDataStream
 internal sealed class PipelineFakeExchangeClient : IExchangeClient
 {
     public string ExchangeName => "PIPELINE-FAKE";
+    public string QuoteAsset => "USDT";
     public decimal Balance { get; set; } = 100_000m;
     public IReadOnlyList<Kline> PreloadedKlines { get; set; } = Array.Empty<Kline>();
     public int PlaceOrderCalls { get; private set; }
 
-    public Task<decimal> GetFuturesBalanceAsync(string asset = "USDT", CancellationToken ct = default) =>
+    public Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default) =>
         Task.FromResult(Balance);
     public Task<decimal> GetSpotBalanceAsync(string asset, CancellationToken ct = default) =>
         Task.FromResult(Balance);

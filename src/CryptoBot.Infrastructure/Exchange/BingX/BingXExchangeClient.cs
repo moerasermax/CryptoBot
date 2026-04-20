@@ -13,6 +13,7 @@ using Microsoft.Extensions.Options;
 using System.Threading;
 using System.Threading.Tasks;
 using AppBingXOptions = CryptoBot.Infrastructure.Configuration.BingXOptions;
+using AppTradingMode = CryptoBot.Infrastructure.Configuration.TradingMode;
 
 namespace CryptoBot.Infrastructure.Exchange.BingX;
 
@@ -23,6 +24,7 @@ public sealed class BingXExchangeClient : IExchangeClient
     private readonly ILogger<BingXExchangeClient> _logger;
 
     public string ExchangeName => "BingX";
+    public string QuoteAsset => _options.QuoteAsset;
 
     public BingXExchangeClient(
         IOptions<AppBingXOptions> options,
@@ -35,12 +37,13 @@ public sealed class BingXExchangeClient : IExchangeClient
         {
             opts.RequestTimeout = TimeSpan.FromSeconds(_options.RequestTimeoutSeconds);
 
-            opts.Environment = _options.UseDemoTrading
-                ? global::BingX.Net.BingXEnvironment.Demo
-                : global::BingX.Net.BingXEnvironment.Live;
+            opts.Environment = _options.EffectiveMode == AppTradingMode.Live
+                ? global::BingX.Net.BingXEnvironment.Live
+                : global::BingX.Net.BingXEnvironment.Demo;
 
-            _logger.LogWarning("BingX mode: {Mode}",
-                _options.UseDemoTrading ? "DEMO" : "LIVE (REAL MONEY)");
+            _logger.LogWarning("BingX mode: {Mode} | quote asset: {Asset}",
+                _options.EffectiveMode == AppTradingMode.Live ? "🔴 LIVE (REAL MONEY)" : "🟢 DEMO (VST)",
+                _options.QuoteAsset);
         });
 
         if (!string.IsNullOrWhiteSpace(_options.ApiKey) &&
@@ -61,19 +64,23 @@ public sealed class BingXExchangeClient : IExchangeClient
     // ========== 帳戶 ==========
 
     public async Task<decimal> GetFuturesBalanceAsync(
-        string asset = "USDT", CancellationToken ct = default)
+        string? asset = null, CancellationToken ct = default)
     {
+        var queryAsset = string.IsNullOrWhiteSpace(asset) ? QuoteAsset : asset;
+
         var result = await _client.PerpetualFuturesApi.Account
             .GetBalancesAsync(ct).ConfigureAwait(false);
 
         result.Check(nameof(GetFuturesBalanceAsync));
 
         var balance = result.Data.FirstOrDefault(b =>
-            string.Equals(b.Asset, asset, StringComparison.OrdinalIgnoreCase));
+            string.Equals(b.Asset, queryAsset, StringComparison.OrdinalIgnoreCase));
 
         if (balance is null)
         {
-            _logger.LogWarning("No {Asset} balance on BingX futures account", asset);
+            _logger.LogInformation(
+                "No {Asset} balance on BingX futures account (mode={Mode}) — returning 0.",
+                queryAsset, _options.EffectiveMode);
             return 0m;
         }
 

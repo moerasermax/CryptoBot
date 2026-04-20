@@ -36,6 +36,7 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
     private Kline? _currentKline;
 
     public string ExchangeName => "Backtest";
+    public string QuoteAsset => "USDT";
 
     /// <summary>目前虛擬餘額（USDT），由成交即時扣帳。</summary>
     public decimal VirtualBalance { get; private set; }
@@ -62,7 +63,7 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
 
     // ===== 帳戶 =====
 
-    public Task<decimal> GetFuturesBalanceAsync(string asset = "USDT", CancellationToken ct = default)
+    public Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default)
         => Task.FromResult(VirtualBalance);
 
     public Task<decimal> GetSpotBalanceAsync(string asset, CancellationToken ct = default)

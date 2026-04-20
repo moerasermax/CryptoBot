@@ -1,0 +1,122 @@
+@using CryptoBot.Application.Realtime
+@using CryptoBot.Application.Strategies
+@using CryptoBot.ConsoleApp.Realtime
+@using CryptoBot.Domain.Aggregates.StrategyAggregate
+@using CryptoBot.Domain.Enums
+@using CryptoBot.Domain.Repositories
+@using CryptoBot.Infrastructure.Configuration
+@using Microsoft.Extensions.DependencyInjection
+@using Microsoft.Extensions.Options
+@implements IDisposable
+@inject IOptions<BingXOptions> BingXOpts
+@inject IStrategyRuntimeController Runtime
+@inject IServiceScopeFactory ScopeFactory
+@inject DashboardEventBus Bus
+
+@*
+    全局環境狀態列 — Demo/Live 模式 + 當前掛載策略 + 引擎運行狀態。
+    Push-driven：訂閱 DashboardEventBus.StatsUpdated（DashboardPushService 每幾秒就會打一次），
+    順手 reload running 策略列表，不額外輪詢。
+*@
+
+<div class="env-bar @ModeCssClass">
+    <span class="env-segment env-mode" title="@ModeTooltip">
+        <span class="env-segment-label">MODE</span>
+        <span class="env-badge env-badge-@ModeCssClass">
+            @ModeIcon @ModeLabel
+        </span>
+    </span>
+
+    <span class="env-segment env-strategy" title="@ActiveTooltip">
+        <span class="env-segment-label">ACTIVE</span>
+        <span class="env-strategy-name">@ActiveSummary</span>
+    </span>
+
+    <span class="env-segment env-engine">
+        <span class="env-segment-label">ENGINE</span>
+        <span class="env-engine-state @(EngineRunning ? "is-running" : "is-stopped")">
+            <span class="env-dot"></span>
+            @(EngineRunning ? "Running" : "Stopped")
+        </span>
+    </span>
+</div>
+
+@code {
+    private List<Strategy> _running = new();
+
+    private string ModeLabel => BingXOpts.Value.EffectiveMode == TradingMode.Live ? "LIVE" : "DEMO";
+    private string ModeIcon  => BingXOpts.Value.EffectiveMode == TradingMode.Live ? "⚠️" : "🛡";
+    private string ModeCssClass => BingXOpts.Value.EffectiveMode == TradingMode.Live ? "live" : "demo";
+    private string ModeTooltip =>
+        BingXOpts.Value.EffectiveMode == TradingMode.Live
+            ? $"LIVE trading on BingX — quote asset: {BingXOpts.Value.QuoteAsset} (real money!)"
+            : $"DEMO trading on BingX — quote asset: {BingXOpts.Value.QuoteAsset} (virtual funds)";
+
+    private bool EngineRunning => _running.Any(s => Runtime.IsRunning(s.Id));
+
+    private string ActiveSummary
+    {
+        get
+        {
+            if (_running.Count == 0) return "— (no strategy)";
+            var s = _running[0];
+            var paramSummary = FormatParameters(s);
+            var extra = _running.Count > 1 ? $" +{_running.Count - 1}" : "";
+            return $"{s.Name} · {s.StrategyType}{paramSummary}{extra}";
+        }
+    }
+
+    private string ActiveTooltip
+    {
+        get
+        {
+            if (_running.Count == 0) return "No strategies in Running state.";
+            return string.Join(" | ", _running.Select(s => $"{s.Name} ({s.StrategyType}){FormatParameters(s)}"));
+        }
+    }
+
+    private static string FormatParameters(Strategy s)
+    {
+        var p = s.Configuration.Parameters;
+        if (p.TryGetValue("FastSmaPeriod", out var fast) && p.TryGetValue("SlowSmaPeriod", out var slow))
+            return $" ({(int)fast}, {(int)slow})";
+        if (p.Count == 0) return string.Empty;
+        var first = p.Take(2).Select(kv => $"{kv.Key}={kv.Value:0.##}");
+        return $" ({string.Join(", ", first)})";
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        await ReloadAsync();
+        Bus.StatsUpdated += OnStatsUpdated;
+    }
+
+    private void OnStatsUpdated(DashboardStatsUpdate _)
+    {
+        InvokeAsync(async () =>
+        {
+            await ReloadAsync();
+            StateHasChanged();
+        });
+    }
+
+    private async Task ReloadAsync()
+    {
+        try
+        {
+            await using var scope = ScopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IStrategyRepository>();
+            var list = await repo.GetByStatusAsync(StrategyStatus.Running, default);
+            _running = list.ToList();
+        }
+        catch
+        {
+            _running = new();
+        }
+    }
+
+    public void Dispose()
+    {
+        Bus.StatsUpdated -= OnStatsUpdated;
+    }
+}
