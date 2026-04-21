@@ -363,14 +363,135 @@ classDiagram
 | `_clientGate` 物件鎖而非 `lock(this)` 或 `lock(_options)` | 專屬鎖避免外部偶然 lock 同一物件造成 deadlock；`Dispose` 舊 client 在 lock 外執行 |
 | 切換後**不**自動重啟策略 | 強制使用者手動 Start = 二次人為確認，杜絕「demo 配置打 live 訂單」 |
 
-## 4. 讀圖規則
+## 4. 金鑰持久化 + 策略手動控制 (S24 + S25)
+
+```mermaid
+classDiagram
+    direction LR
+
+    %% ─── S24: ExchangeAccount Aggregate ───
+    class ExchangeAccount {
+        <<AggregateRoot>>
+        +Guid Id
+        +ExchangeName Exchange
+        +string AccountName
+        +string ApiKey
+        +string ApiSecret
+        +bool IsActive
+        +DateTime CreatedAt
+        +DateTime UpdatedAt
+        +bool HasCredentials «derived»
+        +Create(ExchangeName, string, string?, string?, bool)$ ExchangeAccount
+        +UpdateCredentials(string?, string?, string?) void
+        +Activate() void
+        +Deactivate() void
+    }
+
+    class ExchangeName {
+        <<enum>>
+        BingX = 1
+    }
+
+    class IExchangeAccountRepository {
+        <<interface · Domain>>
+        +GetByIdAsync(Guid, CancellationToken) Task~ExchangeAccount?~
+        +GetActiveAsync(ExchangeName, CancellationToken) Task~ExchangeAccount?~
+        +ListAsync(ExchangeName?, CancellationToken) Task~IReadOnlyList~ExchangeAccount~~
+        +AddAsync(ExchangeAccount, CancellationToken) Task
+        +UpdateAsync(ExchangeAccount, CancellationToken) Task
+        +SetActiveAsync(Guid, CancellationToken) Task
+        +DeleteAsync(Guid, CancellationToken) Task
+    }
+
+    class ExchangeAccountRepository {
+        <<sealed · Infrastructure>>
+        -AppDbContext _db
+        +SetActiveAsync(Guid, CancellationToken) Task «transactional»
+    }
+
+    %% ─── S24: Credential Provider bridge ───
+    class IExchangeCredentialProvider {
+        <<interface · Application.Common>>
+        +Task~ExchangeCredentialSnapshot~ GetActiveAsync(CancellationToken)
+        +event Action~ExchangeCredentialChangedEvent~ CredentialsChanged
+    }
+
+    class ExchangeCredentialSnapshot {
+        <<record>>
+        +bool IsConfigured
+        +ExchangeName Exchange
+        +string ApiKey
+        +string ApiSecret
+        +Guid? AccountId
+        +string? AccountName
+    }
+
+    class ExchangeCredentialChangedEvent {
+        <<record>>
+        +Guid AccountId
+        +ExchangeName Exchange
+        +string Reason
+        +DateTime ChangedAtUtc
+    }
+
+    class DbExchangeCredentialProvider {
+        <<sealed · Singleton · Infrastructure>>
+        -IServiceScopeFactory _scopes
+        +GetActiveAsync(CancellationToken) Task~ExchangeCredentialSnapshot~
+        +RaiseChanged(Guid, string) void
+    }
+
+    %% ─── S25: Strategy hot-swap control ───
+    class IStrategyRuntimeController {
+        <<interface · extended S25>>
+        +ChangeStrategyTypeAsync(Guid strategyId, string newType, CancellationToken) Task
+    }
+
+    class IStrategyFactory {
+        <<interface · extended S25>>
+        +IReadOnlyList~string~ KnownTypes
+        +Create(string strategyType) IStrategy
+    }
+
+    class Strategy_S25 {
+        <<extended method>>
+        +ChangeType(string newStrategyType) void
+    }
+
+    %% ─── Relationships ───
+    ExchangeAccount --> ExchangeName
+    ExchangeAccountRepository ..|> IExchangeAccountRepository
+    DbExchangeCredentialProvider ..|> IExchangeCredentialProvider
+    DbExchangeCredentialProvider ..> IExchangeAccountRepository : reads via scope
+    DbExchangeCredentialProvider ..> ExchangeCredentialSnapshot : returns
+    DbExchangeCredentialProvider ..> ExchangeCredentialChangedEvent : raises
+    BingXExchangeClient ..> IExchangeCredentialProvider : subscribes → rebuild client
+    BingXMarketDataStream ..> IExchangeCredentialProvider : subscribes → rebuild socket
+    IStrategyRuntimeController ..> IStrategyFactory : validates KnownTypes
+    IStrategyRuntimeController ..> Strategy_S25 : calls ChangeType
+```
+
+### 設計亮點 (S24 + S25)
+
+| 設計 | 為什麼 |
+|---|---|
+| `ExchangeAccount` 獨立 Aggregate 而非塞進 `BingXOptions` | 金鑰要持久化、要支援多組、要有 active 語意，POCO options 承載不了 |
+| `UpdateCredentials` 空字串/空白 → 保留原值 | UI 預設把 Secret 顯示成遮罩（••••）；使用者只改 key 時不應清空 secret |
+| `SetActiveAsync` 在 Repository 層交易化 | 「同交易所最多一筆 active」是業務不變式；Domain Aggregate 看不到其他 row，只能由 Repository 用 transaction 保證 |
+| `IExchangeCredentialProvider` 在 Application.Common | SDK Client (`BingXExchangeClient` / `BingXMarketDataStream`) 屬 Infrastructure，要訂閱 credential 變更事件就需要 Application 層抽象 |
+| `DbExchangeCredentialProvider` 用 `IServiceScopeFactory` 解析 DbContext | Singleton lifetime 不能直接持有 Scoped 的 `AppDbContext`；每次讀取都開新 scope |
+| `IStrategyFactory.KnownTypes` 公開已註冊型別 | Dashboard 下拉選單與 API 端點驗證都需要白名單；中央化避免 drift |
+| `Strategy.ChangeType` 在 Running 時直接 throw | Domain-layer 防禦線：即使 UI / API 忘記 gate，Aggregate 仍拒絕不合法狀態轉移 |
+| `ChangeStrategyTypeAsync` 在 HostedService 內 `_mutateLock` 序列化 | 與 Start/Stop 共用同一把鎖，禁止「一邊啟動一邊換腦」的 race window |
+
+## 5. 讀圖規則
 
 - `*` 為 abstract / 必須 override 的成員。
 - `<<...>>` 為 stereotype，標出該型別的角色（Aggregate / ValueObject / Singleton / record / interface）。
 - 實線箭頭 = 組合 / 強相依；虛線箭頭 = 使用 / 訊息傳遞。
 - 三角形空心箭頭 (`..|>`) = 介面實作。
 
-## 5. 設計決策摘要
+## 6. 設計決策摘要
 
 | 決策 | 為何 |
 |---|---|

@@ -106,3 +106,14 @@ public enum StrategyStatus
     Paused = 2,
     Error = 3
 }
+
+/// <summary>
+/// 交易所識別。預留 Binance/OKX/Bybit 給未來多交易所支援。
+/// </summary>
+public enum ExchangeName
+{
+    BingX = 1,
+    Binance = 2,
+    OKX = 3,
+    Bybit = 4
+}

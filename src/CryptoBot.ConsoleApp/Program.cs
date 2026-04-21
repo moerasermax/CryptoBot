@@ -147,6 +147,7 @@ public static class Program
             app.MapDashboardEndpoints();
             app.MapStrategyEndpoints();
             app.MapLabEndpoints();
+            app.MapExchangeAccountEndpoints();
         }
 
         return app;

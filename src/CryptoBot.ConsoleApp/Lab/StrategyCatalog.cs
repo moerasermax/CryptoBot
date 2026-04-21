@@ -7,7 +7,8 @@ namespace CryptoBot.ConsoleApp.Lab;
 /// 加新策略 = 三個動作：
 ///   1) 寫一個 <c>FooParameterForm.razor</c> 繼承 <see cref="StrategyParameterFormBase"/>
 ///   2) 在這個 catalog 的 ctor 裡 <c>Register(new StrategyModel(...))</c>
-///   3) Orchestrator 端教它怎麼跑（這部分 SMA 之外還沒接，所以 RSI 先 Locked）
+///   3) 在 <c>OptimizationOrchestrator.ResolveStrategy</c> + <c>IsValidCombination</c> +
+///      <c>FormatSummary</c> 加對應 key 的 case
 /// </summary>
 public sealed class StrategyCatalog
 {
@@ -24,10 +25,10 @@ public sealed class StrategyCatalog
 
         Register(new StrategyModel(
             Key: "rsi-bb",
-            DisplayName: "RSI + Bollinger",
-            Subtitle: "超買超賣 + 通道反轉",
-            FormComponent: null,
-            IsLocked: true));
+            DisplayName: "B46 · RSI + Bollinger",
+            Subtitle: "通道反轉 × 超買超賣",
+            FormComponent: typeof(Components.Lab.B46ParameterForm),
+            IsLocked: false));
     }
 
     public IReadOnlyList<StrategyModel> Models => _models;

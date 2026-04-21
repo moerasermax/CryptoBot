@@ -119,12 +119,8 @@
                     <strong class="@(_activeStrategy.Status == "Running" ? "pos" : "neg")">@_activeStrategy.Status</strong>
                 </div>
                 <div class="field">
-                    <span>Current Fast / Slow</span>
-                    <strong>
-                        @(_activeStrategy.Parameters.TryGetValue("FastSmaPeriod", out var f) ? ((int)f).ToString() : "—")
-                        /
-                        @(_activeStrategy.Parameters.TryGetValue("SlowSmaPeriod", out var s) ? ((int)s).ToString() : "—")
-                    </strong>
+                    <span>Current Parameters</span>
+                    <strong>@ActiveStrategyParameters</strong>
                 </div>
             </div>
         }
@@ -168,8 +164,7 @@
             <thead>
                 <tr>
                     <th>#</th>
-                    <th>Fast</th>
-                    <th>Slow</th>
+                    <th>Parameters</th>
                     <th>PnL (USDT)</th>
                     <th>Return</th>
                     <th>MaxDD</th>
@@ -183,8 +178,7 @@
                 {
                     <tr class="@(row.Rank == 1 ? "rank-1" : "")">
                         <td>@row.Rank</td>
-                        <td>@row.Fast</td>
-                        <td>@row.Slow</td>
+                        <td>@row.ParameterSummary</td>
                         <td class="@(row.NetPnL >= 0 ? "pos" : "neg")">@row.NetPnL.ToString("N4")</td>
                         <td class="@(row.ReturnPercent >= 0 ? "pos" : "neg")">@row.ReturnPercent.ToString("N2")%</td>
                         <td>@row.MaxDrawdownPercent.ToString("N2")%</td>
@@ -273,6 +267,18 @@
 
     private string GridSizeLabel => _currentGridSize <= 0 ? "—" : _currentGridSize.ToString();
 
+    private string ActiveStrategyParameters
+    {
+        get
+        {
+            if (_activeStrategy is null || _activeStrategy.Parameters.Count == 0) return "—";
+            return string.Join(" · ", _activeStrategy.Parameters.Select(kv =>
+                kv.Value == Math.Floor(kv.Value)
+                    ? $"{kv.Key}={(int)kv.Value}"
+                    : $"{kv.Key}={kv.Value}"));
+        }
+    }
+
     private string PercentLabel
     {
         get
@@ -352,10 +358,10 @@
         {
             var resp = await http.PostAsJsonAsync(
                 $"/api/lab/apply/{_activeStrategy.Id}",
-                new ApplyParamsRequest(row.Fast, row.Slow));
+                new ApplyParamsRequest(row.Parameters));
             if (resp.IsSuccessStatusCode)
             {
-                _toast = $"✓ 已套用 Fast={row.Fast} / Slow={row.Slow} 到 {_activeStrategy.Name}";
+                _toast = $"✓ 已套用 {row.ParameterSummary} 到 {_activeStrategy.Name}";
                 _toastIsError = false;
                 await LoadActiveStrategyAsync();
             }

@@ -42,8 +42,13 @@
         if (startUtc >= endUtc) { error = "Start must be before End."; return null; }
         error = null;
         return new OptimizationRequest(
-            FastMin: _fastMin, FastMax: _fastMax, FastStep: _fastStep,
-            SlowMin: _slowMin, SlowMax: _slowMax, SlowStep: _slowStep,
-            StartUtc: startUtc, EndUtc: endUtc);
+            StrategyKey: "sma",
+            Ranges: new[]
+            {
+                new ParameterRangeDto("FastSmaPeriod", _fastMin, _fastMax, _fastStep),
+                new ParameterRangeDto("SlowSmaPeriod", _slowMin, _slowMax, _slowStep),
+            },
+            StartUtc: startUtc,
+            EndUtc: endUtc);
     }
 }

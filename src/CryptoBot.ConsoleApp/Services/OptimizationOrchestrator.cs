@@ -1,5 +1,6 @@
 using CryptoBot.Application.Backtesting;
 using CryptoBot.Application.Strategies;
+using CryptoBot.Application.Strategies.B46RsiBb;
 using CryptoBot.Application.Strategies.SmaCrossover;
 using CryptoBot.ConsoleApp.Realtime;
 using CryptoBot.Domain.Aggregates.StrategyAggregate;
@@ -80,19 +81,16 @@ public sealed class OptimizationOrchestrator
     private async Task RunAsync(OptimizationRequest req, CancellationToken ct)
     {
         _logger.LogInformation(
-            "🧪 [LAB] Optimization requested — Fast {FMin}..{FMax}/{FStep}, Slow {SMin}..{SMax}/{SStep}, window {Start}→{End}",
-            req.FastMin, req.FastMax, req.FastStep, req.SlowMin, req.SlowMax, req.SlowStep,
-            req.StartUtc, req.EndUtc);
+            "🧪 [LAB] Optimization requested — strategy={StrategyKey}, {RangeCount} param ranges, window {Start}→{End}",
+            req.StrategyKey, req.Ranges.Count, req.StartUtc, req.EndUtc);
 
         // 1) 先把 OHLC 下載到 SQLite（跟 CLI 版同一條路徑）
         await EnsureHistoricalAsync(req.StartUtc, req.EndUtc, ct).ConfigureAwait(false);
 
-        // 2) 展開參數網格
-        var ranges = new[]
-        {
-            new ParameterRange("FastSmaPeriod", req.FastMin, req.FastMax, req.FastStep),
-            new ParameterRange("SlowSmaPeriod", req.SlowMin, req.SlowMax, req.SlowStep),
-        };
+        // 2) 展開參數網格（每個策略自己的 param 清單已由 BuildRequest 組好）
+        var ranges = req.Ranges
+            .Select(r => new ParameterRange(r.Name, r.Min, r.Max, r.Step))
+            .ToArray();
 
         // 3) 先算總數，才能在每次完成時推「x / total」
         var total = ranges.Aggregate(1, (acc, r) => acc * r.Enumerate().Count());
@@ -109,24 +107,21 @@ public sealed class OptimizationOrchestrator
             ranges,
             runOne: async (paramSet, token) =>
             {
-                var fast = (int)paramSet["FastSmaPeriod"];
-                var slow = (int)paramSet["SlowSmaPeriod"];
-
                 BacktestReport report;
-                if (fast >= slow)
+                if (!IsValidCombination(req.StrategyKey, paramSet))
                 {
-                    // 無效組合（快線 ≥ 慢線）— 直接回空報告，不浪費算力
+                    // 無效組合（例如 SMA 的 Fast ≥ Slow）— 直接回空報告，不浪費算力
                     report = EmptyReport();
                 }
                 else
                 {
                     using var scope = _scopeFactory.CreateScope();
-                    report = await RunOneBacktestAsync(scope.ServiceProvider, req, fast, slow, token)
+                    report = await RunOneBacktestAsync(scope.ServiceProvider, req, paramSet, token)
                         .ConfigureAwait(false);
                 }
 
                 var done = Interlocked.Increment(ref completed);
-                await BroadcastProgressAsync(done, total, $"Fast={fast}, Slow={slow}")
+                await BroadcastProgressAsync(done, total, FormatParamSet(paramSet))
                     .ConfigureAwait(false);
 
                 return report;
@@ -134,8 +129,35 @@ public sealed class OptimizationOrchestrator
             ct: ct).ConfigureAwait(false);
 
         // 5) 排名 + 推送完成事件
-        await BroadcastCompletedAsync(runs).ConfigureAwait(false);
+        await BroadcastCompletedAsync(req.StrategyKey, runs).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// 策略特定的組合合法性檢查。SMA 要求 Fast &lt; Slow；其他策略目前無額外限制。
+    /// </summary>
+    private static bool IsValidCombination(string strategyKey, IReadOnlyDictionary<string, decimal> paramSet)
+    {
+        if (strategyKey == "sma")
+        {
+            var fast = (int)paramSet["FastSmaPeriod"];
+            var slow = (int)paramSet["SlowSmaPeriod"];
+            return fast < slow;
+        }
+        if (strategyKey == "rsi-bb")
+        {
+            // oversold < overbought 是語義前提；其他維度任意組合都算有效。
+            var oversold   = paramSet.GetValueOrDefault("RsiOversold",   30m);
+            var overbought = paramSet.GetValueOrDefault("RsiOverbought", 70m);
+            return oversold < overbought;
+        }
+        return true;
+    }
+
+    private static string FormatParamSet(IReadOnlyDictionary<string, decimal> paramSet) =>
+        string.Join(", ", paramSet.Select(kv =>
+            kv.Value == Math.Floor(kv.Value)
+                ? $"{kv.Key}={(int)kv.Value}"
+                : $"{kv.Key}={kv.Value}"));
 
     private async Task EnsureHistoricalAsync(DateTime start, DateTime end, CancellationToken ct)
     {
@@ -152,7 +174,7 @@ public sealed class OptimizationOrchestrator
     private static async Task<BacktestReport> RunOneBacktestAsync(
         IServiceProvider scoped,
         OptimizationRequest req,
-        int fast, int slow,
+        IReadOnlyDictionary<string, decimal> paramSet,
         CancellationToken ct)
     {
         var store = scoped.GetRequiredService<IHistoricalKlineStore>();
@@ -175,20 +197,27 @@ public sealed class OptimizationOrchestrator
             interval: Interval,
             leverage: Leverage.Conservative,
             maxKlineWindow: WarmupBars,
-            parameters: new Dictionary<string, decimal>
-            {
-                ["FastSmaPeriod"] = fast,
-                ["SlowSmaPeriod"] = slow,
-            });
+            parameters: new Dictionary<string, decimal>(paramSet));
 
         var simulator = new BacktestSimulator(options, loggerFactory.CreateLogger<BacktestSimulator>());
-        IStrategy strategy = new SmaCrossoverStrategy();
+        IStrategy strategy = ResolveStrategy(req.StrategyKey);
         var engine = new BacktestEngine(
             store: store, clock: simulator, exchange: simulator, strategy: strategy,
             logger: loggerFactory.CreateLogger<BacktestEngine>());
 
         return await engine.RunAsync(options, config, Guid.NewGuid(), ct).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// 策略插槽派發：根據 StrategyCatalog 的 Key 建立對應的 <see cref="IStrategy"/>。
+    /// 新策略要上線優化時在這裡加一個 case。
+    /// </summary>
+    private static IStrategy ResolveStrategy(string strategyKey) => strategyKey switch
+    {
+        "sma"    => new SmaCrossoverStrategy(),
+        "rsi-bb" => new B46RsiBbStrategy(),
+        _        => throw new ArgumentException($"Unknown strategy key: {strategyKey}", nameof(strategyKey))
+    };
 
     private static BacktestReport EmptyReport() => new(
         TotalKlines: 0, SignalsTriggered: 0, OrdersFilled: 0,
@@ -208,7 +237,7 @@ public sealed class OptimizationOrchestrator
         await _hub.Clients.All.SendAsync("OptimizationProgress", update).ConfigureAwait(false);
     }
 
-    private async Task BroadcastCompletedAsync(IReadOnlyList<OptimizationRun> runs)
+    private async Task BroadcastCompletedAsync(string strategyKey, IReadOnlyList<OptimizationRun> runs)
     {
         var ranked = runs
             .Where(r => r.Report.OrdersFilled >= MinFillsForRanking)
@@ -219,10 +248,11 @@ public sealed class OptimizationOrchestrator
         {
             var ratio = ProfitToDrawdownRatio(r.Report);
             var isInf = ratio == decimal.MaxValue;
+            var paramDict = new Dictionary<string, decimal>(r.Parameters);
             return new LeaderboardRowDto(
                 Rank: idx + 1,
-                Fast: (int)r.GetParameter("FastSmaPeriod"),
-                Slow: (int)r.GetParameter("SlowSmaPeriod"),
+                Parameters: paramDict,
+                ParameterSummary: FormatSummary(strategyKey, paramDict),
                 NetPnL: r.Report.NetPnL,
                 ReturnPercent: r.Report.ReturnPercent,
                 MaxDrawdownPercent: r.Report.MaxDrawdownPercent,
@@ -245,6 +275,15 @@ public sealed class OptimizationOrchestrator
             rows.Count, runs.Count);
     }
 
+    private static string FormatSummary(string strategyKey, IReadOnlyDictionary<string, decimal> p)
+    {
+        if (strategyKey == "sma")
+            return $"Fast={(int)p.GetValueOrDefault("FastSmaPeriod")} / Slow={(int)p.GetValueOrDefault("SlowSmaPeriod")}";
+        if (strategyKey == "rsi-bb")
+            return $"RSI={(int)p.GetValueOrDefault("RsiPeriod")} ({(int)p.GetValueOrDefault("RsiOversold")}/{(int)p.GetValueOrDefault("RsiOverbought")}) · BB={(int)p.GetValueOrDefault("BbPeriod")}±{p.GetValueOrDefault("BbStdDev"):0.##}";
+        return FormatParamSet(p);
+    }
+
     private async Task BroadcastFailedAsync(string error)
     {
         var update = new OptimizationFailedUpdate(error);
@@ -260,9 +299,24 @@ public sealed class OptimizationOrchestrator
     }
 }
 
-public sealed record OptimizationRequest(
-    decimal FastMin, decimal FastMax, decimal FastStep,
-    decimal SlowMin, decimal SlowMax, decimal SlowStep,
-    DateTime StartUtc, DateTime EndUtc);
+/// <summary>
+/// 單一參數掃描範圍 DTO — 序列化後給前端表單 / API 用，對應 Application 層的
+/// <see cref="ParameterRange"/>（後者有 Enumerate 邏輯，是引擎用的）。
+/// </summary>
+public sealed record ParameterRangeDto(string Name, decimal Min, decimal Max, decimal Step);
 
-public sealed record ApplyParamsRequest(int Fast, int Slow);
+/// <summary>
+/// 優化請求 — StrategyKey 決定 Orchestrator 要派哪一個 IStrategy + 驗哪些組合限制。
+/// Ranges 是該策略可掃描的參數集合（笛卡兒展開給 BacktestEngine 跑）。
+/// </summary>
+public sealed record OptimizationRequest(
+    string StrategyKey,
+    IReadOnlyList<ParameterRangeDto> Ranges,
+    DateTime StartUtc,
+    DateTime EndUtc);
+
+/// <summary>
+/// Leaderboard 套用請求 — 整包參數字典直接灌進 StrategyConfiguration.Parameters。
+/// 策略自己用 GetParameter("X", default) 取自己要的 key，因此這層不必知道策略型別。
+/// </summary>
+public sealed record ApplyParamsRequest(IReadOnlyDictionary<string, decimal> Parameters);

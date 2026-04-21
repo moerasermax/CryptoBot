@@ -191,7 +191,90 @@ sequenceDiagram
 3. **同模式冪等**：避免 UI 連點兩下造成 double-reconfigure
 4. **Atomic client swap**：`_clientGate` lock 確保 in-flight RPC 看不到「半切」狀態
 
-## 5. 一頁讀懂
+## 5. 金鑰持久化層 + UI 控制流 (S24 + S25)
+
+S24 把 API 金鑰從 `appsettings.json` 搬到 SQLite；S25 讓使用者從 Dashboard 手動切策略大腦 / 開關執行狀態。
+兩者都不改變四層相依方向，只在既有圖上加了一個 **ExchangeAccount Aggregate** 和兩個 Dashboard 控制元件。
+
+```mermaid
+flowchart TB
+    subgraph UI["🖥️ ConsoleApp · Blazor"]
+        Dash["Dashboard.razor<br/>· 決策大腦下拉<br/>· Running/Stopped Toggle<br/>· 金鑰引導 Modal"]
+        Settings["ExchangeSettings.razor<br/>/settings/exchanges"]
+        Gate["KeyRequiredGate<br/>(在 MainLayout 的 banner)"]
+    end
+
+    subgraph Api["🛠️ Minimal API"]
+        Exch["/api/exchange-accounts"]
+        Strat["/api/strategies<br/>/api/strategies/{id}/toggle<br/>/api/strategies/{id}/type<br/>/api/strategies/available-types"]
+    end
+
+    subgraph App["⚙️ Application"]
+        ICredProv["IExchangeCredentialProvider<br/>+ CredentialsChanged event"]
+        IStrFactory["IStrategyFactory<br/>+ KnownTypes"]
+        IRuntime["IStrategyRuntimeController<br/>+ StartAsync / StopAsync<br/>+ ChangeStrategyTypeAsync"]
+    end
+
+    subgraph Dom["💎 Domain"]
+        Agg["ExchangeAccount (AggregateRoot)<br/>+ Create / UpdateCredentials<br/>+ Activate / Deactivate"]
+        Strategy["Strategy (AggregateRoot)<br/>+ ChangeType(newType)"]
+        Repo["IExchangeAccountRepository<br/>+ SetActiveAsync"]
+    end
+
+    subgraph Infra["🔌 Infrastructure"]
+        Db["EF Core · ExchangeAccounts 表<br/>(20260421032109_ExchangeAccounts migration)"]
+        Provider["DbExchangeCredentialProvider<br/>(Singleton · CredentialsChanged fire)"]
+        Bingx["BingXExchangeClient<br/>(ReconfigureCredentials handler)"]
+    end
+
+    Dash --> Api
+    Settings --> Api
+    Gate -. subscribes .-> ICredProv
+
+    Exch --> Repo
+    Exch -. after commit .-> ICredProv
+    Strat --> IRuntime
+    Strat --> IStrFactory
+
+    IRuntime -. owns .-> Strategy
+    Repo --> Agg
+    ICredProv ..|> Provider
+    Provider --> Repo
+    Provider -. notify .-> Bingx
+    Agg -. persisted by .-> Db
+
+    classDef ui fill:#ff4d6d33,stroke:#ff4d6d,color:#e6e8ee
+    classDef api fill:#4dd0e133,stroke:#4dd0e1,color:#e6e8ee
+    classDef app fill:#1de98233,stroke:#1de982,color:#e6e8ee
+    classDef dom fill:#f5b30133,stroke:#f5b301,color:#e6e8ee
+    classDef infra fill:#9f7aea33,stroke:#9f7aea,color:#e6e8ee
+    class Dash,Settings,Gate ui
+    class Exch,Strat api
+    class ICredProv,IStrFactory,IRuntime app
+    class Agg,Strategy,Repo dom
+    class Db,Provider,Bingx infra
+```
+
+### 5.1 S24 金鑰流（UI → DB → SDK client）
+
+1. 使用者在 `/settings/exchanges` 新增或啟用一筆帳號 → `POST /api/exchange-accounts[/{id}/activate]`
+2. Endpoint 呼叫 `IExchangeAccountRepository.SetActiveAsync`（把兄弟帳號 Deactivate）→ `SaveChanges`
+3. 再呼叫 `IExchangeCredentialProvider.NotifyCredentialsChangedAsync(exchange)`（**同步**）
+4. Provider 讀最新的 active 帳號 → fire `CredentialsChanged` event
+5. `BingXExchangeClient` 的 handler 在 `_clientGate` lock 內 dispose 舊 REST client、用新金鑰建新 client
+
+讀取鏈在 §4.6.1 Dev Protocol 有完整流程圖，任何路徑繞過 `IExchangeCredentialProvider` 一律違憲。
+
+### 5.2 S25 策略控制流（Dashboard → Runtime）
+
+兩條干預線彼此獨立：
+
+- **Toggle** (`POST /api/strategies/{id}/toggle`)：由 `IStrategyRuntimeController.StartAsync` / `StopAsync` 處理，`_mutateLock` 串行化。
+- **ChangeType** (`PUT /api/strategies/{id}/type`)：進入 `ChangeStrategyTypeAsync`，順序鎖定為 **Stop executor → Stop aggregate → ChangeType → Start aggregate（若原本在跑）→ 新 executor**。詳見 Data_Flow.md §6。
+
+Domain 層 `Strategy.ChangeType` 會**拒絕**當 `Status == Running` 時被呼叫 — 強制所有換腦動作都走上面的停-換-起流程。
+
+## 6. 一頁讀懂
 
 > 想加新功能？先想：**它應該在哪一層？**
 > 想呼叫一個別層的東西？先想：**箭頭方向對不對？**

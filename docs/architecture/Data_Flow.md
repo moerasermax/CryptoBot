@@ -180,10 +180,140 @@ sequenceDiagram
 
 **關鍵：** 整個流程中**沒有任何訂單被送出** — 因為 Runtime 在步驟 3 就全停了，直到使用者在 UI 手動重啟策略。這就是「金融安全」的具體實作。
 
-## 5. 重點不變式
+## 5. 金鑰管理資料流 (S24)
+
+Key 從使用者 UI 輸入到被 SDK 拿去打 REST call 的完整路徑：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 使用者
+    participant ES as ExchangeSettings.razor<br/>(/settings/exchanges)
+    participant API as /api/exchange-accounts
+    participant Repo as IExchangeAccountRepository<br/>(EF · Scoped)
+    participant DB as SQLite<br/>(ExchangeAccounts 表)
+    participant Prov as IExchangeCredentialProvider<br/>(DbExchangeCredentialProvider · Singleton)
+    participant BX as BingXExchangeClient<br/>(Singleton)
+    participant BXAPI as BingX REST
+
+    U->>ES: 填入 ApiKey / ApiSecret + Activate=true
+    ES->>API: POST /api/exchange-accounts
+    API->>Repo: AddAsync(account)
+    API->>Repo: SetActiveAsync(id)<br/>（deactivate 兄弟）
+    API->>Repo: uow.SaveChangesAsync
+    Repo->>DB: INSERT / UPDATE ExchangeAccounts
+
+    API->>Prov: NotifyCredentialsChangedAsync(BingX)
+    Prov->>Repo: GetActiveAsync(BingX)
+    Repo-->>Prov: ExchangeCredentials(IsConfigured=true)
+    Note over Prov: fire CredentialsChanged event
+    Prov->>BX: event handler<br/>ReconfigureCredentials(new key)
+    Note over BX: lock(_clientGate)<br/>Dispose old BingXRestClient<br/>Build new(apiKey, apiSecret)
+
+    API-->>ES: 201 Created
+    ES-->>U: "已新增並啟用 — SDK client 已重建"
+
+    Note over BX,BXAPI: 之後任何 REST call 都用新金鑰
+    BX->>BXAPI: GET /balance / POST /order ...
+```
+
+### 關鍵保證
+
+- **同交易所至多一筆 Active**：由 `SetActiveAsync` 在同一個 DB transaction 內 deactivate 其他帳號來保證。
+- **同步事件 fire**：`NotifyCredentialsChangedAsync` 必須在返回前把所有 handler 跑完，否則 API response 到 UI 的時候 SDK 仍拿舊金鑰。
+- **密文不回傳 UI**：`GET /api/exchange-accounts` 對 ApiKey 回 `first4…last4` 預覽、對 ApiSecret 一律 `••••••` 遮罩。
+- **空字串保留原值**：`PUT /api/exchange-accounts/{id}` 以空字串送回 secret 不會覆寫 DB（Domain 層 `ExchangeAccount.UpdateCredentials` 保證）。
+
+## 6. 策略大腦熱切換資料流 (S25)
+
+Dashboard 下拉選單換「決策大腦」的完整路徑：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 使用者
+    participant D as Dashboard.razor
+    participant API as /api/strategies/{id}/type
+    participant F as IStrategyFactory
+    participant C as IStrategyRuntimeController<br/>(= StrategyRuntimeHostedService)
+    participant E as 舊 IStrategyExecutor
+    participant Repo as IStrategyRepository
+    participant Ne as 新 IStrategyExecutor
+
+    U->>D: 下拉選「B46RsiBb」(原本 SmaCrossover)
+    D->>API: PUT { "strategyType": "B46RsiBb" }
+    API->>F: KnownTypes.Contains("B46RsiBb")?
+    F-->>API: true
+    API->>C: ChangeStrategyTypeAsync(id, "B46RsiBb")
+
+    Note over C: await _mutateLock
+    C->>F: Get("B46RsiBb") → 預檢類型存在
+    C->>E: StopAsync()（若在跑）
+    E-->>C: stopped
+    Note over C: _executors.Remove(id)
+
+    C->>Repo: strategy.Stop("Type change in progress")
+    C->>Repo: strategy.ChangeType("B46RsiBb")
+    C->>Repo: strategy.Start()（若原本 Running）
+    C->>Repo: uow.SaveChangesAsync
+
+    alt 原本在跑
+        C->>Ne: executorFactory.Create(strategy, impl)
+        C->>Ne: StartAsync()
+        Note over C: _executors[id] = Ne
+    end
+
+    C-->>API: true
+    API->>Repo: 重拉最新狀態
+    API-->>D: 200 { StrategyType: "B46RsiBb", Status: "Running" }
+    D-->>U: 下拉 + Toggle 與 DB 一致
+```
+
+### 6.1 Toggle 路徑（更短）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 使用者
+    participant D as Dashboard.razor
+    participant API as /api/strategies/{id}/toggle
+    participant C as IStrategyRuntimeController
+    participant Repo as IStrategyRepository
+
+    U->>D: 點 Running/Stopped Toggle
+    D->>API: POST
+    API->>Repo: GetByIdAsync(id)
+    API->>C: Status == Running ? StopAsync : StartAsync
+    alt Start
+        C->>Repo: strategy.Start() + SaveChanges
+        C->>C: executorFactory.Create + executor.StartAsync
+    else Stop
+        C->>C: executor.StopAsync + remove
+        C->>Repo: strategy.Stop("Stopped via API") + SaveChanges
+    end
+    C-->>API: bool
+    API-->>D: ToggleResponseDto
+    D->>D: LoadStrategyControlsAsync()（重拉）
+    D-->>U: Toggle 反映最新狀態
+```
+
+### 6.2 熱切換安全線
+
+| 動作 | 是否停 executor | 是否改 DB Status | 是否改 Strategy.StrategyType | 是否重建 executor |
+|---|---|---|---|---|
+| **Toggle → Start** | — | Stopped → Running | — | Yes (新) |
+| **Toggle → Stop** | Yes | Running → Stopped | — | — |
+| **ChangeType（Running 中）** | Yes | Running → Stopped →（type 換完）→ Running | Yes | Yes (新類型) |
+| **ChangeType（Stopped 中）** | — | Stopped（不動） | Yes | — |
+
+Domain 層 `Strategy.ChangeType` 拒絕當 `Status == Running` 時被直接呼叫 — 上表的 Running-中 換腦動作**必須**由 Controller 先翻 Stopped 再換類型。任何繞過 Controller 直接在 Application service 裡改 Type 的程式碼一律違憲。
+
+## 7. 重點不變式
 
 - **WS → Application 必經 Infrastructure 翻譯**：Application 看到的永遠是 `Kline` / `MarketSnapshot` / `Position`，不是 `BingXFuturesAccountUpdate`。
 - **DB 寫入永遠走 Repository 介面**，沒有任何路徑直接 `dbContext.SaveChanges()` 跳過抽象。
 - **推播是雙通道**：本機 Blazor 走 `DashboardEventBus`（in-process），外部 client 走 SignalR — 兩者由 Orchestrator 同步觸發。
 - **回測完全離線**：BacktestEngine 不碰任何外部 API，所有資料來自 `IHistoricalKlineStore`。
 - **環境切換 Stop-First**：`IEnvironmentSwitcher.SwitchAsync` 永遠先 `StopAllAsync` 再 `ReconfigureAsync`，順序不可重排。
+- **金鑰唯一來源 = SQLite**：Application 層程式碼不得再從 `IConfiguration` 讀 `BingX:ApiKey`；一律透過 `IExchangeCredentialProvider`。
+- **Running 中不得換腦**：Domain 層 `Strategy.ChangeType` 強制先 Stop。UI 換型走 Controller 的 Stop-Then-Start 流程。

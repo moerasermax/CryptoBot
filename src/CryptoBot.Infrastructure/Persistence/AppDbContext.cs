@@ -1,3 +1,4 @@
+using CryptoBot.Domain.Aggregates.ExchangeAccountAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
 using CryptoBot.Domain.Aggregates.PositionAggregate;
 using CryptoBot.Domain.Aggregates.StrategyAggregate;
@@ -23,6 +24,7 @@ public sealed class AppDbContext : DbContext
     public DbSet<Position> Positions => Set<Position>();
     public DbSet<Strategy> Strategies => Set<Strategy>();
     public DbSet<HistoricalKlineRecord> HistoricalKlines => Set<HistoricalKlineRecord>();
+    public DbSet<ExchangeAccount> ExchangeAccounts => Set<ExchangeAccount>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

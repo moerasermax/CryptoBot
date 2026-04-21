@@ -1,0 +1,230 @@
+@page "/settings/exchanges"
+@using System.Net.Http.Json
+@using CryptoBot.ConsoleApp.Api
+@inject IHttpClientFactory HttpFactory
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+@rendermode InteractiveServer
+
+<PageTitle>CryptoBot · Exchange Keys</PageTitle>
+
+<section class="panel">
+    <header class="panel-header">
+        <h2>交易所金鑰管理</h2>
+        <span class="panel-sub">S24 · SQLite-backed, hot-swappable</span>
+    </header>
+
+    <div class="settings-body">
+        <p class="settings-hint">
+            把 API Key / Secret 存到本機 SQLite — 新增後按「啟用」即時生效，不必重啟。
+            同一個交易所只能有一個啟用中的帳號；切換時舊的自動停用。
+            <strong>⚠️ 金鑰以明文落地於 <code>cryptobot.db</code>，請確保檔案權限。</strong>
+        </p>
+
+        @if (!string.IsNullOrEmpty(_error))
+        {
+            <div class="settings-error">@_error</div>
+        }
+        @if (!string.IsNullOrEmpty(_info))
+        {
+            <div class="settings-info">@_info</div>
+        }
+
+        <h3 class="settings-subtitle">新增帳號</h3>
+        <div class="glass-form">
+            <div class="glass-row">
+                <label class="glass-label">Exchange</label>
+                <div class="glass-cell" style="flex:2">
+                    <select @bind="_newExchange" class="glass-select">
+                        @foreach (var ex in _allExchanges)
+                        {
+                            <option value="@ex">@ex</option>
+                        }
+                    </select>
+                </div>
+            </div>
+            <div class="glass-row">
+                <label class="glass-label">Account Name</label>
+                <div class="glass-cell" style="flex:2">
+                    <input type="text" placeholder="例：main / sub-1" @bind="_newAccountName" />
+                </div>
+            </div>
+            <div class="glass-row">
+                <label class="glass-label">API Key</label>
+                <div class="glass-cell" style="flex:2">
+                    <input type="text" @bind="_newApiKey" />
+                </div>
+            </div>
+            <div class="glass-row">
+                <label class="glass-label">API Secret</label>
+                <div class="glass-cell" style="flex:2">
+                    <input type="password" @bind="_newApiSecret" />
+                </div>
+            </div>
+            <div class="glass-row">
+                <label class="glass-label">儲存後立即啟用</label>
+                <div class="glass-cell" style="flex:2">
+                    <input type="checkbox" @bind="_newActivate" />
+                </div>
+            </div>
+        </div>
+        <div class="settings-actions">
+            <button class="btn-primary" disabled="@_busy" @onclick="AddAccountAsync">新增帳號</button>
+        </div>
+
+        <h3 class="settings-subtitle">已存帳號</h3>
+        @if (_accounts.Count == 0)
+        {
+            <div class="empty">尚無任何交易所帳號 — 新增上方表單後生效。</div>
+        }
+        else
+        {
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Exchange</th>
+                        <th>Account</th>
+                        <th>API Key</th>
+                        <th>API Secret</th>
+                        <th>Status</th>
+                        <th>Updated</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var a in _accounts)
+                    {
+                        <tr>
+                            <td>@a.Exchange</td>
+                            <td>@a.AccountName</td>
+                            <td><code>@a.ApiKeyPreview</code></td>
+                            <td><code>@a.ApiSecretMask</code></td>
+                            <td class="@(a.IsActive ? "pos" : "")">@(a.IsActive ? "ACTIVE" : "—")</td>
+                            <td>@a.UpdatedAt.ToLocalTime().ToString("MM-dd HH:mm")</td>
+                            <td>
+                                @if (!a.IsActive)
+                                {
+                                    <button class="btn-apply" disabled="@_busy" @onclick="@(() => ActivateAsync(a.Id))">啟用</button>
+                                }
+                                <button class="btn-danger" disabled="@_busy" @onclick="@(() => DeleteAsync(a.Id))">刪除</button>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </div>
+</section>
+
+@code {
+    private static readonly string[] _allExchanges =
+        Enum.GetNames(typeof(CryptoBot.Domain.Enums.ExchangeName));
+
+    private List<ExchangeAccountDto> _accounts = new();
+    private string _newExchange = "BingX";
+    private string _newAccountName = "main";
+    private string _newApiKey = string.Empty;
+    private string _newApiSecret = string.Empty;
+    private bool _newActivate = true;
+    private bool _busy;
+    private string? _error;
+    private string? _info;
+
+    private HttpClient CreateClient()
+    {
+        var http = HttpFactory.CreateClient();
+        http.BaseAddress = new Uri(Nav.BaseUri);
+        return http;
+    }
+
+    protected override async Task OnInitializedAsync() => await ReloadAsync();
+
+    private async Task ReloadAsync()
+    {
+        try
+        {
+            using var http = CreateClient();
+            var list = await http.GetFromJsonAsync<List<ExchangeAccountDto>>("/api/exchange-accounts");
+            _accounts = list ?? new();
+        }
+        catch (Exception ex)
+        {
+            _error = $"載入失敗：{ex.Message}";
+        }
+    }
+
+    private async Task AddAccountAsync()
+    {
+        _error = _info = null;
+
+        if (string.IsNullOrWhiteSpace(_newApiKey) || string.IsNullOrWhiteSpace(_newApiSecret))
+        {
+            _error = "API Key / Secret 不能為空。";
+            return;
+        }
+
+        _busy = true;
+        try
+        {
+            var req = new CreateExchangeAccountRequest(
+                Exchange: _newExchange,
+                AccountName: _newAccountName,
+                ApiKey: _newApiKey,
+                ApiSecret: _newApiSecret,
+                Activate: _newActivate);
+
+            using var http = CreateClient();
+            var resp = await http.PostAsJsonAsync("/api/exchange-accounts", req);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _error = $"新增失敗：{resp.StatusCode} {(await resp.Content.ReadAsStringAsync())}";
+                return;
+            }
+
+            _info = _newActivate ? "已新增並啟用 — SDK client 已重建。" : "已新增（未啟用）。";
+            _newApiKey = _newApiSecret = string.Empty;
+            _newAccountName = "main";
+            await ReloadAsync();
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task ActivateAsync(Guid id)
+    {
+        _error = _info = null; _busy = true;
+        try
+        {
+            using var http = CreateClient();
+            var resp = await http.PostAsync($"/api/exchange-accounts/{id}/activate", null);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _error = $"啟用失敗：{resp.StatusCode} {(await resp.Content.ReadAsStringAsync())}";
+                return;
+            }
+            _info = "已切換啟用帳號 — SDK client 已重建。";
+            await ReloadAsync();
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task DeleteAsync(Guid id)
+    {
+        var ok = await JS.InvokeAsync<bool>("confirm", "確定刪除這筆帳號？若為 ACTIVE 將使該交易所變為未配置。");
+        if (!ok) return;
+
+        _error = _info = null; _busy = true;
+        try
+        {
+            using var http = CreateClient();
+            var resp = await http.DeleteAsync($"/api/exchange-accounts/{id}");
+            if (!resp.IsSuccessStatusCode)
+            {
+                _error = $"刪除失敗：{resp.StatusCode} {(await resp.Content.ReadAsStringAsync())}";
+                return;
+            }
+            _info = "已刪除。";
+            await ReloadAsync();
+        }
+        finally { _busy = false; }
+    }
+}

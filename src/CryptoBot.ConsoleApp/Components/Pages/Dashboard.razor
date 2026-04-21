@@ -1,16 +1,112 @@
 @page "/"
 @using System.Collections.Generic
 @using System.Linq
+@using System.Net.Http.Json
+@using CryptoBot.Application.Common.Interfaces
 @using CryptoBot.Application.Realtime
 @using CryptoBot.ConsoleApp.Api.Dtos
 @using CryptoBot.ConsoleApp.Realtime
 @using CryptoBot.ConsoleApp.Services
+@using CryptoBot.Domain.Enums
 @using CryptoBot.Domain.Repositories
 @inject IServiceScopeFactory ScopeFactory
 @inject DashboardEventBus Bus
+@inject IExchangeCredentialProvider Credentials
+@inject IHttpClientFactory HttpFactory
+@inject NavigationManager Nav
+@rendermode InteractiveServer
 @implements IDisposable
 
 <PageTitle>CryptoBot · Dashboard</PageTitle>
+
+@if (_showKeyModal)
+{
+    <div class="env-modal-backdrop">
+        <div class="env-modal" role="dialog" aria-modal="true">
+            <div class="env-modal-header">
+                <span class="env-modal-icon">🔑</span>
+                <h3>尚未設定 BingX API 金鑰</h3>
+            </div>
+            <div class="env-modal-body">
+                <p class="env-modal-warn-line">
+                    系統目前沒有任何啟用中的交易所金鑰。在設定前指揮中心無法查詢餘額或下單。
+                </p>
+                <ul class="env-modal-bullets">
+                    <li>請到 <b>Settings · 金鑰</b> 頁面新增一組 API Key / Secret。</li>
+                    <li>金鑰以 SQLite 本地儲存 — <b>切勿</b> 把 cryptobot.db 傳到公開環境。</li>
+                    <li>切換 / 刪除會即時重建 SDK client，不需重啟服務。</li>
+                </ul>
+            </div>
+            <div class="env-modal-actions">
+                <button type="button" class="env-modal-btn env-modal-btn-cancel" @onclick="DismissKeyModal">
+                    稍後再設定
+                </button>
+                <button type="button" class="env-modal-btn env-modal-btn-danger" @onclick="GoToKeySettings">
+                    前往金鑰設定
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+<section class="panel">
+    <header class="panel-header">
+        <h2>策略控制台</h2>
+        <span class="panel-sub">S25 · 策略大腦與執行狀態即時切換</span>
+    </header>
+    @if (_primaryStrategy is null)
+    {
+        <div class="empty">尚未建立任何策略 — 請先從 seed 或 /lab 新增。</div>
+    }
+    else
+    {
+        <div class="control-row">
+            <div class="control-cell">
+                <label class="control-label">Strategy</label>
+                <div class="control-value">
+                    <strong>@_primaryStrategy.Name</strong>
+                    <span class="panel-sub">@_primaryStrategy.Symbol · @_primaryStrategy.Interval</span>
+                </div>
+            </div>
+
+            <div class="control-cell">
+                <label class="control-label">決策大腦</label>
+                <select class="glass-select"
+                        disabled="@(_ctrlBusy || _availableTypes.Count == 0)"
+                        @bind="_selectedStrategyType"
+                        @bind:after="OnStrategyTypeChangedAsync">
+                    @foreach (var t in _availableTypes)
+                    {
+                        <option value="@t">@t</option>
+                    }
+                </select>
+            </div>
+
+            <div class="control-cell">
+                <label class="control-label">執行狀態</label>
+                <label class="toggle-switch">
+                    <input type="checkbox"
+                           disabled="@_ctrlBusy"
+                           checked="@(_primaryStrategy.Status == "Running")"
+                           @onchange="OnToggleRunningAsync" />
+                    <span class="toggle-slider"></span>
+                    <span class="toggle-text @(_primaryStrategy.Status == "Running" ? "pos" : "neg")">
+                        @(_primaryStrategy.Status == "Running" ? "Running" : _primaryStrategy.Status)
+                    </span>
+                </label>
+            </div>
+        </div>
+
+        @if (!string.IsNullOrEmpty(_ctrlInfo))
+        {
+            <div class="settings-info">@_ctrlInfo</div>
+        }
+        @if (!string.IsNullOrEmpty(_ctrlError))
+        {
+            <div class="settings-error">@_ctrlError</div>
+        }
+    }
+</section>
 
 <section class="grid-cards">
     <article class="card">
@@ -129,17 +225,142 @@
 
     private Action<DashboardStatsUpdate>? _statsHandler;
     private Action<TradeFilledUpdate>? _tradeHandler;
+    private EventHandler<ExchangeCredentialsChangedEventArgs>? _credsHandler;
+
+    // S25 controls
+    private StrategyDto? _primaryStrategy;
+    private string _selectedStrategyType = string.Empty;
+    private List<string> _availableTypes = new();
+    private bool _ctrlBusy;
+    private string? _ctrlInfo;
+    private string? _ctrlError;
+
+    // S24 onboarding
+    private bool _showKeyModal;
+    private bool _keyModalDismissed;
+
+    private HttpClient CreateClient()
+    {
+        var http = HttpFactory.CreateClient();
+        http.BaseAddress = new Uri(Nav.BaseUri);
+        return http;
+    }
 
     protected override async Task OnInitializedAsync()
     {
+        await RefreshKeyGateAsync();
+        _credsHandler = OnCredentialsChanged;
+        Credentials.CredentialsChanged += _credsHandler;
+
         // 1) 首屏快照（不等 2s 心跳）
         await RefreshSnapshotAsync();
+        await LoadStrategyControlsAsync();
 
         // 2) 訂閱即時推播 — 後續只差異更新，不再整包重拉
         _statsHandler = OnStatsUpdate;
         _tradeHandler = OnTradeFilled;
         Bus.StatsUpdated += _statsHandler;
         Bus.TradeFilled += _tradeHandler;
+    }
+
+    private async Task RefreshKeyGateAsync()
+    {
+        try
+        {
+            var c = await Credentials.GetActiveAsync(ExchangeName.BingX);
+            _showKeyModal = !c.IsConfigured && !_keyModalDismissed;
+        }
+        catch
+        {
+            _showKeyModal = !_keyModalDismissed;
+        }
+    }
+
+    private void OnCredentialsChanged(object? sender, ExchangeCredentialsChangedEventArgs e)
+    {
+        if (e.Exchange != ExchangeName.BingX) return;
+        _showKeyModal = !e.Credentials.IsConfigured && !_keyModalDismissed;
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void DismissKeyModal()
+    {
+        _keyModalDismissed = true;
+        _showKeyModal = false;
+    }
+
+    private void GoToKeySettings()
+    {
+        _keyModalDismissed = true;
+        Nav.NavigateTo("/settings/exchanges");
+    }
+
+    private async Task LoadStrategyControlsAsync()
+    {
+        try
+        {
+            using var http = CreateClient();
+            var list = await http.GetFromJsonAsync<List<StrategyDto>>("/api/strategies");
+            _primaryStrategy = list?.FirstOrDefault();
+            _selectedStrategyType = _primaryStrategy?.StrategyType ?? string.Empty;
+
+            var types = await http.GetFromJsonAsync<List<string>>("/api/strategies/available-types");
+            _availableTypes = types ?? new List<string>();
+        }
+        catch (Exception ex)
+        {
+            _ctrlError = $"載入策略控制台失敗：{ex.Message}";
+        }
+    }
+
+    private async Task OnStrategyTypeChangedAsync()
+    {
+        if (_primaryStrategy is null) return;
+        if (string.IsNullOrWhiteSpace(_selectedStrategyType)) return;
+        if (_selectedStrategyType == _primaryStrategy.StrategyType) return;
+
+        _ctrlBusy = true; _ctrlError = _ctrlInfo = null;
+        try
+        {
+            using var http = CreateClient();
+            var resp = await http.PutAsJsonAsync(
+                $"/api/strategies/{_primaryStrategy.Id}/type",
+                new ChangeStrategyTypeRequest(_selectedStrategyType));
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                _ctrlError = $"切換失敗：{resp.StatusCode} {(await resp.Content.ReadAsStringAsync())}";
+                _selectedStrategyType = _primaryStrategy.StrategyType; // 回滾
+                return;
+            }
+
+            var body = await resp.Content.ReadFromJsonAsync<ChangeStrategyTypeResponseDto>();
+            _ctrlInfo = body?.Message ?? "已切換決策大腦。";
+            await LoadStrategyControlsAsync();
+        }
+        finally { _ctrlBusy = false; }
+    }
+
+    private async Task OnToggleRunningAsync(ChangeEventArgs _)
+    {
+        if (_primaryStrategy is null) return;
+
+        _ctrlBusy = true; _ctrlError = _ctrlInfo = null;
+        try
+        {
+            using var http = CreateClient();
+            var resp = await http.PostAsync($"/api/strategies/{_primaryStrategy.Id}/toggle", null);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _ctrlError = $"狀態切換失敗：{resp.StatusCode} {(await resp.Content.ReadAsStringAsync())}";
+                return;
+            }
+
+            var body = await resp.Content.ReadFromJsonAsync<ToggleResponseDto>();
+            _ctrlInfo = body?.Message ?? "已切換狀態。";
+            await LoadStrategyControlsAsync();
+        }
+        finally { _ctrlBusy = false; }
     }
 
     private async Task RefreshSnapshotAsync()
@@ -202,5 +423,6 @@
     {
         if (_statsHandler is not null) Bus.StatsUpdated -= _statsHandler;
         if (_tradeHandler is not null) Bus.TradeFilled -= _tradeHandler;
+        if (_credsHandler is not null) Credentials.CredentialsChanged -= _credsHandler;
     }
 }

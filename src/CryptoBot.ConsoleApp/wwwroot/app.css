@@ -1107,4 +1107,107 @@ body::before {
     to   { opacity: 1; transform: translateY(0)    scale(1); }
 }
 
+/* ===== S24 Exchange Settings 页面 ===== */
+.key-gate-banner {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 20px;
+    background: linear-gradient(90deg, rgba(255, 180, 40, 0.22), rgba(255, 60, 60, 0.18));
+    border-bottom: 1px solid rgba(255, 180, 40, 0.35);
+    font-size: 13px; color: #ffe9b8;
+}
+.key-gate-icon { font-size: 18px; }
+.key-gate-banner a { color: #ffd27a; text-decoration: underline; }
+.key-gate-banner a:hover { color: #fff3cd; }
+
+.settings-body { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+.settings-hint {
+    color: var(--text-dim); font-size: 13px; line-height: 1.6;
+    padding: 12px 14px; background: rgba(255,255,255,0.03);
+    border-left: 3px solid var(--accent, #6aa7ff); border-radius: 4px;
+}
+.settings-hint code { color: #ffd27a; }
+.settings-subtitle {
+    font-size: 14px; letter-spacing: 0.5px; text-transform: uppercase;
+    color: var(--text-dim); margin: 12px 0 4px;
+}
+.settings-actions { display: flex; gap: 10px; }
+.settings-error {
+    padding: 10px 14px; border-radius: 4px;
+    background: rgba(255, 59, 92, 0.15); color: #ff8fa3;
+    border-left: 3px solid var(--neg, #ff3b5c);
+}
+.settings-info {
+    padding: 10px 14px; border-radius: 4px;
+    background: rgba(46, 255, 139, 0.12); color: #8cf7b6;
+    border-left: 3px solid var(--pos, #2eff8b);
+}
+.glass-select {
+    width: 100%; padding: 6px 10px;
+    background: rgba(255,255,255,0.05); color: var(--text, #e5ecf7);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 4px;
+}
+.btn-danger {
+    padding: 4px 10px; margin-left: 6px;
+    background: rgba(255, 59, 92, 0.18); color: #ffb1c2;
+    border: 1px solid rgba(255, 59, 92, 0.4); border-radius: 4px;
+    cursor: pointer; font-size: 12px;
+}
+.btn-danger:hover:not(:disabled) { background: rgba(255, 59, 92, 0.3); }
+.btn-danger:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ===== S25 Dashboard 策略控制台 ===== */
+.control-row {
+    display: flex; gap: 18px; padding: 16px 20px;
+    flex-wrap: wrap; align-items: flex-end;
+}
+.control-cell {
+    display: flex; flex-direction: column; gap: 6px;
+    min-width: 180px; flex: 1;
+}
+.control-label {
+    font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
+    color: var(--text-dim, #8a93a6);
+}
+.control-value {
+    display: flex; flex-direction: column; gap: 2px;
+    color: var(--text, #e5ecf7);
+}
+
+.toggle-switch {
+    position: relative; display: inline-flex; align-items: center;
+    gap: 10px; cursor: pointer; user-select: none;
+    padding: 6px 0;
+}
+.toggle-switch input[type="checkbox"] {
+    position: absolute; opacity: 0; width: 0; height: 0;
+}
+.toggle-slider {
+    width: 44px; height: 22px; border-radius: 22px;
+    background: rgba(255,255,255,0.12);
+    border: 1px solid rgba(255,255,255,0.18);
+    position: relative; transition: background 160ms ease;
+    flex-shrink: 0;
+}
+.toggle-slider::before {
+    content: ""; position: absolute;
+    top: 2px; left: 2px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #e5ecf7;
+    transition: transform 160ms cubic-bezier(0.25, 1, 0.5, 1);
+}
+.toggle-switch input[type="checkbox"]:checked + .toggle-slider {
+    background: linear-gradient(90deg, rgba(46, 255, 139, 0.55), rgba(46, 255, 139, 0.85));
+    border-color: rgba(46, 255, 139, 0.7);
+}
+.toggle-switch input[type="checkbox"]:checked + .toggle-slider::before {
+    transform: translateX(22px);
+}
+.toggle-switch input[type="checkbox"]:disabled + .toggle-slider {
+    opacity: 0.45; cursor: not-allowed;
+}
+.toggle-text {
+    font-size: 13px; letter-spacing: 0.3px;
+    font-weight: 500;
+}
+
 

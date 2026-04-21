@@ -1,3 +1,4 @@
+using CryptoBot.Domain.Aggregates.ExchangeAccountAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
 using CryptoBot.Domain.Aggregates.PositionAggregate;
 using CryptoBot.Domain.Aggregates.StrategyAggregate;
@@ -51,6 +52,27 @@ public interface IStrategyRepository
     Task AddAsync(Strategy strategy, CancellationToken ct = default);
     Task UpdateAsync(Strategy strategy, CancellationToken ct = default);
     Task DeleteAsync(Guid id, CancellationToken ct = default);
+}
+
+/// <summary>
+/// 交易所帳號儲存庫介面 — S24 起，金鑰由 SQLite 管理而非 appsettings.json。
+/// SetActiveAsync 內部負責「同交易所至多一筆 active」的去活化動作。
+/// </summary>
+public interface IExchangeAccountRepository
+{
+    Task<ExchangeAccount?> GetByIdAsync(Guid id, CancellationToken ct = default);
+    Task<ExchangeAccount?> GetActiveAsync(ExchangeName exchange, CancellationToken ct = default);
+    Task<IReadOnlyList<ExchangeAccount>> GetAllAsync(CancellationToken ct = default);
+    Task<IReadOnlyList<ExchangeAccount>> GetByExchangeAsync(ExchangeName exchange, CancellationToken ct = default);
+    Task AddAsync(ExchangeAccount account, CancellationToken ct = default);
+    Task UpdateAsync(ExchangeAccount account, CancellationToken ct = default);
+    Task DeleteAsync(Guid id, CancellationToken ct = default);
+
+    /// <summary>
+    /// 把指定 id 設為該交易所唯一 active；同交易所其他帳號自動 Deactivate。
+    /// 呼叫端負責 SaveChanges。
+    /// </summary>
+    Task SetActiveAsync(Guid id, CancellationToken ct = default);
 }
 
 /// <summary>

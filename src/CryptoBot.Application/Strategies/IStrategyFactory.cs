@@ -12,6 +12,12 @@ public interface IStrategyFactory
 {
     /// <summary>依類型字串取得策略實作。找不到丟 <see cref="DomainException"/>。</summary>
     IStrategy Get(string strategyType);
+
+    /// <summary>
+    /// S25：所有已註冊的策略類型字串（Dashboard 下拉選單用）。
+    /// 等同於 DI 容器裡所有具體 <see cref="IStrategy"/> 實作的 <c>StrategyType</c> 集合。
+    /// </summary>
+    IReadOnlyList<string> KnownTypes { get; }
 }
 
 /// <summary>
@@ -44,4 +50,6 @@ public sealed class StrategyFactory : IStrategyFactory
             $"No IStrategy registered for type '{strategyType}'. " +
             $"Known: [{string.Join(", ", _byType.Keys)}].");
     }
+
+    public IReadOnlyList<string> KnownTypes => _byType.Keys.OrderBy(k => k).ToArray();
 }

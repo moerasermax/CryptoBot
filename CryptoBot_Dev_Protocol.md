@@ -1,6 +1,6 @@
 # CryptoBot 開發憲章 (Development Manifesto)
 
-> **版本**：v1.1 · 2026-04-21 · Beta v0.1（含 S21 環境熱切換）
+> **版本**：v1.2 · 2026-04-21 · Beta v0.2（含 S24 金鑰持久化 + S25 手動控制台）
 > **位階**：本文件為本專案最高技術準則，凌駕個別 PR / Issue / 心情。
 > 任何與本憲章衝突的程式碼、設計或流程，**一律以憲章為準**。
 > 修訂憲章本身需要明確的 commit + 在本檔頂端遞增版本號。
@@ -268,6 +268,94 @@ Live → Demo 不需要二次確認（往安全方向走不防呆）。
 
 ---
 
+## §4.6 金鑰持久化規範 (S24)
+
+API Key / Secret **不得再依賴** `appsettings.json`、`appsettings.Local.json` 或環境變數作為主要來源。
+金鑰的唯一權威儲存是 SQLite 裡的 `ExchangeAccount` Aggregate，由 `IExchangeAccountRepository` 管理。
+
+### 4.6.1 讀取鏈路（**唯一合法順序**）
+
+```
+UI 或 Background Service
+       │
+       ▼
+IExchangeCredentialProvider.GetActiveAsync(ExchangeName)   (Application 介面)
+       │
+       ▼
+DbExchangeCredentialProvider  (Infrastructure 實作 · Singleton)
+       │   scope = IServiceScopeFactory.CreateScope()
+       ▼
+IExchangeAccountRepository.GetActiveAsync(ExchangeName)    (Scoped · EF)
+       │
+       ▼
+ExchangeCredentials { Exchange, AccountName, ApiKey, ApiSecret, IsConfigured }
+```
+
+任何「直接從 `IConfiguration` 拉 `BingX:ApiKey`」的新程式碼**一律退件**。`appsettings.json` 內的
+`BingX:ApiKey` / `ApiSecret` 欄位僅保留給 bootstrap 啟動時的 SDK client 最小配置，執行期一律以 Provider 為準。
+
+### 4.6.2 寫入鏈路與不變式
+
+- 同一個 `ExchangeName` 在任何時刻**最多一筆** `IsActive = true`。由 `IExchangeAccountRepository.SetActiveAsync` 在切換時同步 deactivate 兄弟帳號來保證 — 呼叫端只負責 `SaveChanges`。
+- `ExchangeAccount.Activate()` 拒絕空金鑰 — `ApiKey` 或 `ApiSecret` 空字串時丟 `DomainException`。
+- `ExchangeAccount.UpdateCredentials` 對 **空字串** 採「保留原值」語意；`null` 同理。目的：UI 顯示遮罩的 secret 時，使用者若只改 key，送空 secret 回來不能覆蓋真實密文。
+
+### 4.6.3 `CredentialsChanged` 事件契約
+
+UI 儲存 / 啟用 / 刪除帳號後，**API 端點必須**呼叫 `IExchangeCredentialProvider.NotifyCredentialsChangedAsync(exchange)`：
+
+- 事件採**同步 fire**：handler（如 `BingXExchangeClient.ReconfigureCredentials`）必須在呼叫返回前完成 SDK client 置換，否則後續 REST 呼叫會撿到舊金鑰。
+- Handler 內部必須以 `_clientGate` lock 包住「舊 client dispose + 新 client 建立」，參照 §4.5.2 的鎖契約。
+
+### 4.6.4 安全警告（必寫進 UI 文案）
+
+SQLite（`cryptobot.db`）目前以**明文**存放金鑰。短期仰賴 Windows 檔案權限；中期應掛 Data Protection API 對 `ApiKey` / `ApiSecret` 欄位加密後落地。在加密尚未就位前：
+
+- 不得把 `cryptobot.db` commit 進 git（根目錄 `.gitignore` 已列入）。
+- 不得把 `cryptobot.db` 分享到任何公開頻道（Discord、Slack、email 附件）。
+- 建議只存 **BingX Demo (VST)** 金鑰。
+
+---
+
+## §4.7 手動干預安全準則 (S25)
+
+Dashboard 新增的「策略模型切換」與「Running/Stopped Toggle」是合法的使用者干預點，但必須遵守下列契約，避免「熱換腦袋」期間產生訂單錯配。
+
+### 4.7.1 Running/Stopped Toggle
+
+- UI 呼叫 `POST /api/strategies/{id}/toggle`，**不准**自己操作 `Strategy` Aggregate 或 DB。
+- 委派給 `IStrategyRuntimeController`：`Start` 建立新 `IStrategyExecutor` 並把 DB 狀態翻為 Running；`Stop` 停掉 executor、狀態翻為 Stopped。全鏈路透過 `_mutateLock` 串行化。
+- 多人同時點 Toggle 由 Semaphore 保證一次只跑一個切換（冪等）。
+
+### 4.7.2 策略模型切換（ChangeType）
+
+- UI 呼叫 `PUT /api/strategies/{id}/type`，body：`{ "strategyType": "..." }`。
+- 未註冊於 `IStrategyFactory.KnownTypes` 的字串一律 400 BadRequest，**不觸碰 DB 或 executor**。
+- `IStrategyRuntimeController.ChangeStrategyTypeAsync` 內部順序**不准重排**：
+  ```
+  [1] 取 _mutateLock
+  [2] 若 executor 正在跑 → executor.StopAsync + 移出 _executors 表
+  [3] Aggregate.Stop("Type change in progress") + ChangeType(newType)
+  [4] 若切換前是 Running → Aggregate.Start() （準備 resume）
+  [5] repo.Update + uow.SaveChanges
+  [6] 若需要 resume → factory.Get(newType) + executorFactory.Create + executor.StartAsync
+  ```
+- 為什麼先 Stop 再 Start：避免舊腦產生的未完成 tick 用新腦的判斷邏輯收尾。
+
+### 4.7.3 合規與防呆
+
+- `Strategy.ChangeType` 在 Domain 層**拒絕**當 `Status == Running` 時被直接呼叫；強制使用者走上述 controller 路徑，避免偽造的 service 繞過 executor 停機。
+- UI 的下拉選單必須以 `GET /api/strategies/available-types` 回傳的清單為來源，禁止 hardcode 類型字串 — 新策略註冊後自動可選。
+- Toggle / ChangeType 失敗時 API 回 500，UI 必須把選項回滾（`_selectedStrategyType = _primaryStrategy.StrategyType`），不能讓 UI 顯示和 DB 不一致的狀態。
+
+### 4.7.4 金融安全底線
+
+- 「切換模型」**不會**自動「切換環境」。Demo↔Live 仍只由 §4.5 的 `IEnvironmentSwitcher` 流程處理。
+- 「切換模型」**不會**自動「切換金鑰」。Key 切換仍走 §4.6 的 `CredentialsChanged` 事件。
+- 這三條干預線互相正交 — 任何想把它們合併成「一個魔法 switch」的 PR 一律退件。
+
+---
+
 ## §5. 命名 / 風格速查
 
 - 檔名 = 主型別名；Razor 元件用 PascalCase。
@@ -283,6 +371,7 @@ Live → Demo 不需要二次確認（往安全方向走不防呆）。
 |---|---|---|
 | v1.0 | 2026-04-21 | 初版鎖定於 Beta v0.1 — Clean Arch / Strategy Slot SOP / Zero Tolerance / UI 規範 |
 | v1.1 | 2026-04-21 | S21 完成後增補：§3.2.1 Known Compromise 表、§4.5 環境熱切換不變式（切換流程順序、SDK client 鎖契約、Demo→Live 二次確認規範） |
+| v1.2 | 2026-04-21 | S24+S25 完成後增補：§4.6 金鑰持久化規範（SQLite 唯一權威、`CredentialsChanged` 事件契約、空字串保留語意）、§4.7 手動干預安全準則（Toggle / ChangeType 鏈路順序、Domain 層 Running 拒絕換腦） |
 
 ---
 

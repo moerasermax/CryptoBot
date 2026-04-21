@@ -5,6 +5,7 @@ using CryptoBot.Infrastructure.Backtesting;
 using CryptoBot.Infrastructure.Backtesting.Persistence;
 using CryptoBot.Infrastructure.Configuration;
 using CryptoBot.Infrastructure.Exchange.BingX;
+using CryptoBot.Infrastructure.ExchangeAccounts;
 using CryptoBot.Infrastructure.Notifications;
 using CryptoBot.Infrastructure.Persistence;
 using CryptoBot.Infrastructure.Persistence.Repositories;
@@ -34,6 +35,7 @@ public static class DependencyInjection
         IConfiguration configuration)
     {
         services.AddPersistence(configuration);
+        services.AddSingleton<IExchangeCredentialProvider, DbExchangeCredentialProvider>();
         services.AddBingXExchange(configuration);
 
         services.Configure<StrategySeedOptions>(
@@ -131,6 +133,7 @@ public static class DependencyInjection
         services.AddScoped<IOrderRepository, OrderRepository>();
         services.AddScoped<IPositionRepository, PositionRepository>();
         services.AddScoped<IStrategyRepository, StrategyRepository>();
+        services.AddScoped<IExchangeAccountRepository, ExchangeAccountRepository>();
         services.AddScoped<IUnitOfWork, UnitOfWork>();
 
         return services;

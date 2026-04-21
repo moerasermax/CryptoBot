@@ -1,0 +1,52 @@
+@using CryptoBot.Application.Common.Interfaces
+@using CryptoBot.Domain.Enums
+@inject IExchangeCredentialProvider Credentials
+@inject NavigationManager Nav
+@implements IDisposable
+
+@if (_showBanner)
+{
+    <div class="key-gate-banner">
+        <span class="key-gate-icon">🔑</span>
+        <span class="key-gate-text">
+            <strong>尚未設定 BingX 金鑰</strong> — 系統無法下單 / 查餘額。請到
+            <a href="/settings/exchanges">Settings · 金鑰</a>
+            新增並啟用一組 API Key。
+        </span>
+    </div>
+}
+
+@code {
+    private bool _showBanner;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Credentials.CredentialsChanged += OnChanged;
+        await RefreshAsync();
+    }
+
+    private async Task RefreshAsync()
+    {
+        try
+        {
+            var c = await Credentials.GetActiveAsync(ExchangeName.BingX);
+            _showBanner = !c.IsConfigured;
+        }
+        catch
+        {
+            _showBanner = true;
+        }
+    }
+
+    private async void OnChanged(object? sender, ExchangeCredentialsChangedEventArgs e)
+    {
+        if (e.Exchange != ExchangeName.BingX) return;
+        _showBanner = !e.Credentials.IsConfigured;
+        await InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        Credentials.CredentialsChanged -= OnChanged;
+    }
+}

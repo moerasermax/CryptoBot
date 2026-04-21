@@ -28,3 +28,12 @@ public sealed record StrategyDto(
     string? LastError);
 
 public sealed record ToggleResponseDto(Guid Id, string NewStatus, string Message);
+
+/// <summary>S25：把策略的「決策大腦」換一顆的請求 body。</summary>
+public sealed record ChangeStrategyTypeRequest(string StrategyType);
+
+public sealed record ChangeStrategyTypeResponseDto(
+    Guid Id,
+    string StrategyType,
+    string Status,
+    string Message);

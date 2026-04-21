@@ -311,6 +311,109 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         }
     }
 
+    public async Task<bool> ChangeStrategyTypeAsync(Guid strategyId, string newStrategyType, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(newStrategyType))
+        {
+            _logger.LogWarning("ChangeStrategyType rejected for {Id}: empty type.", strategyId);
+            return false;
+        }
+
+        // 類型必須先存在於 IStrategyFactory；找不到就直接拒絕 — 不動 DB、不動 executor。
+        try
+        {
+            _ = _strategyFactory.Get(newStrategyType);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "ChangeStrategyType rejected for {Id}: unknown type '{Type}'.",
+                strategyId, newStrategyType);
+            return false;
+        }
+
+        await _mutateLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IStrategyRepository>();
+            var uow = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+
+            var strategy = await repo.GetByIdAsync(strategyId, ct).ConfigureAwait(false);
+            if (strategy is null)
+            {
+                _logger.LogWarning("ChangeStrategyType: unknown strategy {Id}.", strategyId);
+                return false;
+            }
+
+            // 1) 如果在跑 → 先停 executor（避免熱換期間還在跑舊腦 tick）
+            var wasRunning = _executors.TryGetValue(strategyId, out var runningExecutor);
+            if (wasRunning && runningExecutor is not null)
+            {
+                try { await runningExecutor.StopAsync(ct).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Executor stop threw during ChangeStrategyType for {Id} — removing anyway.",
+                        strategyId);
+                }
+                _executors.Remove(strategyId);
+            }
+
+            // 2) 翻 DB：先把 Status 退回 Stopped（否則 ChangeType 會拒絕），再換 Type
+            var originalStatus = strategy.Status;
+            if (strategy.Status == StrategyStatus.Running)
+                strategy.Stop("Type change in progress");
+
+            try
+            {
+                strategy.ChangeType(newStrategyType);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Domain refused ChangeType for {Id} to '{Type}'.", strategyId, newStrategyType);
+                return false;
+            }
+
+            // 3) 如果之前在跑，立刻把 Status 拉回 Running 並重建 executor
+            if (wasRunning || originalStatus == StrategyStatus.Running)
+                strategy.Start();
+
+            await repo.UpdateAsync(strategy, ct).ConfigureAwait(false);
+            await uow.SaveChangesAsync(ct).ConfigureAwait(false);
+
+            if (wasRunning || originalStatus == StrategyStatus.Running)
+            {
+                var impl = _strategyFactory.Get(newStrategyType);
+                var executor = _executorFactory.Create(strategy, impl);
+                await executor.StartAsync(ct).ConfigureAwait(false);
+                _executors[strategy.Id] = executor;
+
+                _logger.LogInformation(
+                    "⇆ Strategy {Name} ({Id}) type hot-swapped to {Type} (resumed Running).",
+                    strategy.Name, strategy.Id, newStrategyType);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "⇆ Strategy {Name} ({Id}) type changed to {Type} (stays Stopped).",
+                    strategy.Name, strategy.Id, newStrategyType);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "ChangeStrategyType failed for {Id}.", strategyId);
+            return false;
+        }
+        finally
+        {
+            _mutateLock.Release();
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;

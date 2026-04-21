@@ -25,4 +25,14 @@ public interface IStrategyRuntimeController
 
     /// <summary>當下所有掛載中的策略 id 快照（含 IsRunning=true 的）。</summary>
     IReadOnlyList<Guid> RunningStrategyIds { get; }
+
+    /// <summary>
+    /// S25：把指定策略的「決策大腦」熱換成另一個類型字串（必須已註冊於 <c>IStrategyFactory</c>）。
+    /// 契約：
+    ///  - 若策略正在跑 → 先停 executor → 翻 DB → 重新掛載 executor → 該策略 Status 維持 Running
+    ///  - 若策略已停 → 只翻 DB Type，不啟動
+    ///  - 新類型字串未註冊 → 回 false（DB 不變、executor 狀態不變）
+    /// 回傳：切換是否成功。
+    /// </summary>
+    Task<bool> ChangeStrategyTypeAsync(Guid strategyId, string newStrategyType, CancellationToken ct = default);
 }

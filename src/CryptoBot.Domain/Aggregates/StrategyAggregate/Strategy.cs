@@ -113,6 +113,20 @@ public sealed class Strategy : AggregateRoot<Guid>
     }
 
     /// <summary>
+    /// S25：UI 允許使用者即時切換「決策大腦」類型（例：SmaCrossover → B46RsiBb）。
+    /// 切換前必須由 <c>IStrategyRuntimeController</c> 先停掉 executor — 這個方法只翻欄位值。
+    /// </summary>
+    public void ChangeType(string newStrategyType)
+    {
+        if (string.IsNullOrWhiteSpace(newStrategyType))
+            throw new DomainException("Strategy type cannot be empty.");
+        if (Status == StrategyStatus.Running)
+            throw new DomainException(
+                "Cannot change strategy type while Running. Stop it first.");
+        StrategyType = newStrategyType;
+    }
+
+    /// <summary>
     /// 更新交易統計 (在 Position 關閉時呼叫)
     /// </summary>
     public void RecordTradeResult(decimal pnl)

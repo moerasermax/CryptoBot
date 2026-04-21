@@ -5,6 +5,7 @@ using CryptoBot.Application.Realtime;
 using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Strategies;
 using CryptoBot.Application.Strategies.Arbitrage;
+using CryptoBot.Application.Strategies.B46RsiBb;
 using CryptoBot.Application.Strategies.MeanReversion;
 using CryptoBot.Application.Strategies.SmaCrossover;
 using CryptoBot.Application.Strategies.TrendFollowing;
@@ -46,6 +47,7 @@ public static class DependencyInjection
         services.AddSingleton<IStrategy, MeanReversionStrategy>();
         services.AddSingleton<IStrategy, BasisArbitrageStrategy>();
         services.AddSingleton<IStrategy, SmaCrossoverStrategy>();
+        services.AddSingleton<IStrategy, B46RsiBbStrategy>();
         services.AddSingleton<IStrategyFactory, StrategyFactory>();
 
         services.AddSingleton<IAccountSynchronizer, AccountSynchronizer>();

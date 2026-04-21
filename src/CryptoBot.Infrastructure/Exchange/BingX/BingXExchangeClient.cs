@@ -17,11 +17,12 @@ using AppBingXOptions = CryptoBot.Infrastructure.Configuration.BingXOptions;
 
 namespace CryptoBot.Infrastructure.Exchange.BingX;
 
-public sealed class BingXExchangeClient : IExchangeClient
+public sealed class BingXExchangeClient : IExchangeClient, IDisposable
 {
     // 不是 readonly — ReconfigureAsync 會原子置換成新環境的 client。
     private BingXRestClient _client;
     private readonly AppBingXOptions _options;
+    private readonly IExchangeCredentialProvider _credentials;
     private readonly ILogger<BingXExchangeClient> _logger;
 
     /// <summary>
@@ -37,12 +38,82 @@ public sealed class BingXExchangeClient : IExchangeClient
 
     public BingXExchangeClient(
         IOptions<AppBingXOptions> options,
+        IExchangeCredentialProvider credentials,
         ILogger<BingXExchangeClient> logger)
     {
         _options = options.Value;
+        _credentials = credentials;
         _logger = logger;
 
+        // S24：DB 的活躍金鑰優先，appsettings 只當 fallback。DbContext 在 ctor 階段需要一個 scope
+        // （IExchangeCredentialProvider 內部會自建），因此 sync-over-async 只在啟動期發生一次，
+        // 之後都走事件驅動。
+        TryApplyDbCredentialsAtStartup();
+
         _client = BuildRestClient(_options.EffectiveMode);
+
+        _credentials.CredentialsChanged += OnCredentialsChanged;
+    }
+
+    private void TryApplyDbCredentialsAtStartup()
+    {
+        try
+        {
+            var creds = _credentials
+                .GetActiveAsync(Domain.Enums.ExchangeName.BingX, CancellationToken.None)
+                .GetAwaiter().GetResult();
+
+            if (creds.IsConfigured)
+            {
+                _options.ApiKey = creds.ApiKey;
+                _options.ApiSecret = creds.ApiSecret;
+                _logger.LogInformation(
+                    "BingX credentials loaded from SQLite | account={Account}", creds.AccountName);
+            }
+            else if (!string.IsNullOrWhiteSpace(_options.ApiKey))
+            {
+                _logger.LogWarning(
+                    "No active BingX account in SQLite — falling back to appsettings.json keys. " +
+                    "Configure via /settings/exchanges to migrate.");
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "BingX has no credentials — user must configure at /settings/exchanges before trading.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "Failed to load BingX credentials from SQLite — falling back to appsettings.json keys.");
+        }
+    }
+
+    private void OnCredentialsChanged(object? sender, ExchangeCredentialsChangedEventArgs e)
+    {
+        if (e.Exchange != Domain.Enums.ExchangeName.BingX) return;
+
+        BingXRestClient oldClient;
+        lock (_clientGate)
+        {
+            _options.ApiKey = e.Credentials.ApiKey;
+            _options.ApiSecret = e.Credentials.ApiSecret;
+            oldClient = _client;
+            _client = BuildRestClient(_options.EffectiveMode);
+        }
+
+        try { oldClient.Dispose(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Old BingX REST client Dispose threw on credentials swap — ignored."); }
+
+        _logger.LogWarning(
+            "🔑 BingX credentials SWAPPED (account={Account}, configured={Configured}) — SDK client rebuilt.",
+            e.Credentials.AccountName, e.Credentials.IsConfigured);
+    }
+
+    public void Dispose()
+    {
+        _credentials.CredentialsChanged -= OnCredentialsChanged;
+        try { _client.Dispose(); } catch { /* swallow — best-effort */ }
     }
 
     private BingXRestClient BuildRestClient(TradingMode mode)

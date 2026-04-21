@@ -11,12 +11,15 @@ namespace CryptoBot.ConsoleApp.Api;
 ///
 /// <list type="bullet">
 ///   <item><c>POST /api/lab/optimize</c> — 啟動參數優化（非同步；立即回 202 + <c>job</c> 狀態）</item>
-///   <item><c>POST /api/lab/apply/{strategyId}</c> — 把排行榜某一行的 Fast/Slow 熱套用到現有策略</item>
+///   <item><c>POST /api/lab/apply/{strategyId}</c> — 把排行榜某一行的整包參數熱套用到現有策略</item>
 ///   <item><c>GET  /api/lab/status</c> — 查「目前是否有任務在跑」— 頁面重整時用</item>
 /// </list>
 /// </summary>
 public static class LabEndpoints
 {
+    /// <summary>整個優化工作的組合總數防呆上限 — 避免誤輸爆 rate limit / 記憶體。</summary>
+    private const long MaxTotalCombinations = 1000;
+
     public static IEndpointRouteBuilder MapLabEndpoints(this IEndpointRouteBuilder app)
     {
         var group = app.MapGroup("/api/lab").WithTags("Lab");
@@ -43,8 +46,8 @@ public static class LabEndpoints
             IUnitOfWork uow,
             CancellationToken ct) =>
         {
-            if (body.Fast <= 0 || body.Slow <= 0 || body.Fast >= body.Slow)
-                return Results.BadRequest(new { error = "Fast and Slow must be positive and Fast < Slow." });
+            if (body.Parameters is null || body.Parameters.Count == 0)
+                return Results.BadRequest(new { error = "Parameters must not be empty." });
 
             var strategy = await repo.GetByIdAsync(strategyId, ct).ConfigureAwait(false);
             if (strategy is null)
@@ -61,11 +64,11 @@ public static class LabEndpoints
                            ?? throw new InvalidOperationException("Strategy vanished after stop.");
             }
 
-            var newParams = new Dictionary<string, decimal>(strategy.Configuration.Parameters)
-            {
-                ["FastSmaPeriod"] = body.Fast,
-                ["SlowSmaPeriod"] = body.Slow,
-            };
+            // 保留原有未被此次套用覆寫的參數 — 字典合併而不是整個替換。
+            var newParams = new Dictionary<string, decimal>(strategy.Configuration.Parameters);
+            foreach (var kv in body.Parameters)
+                newParams[kv.Key] = kv.Value;
+
             var current = strategy.Configuration;
             var newConfig = StrategyConfiguration.Create(
                 symbol: current.Symbol,
@@ -91,7 +94,7 @@ public static class LabEndpoints
             return Results.Ok(new
             {
                 strategyId,
-                applied = new { body.Fast, body.Slow },
+                applied = body.Parameters,
                 restarted = wasRunning,
             });
         });
@@ -102,17 +105,22 @@ public static class LabEndpoints
     private static bool ValidateRequest(OptimizationRequest r, out string error)
     {
         error = string.Empty;
-        if (r.FastStep <= 0 || r.SlowStep <= 0) { error = "Step must be positive."; return false; }
-        if (r.FastMax < r.FastMin || r.SlowMax < r.SlowMin) { error = "Max must be >= Min."; return false; }
-        if (r.StartUtc >= r.EndUtc) { error = "Start must be before End."; return false; }
+        if (string.IsNullOrWhiteSpace(r.StrategyKey)) { error = "StrategyKey is required."; return false; }
+        if (r.Ranges is null || r.Ranges.Count == 0)  { error = "At least one parameter range required."; return false; }
+        if (r.StartUtc >= r.EndUtc)                   { error = "Start must be before End."; return false; }
 
-        // 防呆：總格數超過 1000 通常是誤輸，伺服器會爆記憶體 / rate limit
-        var fastCount = (int)Math.Floor((double)((r.FastMax - r.FastMin) / r.FastStep)) + 1;
-        var slowCount = (int)Math.Floor((double)((r.SlowMax - r.SlowMin) / r.SlowStep)) + 1;
-        if ((long)fastCount * slowCount > 1000)
+        long total = 1;
+        foreach (var range in r.Ranges)
         {
-            error = $"Too many combinations: {fastCount}×{slowCount} > 1000. Narrow the ranges.";
-            return false;
+            if (range.Step <= 0) { error = $"Step must be positive for '{range.Name}'."; return false; }
+            if (range.Max < range.Min) { error = $"Max must be >= Min for '{range.Name}'."; return false; }
+            var count = (int)Math.Floor((double)((range.Max - range.Min) / range.Step)) + 1;
+            total *= count;
+            if (total > MaxTotalCombinations)
+            {
+                error = $"Too many combinations: {total} > {MaxTotalCombinations}. Narrow the ranges.";
+                return false;
+            }
         }
 
         return true;

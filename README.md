@@ -1,16 +1,19 @@
 # CryptoBot · BingX .NET 10 Algorithmic Trading Engine
 
-> **Beta v0.1** — 一台跑在 .NET 上、專為 BingX 永續合約打造的量化交易引擎，
-> 內建即時策略執行、SignalR 戰情室、SMA 並行優化回測、與模組化策略大腦插槽。
+> **Beta v0.2** — 一台跑在 .NET 上、專為 BingX 永續合約打造的量化交易引擎，
+> 內建即時策略執行、SignalR 戰情室、SMA 並行優化回測、模組化策略大腦插槽、
+> 動態金鑰管理、以及儀表板策略手動控制台。
 >
 > _「不是 demo，是會自己賺錢（或燒錢）的引擎。」_
 
 ---
 
-## ✨ Beta v0.1 亮點
+## ✨ Beta v0.2 亮點
 
 | 模組 | 內容 |
 |---|---|
+| 🔑 **動態金鑰管理 (S24)** | `ExchangeAccount` Aggregate + SQLite 持久化；`/settings/exchanges` 頁面手動輸入 / 更新 / 啟用切換；首啟若無 active 金鑰 Dashboard 彈 onboarding Modal；`IExchangeCredentialProvider.CredentialsChanged` 事件讓 BingX SDK client 原子重建 |
+| 🎛️ **策略手動控制台 (S25)** | Dashboard 內建「策略大腦」下拉 + Running/Stopped Toggle；型別切換走 Domain-layer `Strategy.ChangeType`（Running 時直接 throw），API 以 `IStrategyFactory.KnownTypes` 白名單驗證，HostedService `_mutateLock` 序列化 Stop→ChangeType→Rebuild Executor→Start |
 | 🔁 **自動續期 ListenKey** | BingX user-data WS 強型別處理；30 分自動 PUT 續期；expired 事件交給上層 Stop→Start 復原 |
 | 📊 **SMA 並行優化回測** | 笛卡兒積展開 Fast×Slow 網格，scope-per-run 並行回測，依 P/DD ratio 排名 |
 | 📡 **SignalR 即時推播** | `DashboardEventBus` 雙通道：Blazor in-process + 外部 WebSocket 一致觸發 |
@@ -18,7 +21,7 @@
 | 🪟 **玻璃擬態戰情室** | `#121212` 深色基底、Pills nav、金黃進度條、ETA、skeleton + fade-in |
 | 🔒 **狀態艙 Singleton** | `LabStateContainer` 跨頁面/刷新/tab 不丟資料 |
 | ♻️ **Demo↔Live 熱切換** | `IEnvironmentSwitcher` Stop-First 編排 + 二次確認 Modal + 切換後不自動重啟（強制人為再確認） |
-| 🧪 **零容忍品質** | 0 Warning / 0 Error · 46/46 tests green |
+| 🧪 **零容忍品質** | 0 Warning / 0 Error · 全測試綠 |
 
 ---
 
@@ -66,18 +69,14 @@
 - .NET 10 preview SDK（target: net8.0；用 preview SDK 才不會建置警告）
 - 任何作業系統（Windows / Linux / macOS）— 預設使用 SQLite，零外部 DB 依賴
 
-### 設定本機憑證（**第一次跑必做**）
+### 設定憑證（**第一次跑必做**）
 
-`src/CryptoBot.ConsoleApp/appsettings.json` 內的金鑰欄位是 **placeholder**（`<YOUR_BINGX_API_KEY_HERE>` 之類）— 真實憑證請寫在 **`appsettings.Local.json`**，這個檔名已加入 `.gitignore`，永遠不會被 commit。
+從 S24 起，**金鑰來源已經是 SQLite**，不再讀 `appsettings.*.json` 的 `BingX.ApiKey` / `BingX.ApiSecret`。首次啟動 Dashboard 會偵測到沒有 active `ExchangeAccount`、跳 **onboarding Modal** 要你先設定；或你可以直接去 **`/settings/exchanges`** 頁面新增一組 BingX 帳號（手動輸入 API Key + Secret，勾「設為當前啟用」送出），引擎會即時透過 `IExchangeCredentialProvider.CredentialsChanged` 事件重建 SDK client，不必重啟服務。
 
-在 `src/CryptoBot.ConsoleApp/` 下新建 `appsettings.Local.json`：
+Discord 通知（可選）仍在 `appsettings.Local.json`：
 
 ```jsonc
 {
-  "BingX": {
-    "ApiKey":    "你的 BingX Demo API Key",
-    "ApiSecret": "你的 BingX Demo API Secret"
-  },
   "Discord": {
     "Enabled":    true,
     "WebhookUrl": "https://discord.com/api/webhooks/.../..."
@@ -85,7 +84,7 @@
 }
 ```
 
-> ⚠️ 強烈建議只放 **BingX Demo (VST)** 額度的金鑰。專案預設 `TradingMode: "Demo"`；切到 Live 前 Modal 會二次確認，但金鑰本身就用 demo 的最安全。
+> ⚠️ 強烈建議只存 **BingX Demo (VST)** 額度的金鑰。專案預設 `TradingMode: "Demo"`；切到 Live 前 Modal 會二次確認。DB 檔 (`cryptobot.db`) 已加入 `.gitignore`，金鑰不會被 commit，但本地仍是 plain text 儲存——不要把 DB 檔傳到別的機器。
 
 ### 啟動
 
@@ -94,7 +93,7 @@ git clone <this-repo>
 cd CryptoBot
 
 dotnet build           # 應該看到 0 警告 / 0 錯誤
-dotnet test            # 應該看到 46/46 通過
+dotnet test            # 全綠
 
 dotnet run --project src/CryptoBot.ConsoleApp
 ```
@@ -105,11 +104,10 @@ dotnet run --project src/CryptoBot.ConsoleApp
 🌐 Web UI 指揮中心：http://localhost:5080
 ```
 
-### 進入回測實驗室
+### 三個主要頁面
 
-開瀏覽器到：
-
-- **`http://localhost:5080/`** — 戰情儀表板（Dashboard）
+- **`http://localhost:5080/`** — 戰情儀表板（Dashboard）· 含策略手動控制台（大腦下拉 + Running Toggle）
+- **`http://localhost:5080/settings/exchanges`** — 交易所金鑰管理（S24）
 - **`http://localhost:5080/lab`** — Backtest Lab · 玻璃擬態優化室
 
 第一次跑回測：在 `/lab` 頁面點頂部 `SMA Crossover` pill（已預設選中），調整 Fast/Slow 範圍與時間窗，按 **🚀 開始優化掃描**。Engine load 變金黃，進度條開始走，跑完出 Leaderboard，按某列「套用」即可 hot-swap 到正在跑的策略。
@@ -122,9 +120,9 @@ dotnet run --project src/CryptoBot.ConsoleApp -- backtest <args>
 
 ---
 
-## 🗺️ Roadmap / Changelog · 開發歷程 (S1 → S21)
+## 🗺️ Roadmap / Changelog · 開發歷程 (S1 → S25)
 
-> 從零到 Beta v0.1 的全部里程碑。每個 SXX 對應一份 `HANDOFF_N.md` 交接文件。
+> 從零到 Beta v0.2 的全部里程碑。每個 SXX 對應一份 `HANDOFF_N.md` 交接文件。
 
 ### Phase 1 · 基礎設施與 API 串接 (S1–S6)
 
@@ -166,14 +164,24 @@ dotnet run --project src/CryptoBot.ConsoleApp -- backtest <args>
 | **S19** | **動態策略插槽**：`StrategyCatalog` 模組化目錄、`LabStateContainer` 狀態艙、`StrategyParameterFormBase` 抽象、`SmaParameterForm` 抽出、`StrategyTabsBar` pills nav |
 | **S20** | **CryptoBot Dev Protocol** 開發憲章 v1.0 + `/docs/architecture/` 三份 Mermaid 文件（System / Data Flow / UML） |
 | **S21** | **Demo↔Live 熱切換安全機制**：`IEnvironmentSwitcher` 編排（Stop-First → Reconfigure → Restart）+ `BingXExchangeClient` / `BingXMarketDataStream` SDK client `_clientGate` 原子換 + `GlobalStatusBar` MODE/ACTIVE/ENGINE/SWITCH 四段式狀態列 + `EnvironmentSwitchModal` Demo→Live 二次確認（autofocus 取消 + acknowledgment checkbox）+ 切換後策略**不**自動重啟（強制人為再確認）|
-| **🎉 Release** | **Beta v0.1** — 0 Warning / 0 Error · 46/46 tests green · Dev Protocol v1.1 · `v0.1-beta` git tag |
 
-### 🔮 Next（Phase 5 預告）
+### Phase 5 · 指標庫、回測快取、熱切換與金鑰管理 (S22–S25)
 
-- 第二顆策略大腦：**RSI + Bollinger Bands** — 短線反轉模型
+| Sprint | 內容 |
+|---|---|
+| **S22** | **指標函式庫抽取**：SMA / RSI / Bollinger / ATR 純函式指標抽到 `Application.Indicators`；策略只呼叫 helper、不再自寫迴圈 |
+| **S23** | **回測快取與 Kline 對齊修復**：`IHistoricalKlineStore` 按 `(Symbol, Interval, Range)` 鍵化；時段重疊 fold-in；warmup bars 嚴格對齊；同一組參數回測不再重算 |
+| **S24** | **動態金鑰管理**：`ExchangeAccount` Aggregate + `IExchangeAccountRepository`（`SetActiveAsync` 交易化保證同交易所唯一 active）+ `/settings/exchanges` Blazor 頁面 + `IExchangeCredentialProvider` 抽象 + `DbExchangeCredentialProvider` (Singleton + `IServiceScopeFactory`) + `CredentialsChanged` 事件驅動 BingX SDK client / socket 原子重建 + Dashboard onboarding Modal |
+| **S25** | **儀表板手動控制台**：Dashboard 內建「策略大腦」下拉（由 `IStrategyFactory.KnownTypes` 驅動）+ Running/Stopped Toggle · API `GET /api/strategies/available-types` + `PUT /api/strategies/{id}/type` · HostedService `ChangeStrategyTypeAsync` 以 `_mutateLock` 序列化 Stop→ChangeType→Rebuild Executor→Start · Domain `Strategy.ChangeType` 在 Running 時直接 throw 作為最後防線 |
+| **🎉 Release** | **Beta v0.2** — 0 Warning / 0 Error · 全測試綠 · Dev Protocol v1.2 · `v0.2-beta` git tag |
+
+### 🔮 Next（Phase 6 預告）
+
+- 第二顆策略大腦上線：**RSI + Bollinger Bands** 短線反轉模型（綁到 S25 下拉選單即可熱切）
 - WalkForward / OOS validation 進回測管線
 - 多 Symbol 同時 live trading（目前 BTC-USDT only）
 - Equity curve / Drawdown 曲線即時 chart
+- 金鑰加密存儲（DPAPI / SQLCipher）取代目前的 plain-text
 
 ---
 
@@ -187,7 +195,7 @@ CryptoBot/
 │  ├─ CryptoBot.Infrastructure/    EF Core + BingX SDK + SignalR adapter
 │  └─ CryptoBot.ConsoleApp/        Composition root：Blazor + Hub + APIs
 │     ├─ Components/               Blazor 元件
-│     │  ├─ Pages/                   /  /lab
+│     │  ├─ Pages/                   Dashboard · BacktestLab · ExchangeSettings (/settings/exchanges)
 │     │  ├─ Lab/                     SmaParameterForm · StrategyTabsBar
 │     │  └─ Layout/                  MainLayout · GlobalStatusBar · EnvironmentSwitchModal
 │     ├─ Lab/                      StrategyCatalog · LabStateContainer · StrategyParameterFormBase
