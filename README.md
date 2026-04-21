@@ -144,6 +144,12 @@ dotnet run --project src/CryptoBot.ConsoleApp -- backtest <args>
 | **S18** | UI/UX 大升級：`StrategyCatalog` 模組化目錄、`LabStateContainer` 狀態艙、`StrategyParameterFormBase` 抽象、`SmaParameterForm` 抽出、`StrategyTabsBar` pills nav、`#121212` 玻璃擬態 + 金黃進度條 + ETA + skeleton + fade-in |
 | **S19** | **CryptoBot Dev Protocol** 開發憲章 + `/docs/architecture/` 三份 Mermaid 文件（System / Data Flow / UML） |
 | **S20** | 🎉 **Beta v0.1 release** — README 重寫 + git tag `v0.1-beta` |
+| **S21** | **Demo↔Live 熱切換安全機制**：`IEnvironmentSwitcher` 編排（Stop-First → Reconfigure → Restart）+ 二次確認 Modal 防線 |
+| **S22** | **指標函式庫抽離與多型化重構**：SMA/RSI/BB 改寫為純函式；優化器支援 `Generic Dictionary` 參數包，擺脫策略依賴 |
+| **S23** | **回測快取與 Kline 對齊修復**：`IHistoricalKlineStore` 按 `(Symbol, Interval, Range)` 鍵化；嚴格 Warmup bars 對齊避免重複下載 |
+| **S24** | **動態金鑰管理系統**：`ExchangeAccount` Aggregate + SQLite 持久化；實作 `/settings/exchanges` 介面與 Dashboard onboarding Modal |
+| **S25** | **儀表板手動控制中心**：Dashboard 策略下拉熱切換 + `Running/Stopped` Toggle 開關；導入 `_mutateLock` 序列化停機重組流程 |
+| **🎉 v0.2** | 🚀 **Beta v0.2 release** — 多交易所金鑰管理與指揮中心全線完工 |
 
 ### 🔮 Next（Phase 5 預告）
 
