@@ -1,6 +1,6 @@
 # CryptoBot 開發憲章 (Development Manifesto)
 
-> **版本**：v1.0 · 2026-04-21 · 鎖定於 Beta v0.1
+> **版本**：v1.1 · 2026-04-21 · Beta v0.1（含 S21 環境熱切換）
 > **位階**：本文件為本專案最高技術準則，凌駕個別 PR / Issue / 心情。
 > 任何與本憲章衝突的程式碼、設計或流程，**一律以憲章為準**。
 > 修訂憲章本身需要明確的 commit + 在本檔頂端遞增版本號。
@@ -158,6 +158,18 @@ dotnet test → 100% pass
 - 不准用 `[Fact(Skip = "...")]` 跳過。要嘛修綠、要嘛刪掉並在 commit 訊息說明。
 - Beta v0.1 基線：**46/46**（Domain 1 + Application 45）。日後新增功能必須維持「總數只增不減」。
 
+### 3.2.1 Known Compromise（已備案的妥協）
+
+下面這些是**有意為之**的簡化，列在憲章裡是為了之後別有人「優化」掉才發現它的存在是必要的。
+要動這幾個地方之前，先讀完「為什麼可以接受」這欄。
+
+| 位置 | 妥協 | 為什麼可以接受 / 動之前要做什麼 |
+|---|---|---|
+| `StrategyExecutor.cs:214,260` | 下單後 `await Task.Delay(500)` 才 RefreshOrderStatus | 純 await 不阻塞執行緒；主鏈是 WS `OnExchangeOrderUpdate` → `AccountSynchronizer`，這個 500ms 只是 belt-and-suspenders fallback。**移除前**必須先讓 AccountSynchronizer 100% 覆蓋 fill confirmation 並補測試。 |
+| `BacktestSimulator.PlaceOrderAsync` | 全部視為 Market 即成交，不模擬部分成交 / 限價觸價 | 骨架版本足以驗證策略訊號正確性；下一輪「精度提升」才補。 |
+| `BingXMarketDataStream.HandleListenKeyExpired` | 只 null 掉 `_activeListenKey`，不重訂閱 | SDK 內部 auto-reconnect 也會在 expiry 附近觸發；自己再 subscribe 會跟 SDK 競賽產生重複連線。復原由 Hosted Service 或顯式 Stop→Start 負責。 |
+| `OptimizationOrchestrator` | 寫死 SMA 網格 dispatch | 新策略要客製組合維度時在這裡加 `switch SelectedModel.Key` — 不要另寫一個 Orchestrator。 |
+
 ### 3.3 Beta 發布前自檢清單
 
 - [ ] `dotnet build` 0/0
@@ -211,6 +223,51 @@ DashboardEventBus.RaiseXxx()         （in-process bus，Blazor 直接訂）
 
 ---
 
+## §4.5 環境熱切換不變式 (S21)
+
+`IEnvironmentSwitcher.SwitchAsync` 永遠遵守這個順序，**不准重排**：
+
+```
+[1] 取 _switchLock (SemaphoreSlim(1,1))      ← 同時只能有一次切換
+[2] 同模式 → 廣播 echo + return              ← 冪等
+[3] StopAllAsync(reason)                     ← 必須在 Reconfigure 之前
+[4] exchange.ReconfigureAsync(newMode)       ← REST 換 endpoint
+[5] marketData.ReconfigureAsync(newMode)     ← WS 換 endpoint
+[6] marketData.StartAsync()                  ← 重連 (try/catch — log only)
+[7] raise EnvironmentChanged                 ← 最後才 broadcast
+```
+
+### 4.5.1 切換後策略**不**自動重啟
+
+> 強制使用者回 UI 手動 Start = 再做一次人為確認，
+> 徹底杜絕「拿 demo 配置打 live 訂單」這個最危險的場景。
+
+任何「為了使用者方便」想自動重啟的 PR 一律退件。
+這不是 UX 問題，是**金融安全問題**。
+
+### 4.5.2 SDK client 熱換鎖契約
+
+`BingXExchangeClient` / `BingXMarketDataStream` 兩個 Singleton 內的 SDK client（`_client` / `_socketClient`）為可變欄位，由專屬 `_clientGate` 物件保護：
+
+- 任何讀 client 的地方必須先 `Snapshot()` 取本地參照（lock 內）
+- `ReconfigureAsync` 必須在 lock 內完成「換新 client + 替換欄位」
+- 舊 client `Dispose` 在 lock 外執行，避免 dispose 時 callback 死鎖
+- 同模式 reconfigure 一律 no-op return，不重建
+
+違反任一條 = 在 in-flight RPC 期間半切，UI 看到的訂單會錯環境。
+
+### 4.5.3 Demo → Live 必須二次確認
+
+`GlobalStatusBar` Demo→Live 切換**必須**走 `EnvironmentSwitchModal`，且 modal 必須：
+- 取消按鈕 `autofocus`（Enter 不會誤觸 Confirm）
+- Confirm 鈕禁用直到 acknowledgment checkbox 被勾選
+- 切換進行中 disable 兩個按鈕
+- 點背板 = 取消（不取消 = bug）
+
+Live → Demo 不需要二次確認（往安全方向走不防呆）。
+
+---
+
 ## §5. 命名 / 風格速查
 
 - 檔名 = 主型別名；Razor 元件用 PascalCase。
@@ -225,6 +282,7 @@ DashboardEventBus.RaiseXxx()         （in-process bus，Blazor 直接訂）
 | 版本 | 日期 | 變更 |
 |---|---|---|
 | v1.0 | 2026-04-21 | 初版鎖定於 Beta v0.1 — Clean Arch / Strategy Slot SOP / Zero Tolerance / UI 規範 |
+| v1.1 | 2026-04-21 | S21 完成後增補：§3.2.1 Known Compromise 表、§4.5 環境熱切換不變式（切換流程順序、SDK client 鎖契約、Demo→Live 二次確認規範） |
 
 ---
 

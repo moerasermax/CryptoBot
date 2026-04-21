@@ -163,6 +163,66 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         lock (_executors) return _executors.ContainsKey(strategyId);
     }
 
+    public IReadOnlyList<Guid> RunningStrategyIds
+    {
+        get { lock (_executors) return _executors.Keys.ToArray(); }
+    }
+
+    public async Task<IReadOnlyList<Guid>> StopAllAsync(string reason, CancellationToken ct = default)
+    {
+        await _mutateLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_executors.Count == 0) return Array.Empty<Guid>();
+
+            var stopped = new List<Guid>(_executors.Count);
+
+            // 先關 executor（停 tick 迴圈、讓 in-flight 動作 drain），再處理 DB 狀態
+            foreach (var (id, executor) in _executors.ToArray())
+            {
+                try { await executor.StopAsync(ct).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Executor stop threw for {Id} during StopAll — continuing.", id);
+                }
+                stopped.Add(id);
+            }
+            _executors.Clear();
+
+            // DB 狀態翻為 Stopped（帶原因）
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IStrategyRepository>();
+            var uow = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+
+            foreach (var id in stopped)
+            {
+                try
+                {
+                    var strategy = await repo.GetByIdAsync(id, ct).ConfigureAwait(false);
+                    if (strategy is null) continue;
+                    strategy.Stop(reason);
+                    await repo.UpdateAsync(strategy, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Failed to flip DB status to Stopped for {Id} during StopAll — continuing.", id);
+                }
+            }
+            await uow.SaveChangesAsync(ct).ConfigureAwait(false);
+
+            _logger.LogWarning("⏹ StopAll: {Count} strategies stopped. Reason: {Reason}",
+                stopped.Count, reason);
+
+            return stopped;
+        }
+        finally
+        {
+            _mutateLock.Release();
+        }
+    }
+
     public async Task<bool> StartAsync(Guid strategyId, CancellationToken ct = default)
     {
         await _mutateLock.WaitAsync(ct).ConfigureAwait(false);

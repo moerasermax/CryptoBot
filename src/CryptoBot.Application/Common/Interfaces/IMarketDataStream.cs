@@ -19,6 +19,14 @@ public interface IMarketDataStream : IAsyncDisposable
     Task StartAsync(CancellationToken ct = default);
     Task StopAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// 熱切換到新模式。實作必須：先 <see cref="StopAsync"/>（關 WS / 清 listenKey），
+    /// 用新 endpoint 重建 socket client，但**不**自動 <see cref="StartAsync"/> —
+    /// 上層 <c>EnvironmentSwitcher</c> 會明確指定何時重啟，以免在
+    /// 沒有任何訂閱者的狀態下白開連線。
+    /// </summary>
+    Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default);
+
     /// <summary>訂閱 K 線更新</summary>
     Task SubscribeKlinesAsync(
         Symbol symbol, KlineInterval interval, CancellationToken ct = default);

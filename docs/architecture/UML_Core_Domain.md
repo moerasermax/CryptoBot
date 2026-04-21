@@ -222,14 +222,155 @@ classDiagram
     StrategyParameterFormBase ..> OptimizationRequest : builds
 ```
 
-## 3. 讀圖規則
+## 3. 環境熱切換契約 (S21)
+
+```mermaid
+classDiagram
+    direction LR
+
+    class TradingMode {
+        <<enum · Application.Common>>
+        Demo = 0
+        Live = 1
+    }
+
+    class IEnvironmentSwitcher {
+        <<interface · Application.Common>>
+        +TradingMode CurrentMode
+        +event Action~EnvironmentChangedEvent~ EnvironmentChanged
+        +SwitchAsync(TradingMode newMode, string? reason, CancellationToken) Task~EnvironmentSwitchResult~
+    }
+
+    class EnvironmentSwitcher {
+        <<sealed · Singleton>>
+        -SemaphoreSlim _switchLock
+        -IExchangeClient _exchange
+        -IMarketDataStream _marketData
+        -IStrategyRuntimeController _runtime
+        +SwitchAsync(...) Task~EnvironmentSwitchResult~
+    }
+
+    class EnvironmentSwitchResult {
+        <<record>>
+        +TradingMode FromMode
+        +TradingMode ToMode
+        +IReadOnlyList~Guid~ StoppedStrategyIds
+        +DateTime SwitchedAtUtc
+        +string? Reason
+    }
+
+    class EnvironmentChangedEvent {
+        <<record>>
+        +TradingMode FromMode
+        +TradingMode ToMode
+        +IReadOnlyList~Guid~ StoppedStrategyIds
+        +DateTime ChangedAtUtc
+        +string? Reason
+    }
+
+    class IExchangeClient {
+        <<interface · Application.Common.Interfaces>>
+        +string ExchangeName
+        +string QuoteAsset
+        +TradingMode CurrentMode
+        +ReconfigureAsync(TradingMode newMode, CancellationToken) Task
+        +GetFuturesBalanceAsync(string? asset, CancellationToken) Task~decimal~
+        +PlaceOrderAsync(Order, CancellationToken) Task
+        ...
+    }
+
+    class IMarketDataStream {
+        <<interface · IAsyncDisposable>>
+        +StartAsync(CancellationToken) Task
+        +StopAsync(CancellationToken) Task
+        +ReconfigureAsync(TradingMode newMode, CancellationToken) Task
+        +event OnKlineUpdate
+        +event OnExchangeOrderUpdate
+        +event OnExchangeAccountUpdate
+        ...
+    }
+
+    class IStrategyRuntimeController {
+        <<interface>>
+        +IReadOnlyList~Guid~ RunningStrategyIds
+        +bool IsRunning(Guid strategyId)
+        +Task~Guid~ StartAsync(Strategy, CancellationToken)
+        +Task StopAsync(Guid strategyId, string reason, CancellationToken)
+        +Task~IReadOnlyList~Guid~~ StopAllAsync(string reason, CancellationToken)
+    }
+
+    class BingXExchangeClient {
+        <<sealed · Singleton>>
+        -object _clientGate
+        -BingXRestClient _client
+        -BingXOptions _options
+        +TradingMode CurrentMode
+        +ReconfigureAsync(...) Task
+        -BuildRestClient(TradingMode) BingXRestClient
+        -Snapshot() BingXRestClient
+    }
+
+    class BingXMarketDataStream {
+        <<sealed · Singleton>>
+        -object _clientGate
+        -BingXSocketClient _socketClient
+        -bool _started
+        +ReconfigureAsync(...) Task
+        -BuildSocketClient(TradingMode) BingXSocketClient
+    }
+
+    class BingXOptions {
+        <<mutable POCO>>
+        +string ApiKey
+        +TradingMode TradingMode
+        +bool UseDemoTrading
+        +TradingMode EffectiveMode «derived»
+        +string QuoteAsset «derived»
+    }
+
+    class LabStateContainer {
+        <<Singleton>>
+        +TradingMode CurrentMode
+        +EnvironmentChangedEvent? LastEnvChange
+        +ChangeEnvironmentAsync(TradingMode, string?, CancellationToken) Task~EnvironmentSwitchResult~
+        +event Action StateChanged
+    }
+
+    EnvironmentSwitcher ..|> IEnvironmentSwitcher
+    EnvironmentSwitcher ..> IExchangeClient : Reconfigure
+    EnvironmentSwitcher ..> IMarketDataStream : Reconfigure + Start
+    EnvironmentSwitcher ..> IStrategyRuntimeController : StopAllAsync
+    EnvironmentSwitcher ..> EnvironmentSwitchResult : returns
+    EnvironmentSwitcher ..> EnvironmentChangedEvent : raises
+    IEnvironmentSwitcher ..> TradingMode
+    IExchangeClient ..> TradingMode
+    IMarketDataStream ..> TradingMode
+    BingXExchangeClient ..|> IExchangeClient
+    BingXMarketDataStream ..|> IMarketDataStream
+    BingXExchangeClient ..> BingXOptions : mutates
+    BingXMarketDataStream ..> BingXOptions : reads
+    LabStateContainer ..> IEnvironmentSwitcher : delegates
+    LabStateContainer ..> EnvironmentChangedEvent : subscribes
+```
+
+### 設計亮點
+
+| 設計 | 為什麼 |
+|---|---|
+| `TradingMode` 放在 `Application.Common` 而非 Infrastructure.Configuration | Application 介面（`IExchangeClient.CurrentMode`、`IMarketDataStream.ReconfigureAsync`）需要參照它 — 放 Infrastructure 會違反相依方向 |
+| `IEnvironmentSwitcher` 在 Application 而非 Infrastructure | 編排服務跨 `IExchangeClient` + `IMarketDataStream` + `IStrategyRuntimeController` 三個 Application 介面，本身沒有任何 BingX 知識 |
+| `BingXOptions` 變 mutable POCO，`EffectiveMode` 是衍生屬性 | `IOptions<T>` 是建構期 snapshot，切換後不更新；改 mutable + derived 才能讓 `CurrentMode` 立即反映 |
+| `_clientGate` 物件鎖而非 `lock(this)` 或 `lock(_options)` | 專屬鎖避免外部偶然 lock 同一物件造成 deadlock；`Dispose` 舊 client 在 lock 外執行 |
+| 切換後**不**自動重啟策略 | 強制使用者手動 Start = 二次人為確認，杜絕「demo 配置打 live 訂單」 |
+
+## 4. 讀圖規則
 
 - `*` 為 abstract / 必須 override 的成員。
 - `<<...>>` 為 stereotype，標出該型別的角色（Aggregate / ValueObject / Singleton / record / interface）。
 - 實線箭頭 = 組合 / 強相依；虛線箭頭 = 使用 / 訊息傳遞。
 - 三角形空心箭頭 (`..|>`) = 介面實作。
 
-## 4. 設計決策摘要
+## 5. 設計決策摘要
 
 | 決策 | 為何 |
 |---|---|

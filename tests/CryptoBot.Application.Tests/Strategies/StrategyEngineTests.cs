@@ -1,3 +1,4 @@
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Notifications;
 using CryptoBot.Application.Realtime;
@@ -354,6 +355,7 @@ internal sealed class FakeMarketDataStream : IMarketDataStream
 
     public Task StartAsync(CancellationToken ct = default) { StartCalls++; return Task.CompletedTask; }
     public Task StopAsync(CancellationToken ct = default) { StopCalls++; return Task.CompletedTask; }
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeKlinesAsync(Symbol symbol, KlineInterval interval, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeMarkPriceAsync(Symbol symbol, CancellationToken ct = default) => Task.CompletedTask;
     public Task UnsubscribeAsync(Symbol symbol, CancellationToken ct = default) => Task.CompletedTask;
@@ -408,6 +410,8 @@ internal sealed class FakeExchangeClient : IExchangeClient
     public int PlaceOrderCalls { get; private set; }
     public string ExchangeName => "FAKE";
     public string QuoteAsset => "USDT";
+    public TradingMode CurrentMode => TradingMode.Demo;
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
 
     public Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default) =>
         Task.FromResult(Balance);

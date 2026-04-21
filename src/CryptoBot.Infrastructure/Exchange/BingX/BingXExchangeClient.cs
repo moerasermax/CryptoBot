@@ -1,5 +1,6 @@
 using BingX.Net;
 using BingX.Net.Clients;
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
@@ -13,18 +14,26 @@ using Microsoft.Extensions.Options;
 using System.Threading;
 using System.Threading.Tasks;
 using AppBingXOptions = CryptoBot.Infrastructure.Configuration.BingXOptions;
-using AppTradingMode = CryptoBot.Infrastructure.Configuration.TradingMode;
 
 namespace CryptoBot.Infrastructure.Exchange.BingX;
 
 public sealed class BingXExchangeClient : IExchangeClient
 {
-    private readonly BingXRestClient _client;
+    // 不是 readonly — ReconfigureAsync 會原子置換成新環境的 client。
+    private BingXRestClient _client;
     private readonly AppBingXOptions _options;
     private readonly ILogger<BingXExchangeClient> _logger;
 
+    /// <summary>
+    /// 守護 <see cref="_client"/> 與 <see cref="_options"/> 的可變欄位 — 切換環境時取，公開方法
+    /// 只在 lock 內讀取 client 引用以避免半切。讀取本身極快 (拿 reference)，
+    /// 不會把網路 IO 圈在 lock 裡。
+    /// </summary>
+    private readonly object _clientGate = new();
+
     public string ExchangeName => "BingX";
     public string QuoteAsset => _options.QuoteAsset;
+    public TradingMode CurrentMode => _options.EffectiveMode;
 
     public BingXExchangeClient(
         IOptions<AppBingXOptions> options,
@@ -33,32 +42,74 @@ public sealed class BingXExchangeClient : IExchangeClient
         _options = options.Value;
         _logger = logger;
 
-        _client = new BingXRestClient(opts =>
+        _client = BuildRestClient(_options.EffectiveMode);
+    }
+
+    private BingXRestClient BuildRestClient(TradingMode mode)
+    {
+        var client = new BingXRestClient(opts =>
         {
             opts.RequestTimeout = TimeSpan.FromSeconds(_options.RequestTimeoutSeconds);
-
-            opts.Environment = _options.EffectiveMode == AppTradingMode.Live
+            opts.Environment = mode == TradingMode.Live
                 ? global::BingX.Net.BingXEnvironment.Live
                 : global::BingX.Net.BingXEnvironment.Demo;
-
-            _logger.LogWarning("BingX mode: {Mode} | quote asset: {Asset}",
-                _options.EffectiveMode == AppTradingMode.Live ? "🔴 LIVE (REAL MONEY)" : "🟢 DEMO (VST)",
-                _options.QuoteAsset);
         });
 
         if (!string.IsNullOrWhiteSpace(_options.ApiKey) &&
             !string.IsNullOrWhiteSpace(_options.ApiSecret))
         {
-
-            BingXCredentials bingXCredentials = new BingXCredentials()
+            var creds = new BingXCredentials
             {
                 Key = _options.ApiKey,
-                Secret = _options.ApiSecret
+                Secret = _options.ApiSecret,
             };
-
-            _client.PerpetualFuturesApi.SetApiCredentials(bingXCredentials);
-            _client.SpotApi.SetApiCredentials(bingXCredentials);
+            client.PerpetualFuturesApi.SetApiCredentials(creds);
+            client.SpotApi.SetApiCredentials(creds);
         }
+
+        _logger.LogWarning("BingX REST client built | mode: {Mode} | quote asset: {Asset}",
+            mode == TradingMode.Live ? "🔴 LIVE (REAL MONEY)" : "🟢 DEMO (VST)",
+            mode == TradingMode.Live ? "USDT" : "VST");
+
+        return client;
+    }
+
+    /// <summary>
+    /// 取目前的 client reference — 公開方法都應透過這個快照取用，避免在切換中拿到半態 client。
+    /// 假設：呼叫端已透過 EnvironmentSwitcher 停止所有 executor，這裡只用來保證引用 atomic。
+    /// </summary>
+    private BingXRestClient Snapshot()
+    {
+        lock (_clientGate) return _client;
+    }
+
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default)
+    {
+        // 重建是 fire-and-replace — Dispose 舊 client，然後把欄位指向新 client。
+        // 因為 BingXRestClient 沒有 IAsyncDisposable，純 Dispose 即可。
+        BingXRestClient oldClient;
+        lock (_clientGate)
+        {
+            if (_options.EffectiveMode == newMode)
+            {
+                _logger.LogInformation("BingX REST already in {Mode} — Reconfigure is a no-op.", newMode);
+                return Task.CompletedTask;
+            }
+
+            // 同步 options（讓所有派生屬性 — QuoteAsset / EffectiveMode — 立即反映）
+            _options.TradingMode = newMode;
+            _options.UseDemoTrading = newMode == TradingMode.Demo;
+
+            oldClient = _client;
+            _client = BuildRestClient(newMode);
+        }
+
+        try { oldClient.Dispose(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "BingX REST client old-instance Dispose threw — ignoring."); }
+
+        _logger.LogWarning("🔁 BingX REST client SWAPPED to {Mode} (new quote asset: {Asset})",
+            newMode, _options.QuoteAsset);
+        return Task.CompletedTask;
     }
 
     // ========== 帳戶 ==========

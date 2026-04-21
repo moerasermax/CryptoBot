@@ -21,6 +21,18 @@ public interface IExchangeClient
     /// </summary>
     string QuoteAsset { get; }
 
+    /// <summary>當前模式 — 提供給 UI / EnvironmentSwitcher 觀察用。</summary>
+    TradingMode CurrentMode { get; }
+
+    /// <summary>
+    /// 熱切換交易模式（Demo ↔ Live）。
+    /// 實作必須：(1) 內部上鎖避免 in-flight REST/WS 操作觀察到半切狀態；
+    /// (2) Dispose 舊 SDK client、用新 endpoint 重建；(3) 重建後 <see cref="QuoteAsset"/>
+    /// 與 <see cref="CurrentMode"/> 立刻反映新模式。
+    /// 切換後若呼叫端有訂單 / 持倉狀態快取，必須自行清掉 — 兩個環境不共享資料。
+    /// </summary>
+    Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default);
+
     // ===== 帳戶 =====
 
     /// <summary>

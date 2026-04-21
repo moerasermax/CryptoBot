@@ -1,4 +1,5 @@
 using CryptoBot.Application.Backtesting;
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
@@ -37,6 +38,12 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
 
     public string ExchangeName => "Backtest";
     public string QuoteAsset => "USDT";
+
+    /// <summary>回測一律視為 Demo（不接真實交易所）。</summary>
+    public TradingMode CurrentMode => TradingMode.Demo;
+
+    /// <summary>回測沒有真正的「環境」可切，呼叫即 no-op；提供此實作只為滿足介面合約。</summary>
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
 
     /// <summary>目前虛擬餘額（USDT），由成交即時扣帳。</summary>
     public decimal VirtualBalance { get; private set; }

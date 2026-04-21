@@ -1,14 +1,6 @@
-namespace CryptoBot.Infrastructure.Configuration;
+using CryptoBot.Application.Common;
 
-/// <summary>
-/// 全域交易模式 — 唯一決定「用真錢還是模擬金」的開關。
-/// Demo 必須對應 BingX 的 VST 模擬資產，Live 才是真 USDT。
-/// </summary>
-public enum TradingMode
-{
-    Demo = 0,
-    Live = 1,
-}
+namespace CryptoBot.Infrastructure.Configuration;
 
 /// <summary>
 /// BingX API 配置 - 從 appsettings.json 讀取

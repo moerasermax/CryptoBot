@@ -1,3 +1,4 @@
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Synchronization;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
@@ -411,6 +412,7 @@ internal sealed class SyncFakeMarketDataStream : IMarketDataStream
 
     public Task StartAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task StopAsync(CancellationToken ct = default) => Task.CompletedTask;
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeKlinesAsync(Symbol s, KlineInterval i, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeMarkPriceAsync(Symbol s, CancellationToken ct = default) => Task.CompletedTask;
     public Task UnsubscribeAsync(Symbol s, CancellationToken ct = default) => Task.CompletedTask;
@@ -433,6 +435,8 @@ internal sealed class SyncFakeExchangeClient : IExchangeClient
 {
     public string ExchangeName => "SYNCFAKE";
     public string QuoteAsset => "USDT";
+    public TradingMode CurrentMode => TradingMode.Demo;
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
     public Price MarkPrice { get; set; } = Price.Create(100m);
     public IReadOnlyList<ExchangePositionInfo> OpenPositions { get; set; } = Array.Empty<ExchangePositionInfo>();
     public int RefreshOrderStatusCalls { get; private set; }

@@ -16,4 +16,13 @@ public interface IStrategyRuntimeController
     Task<bool> StartAsync(Guid strategyId, CancellationToken ct = default);
     Task<bool> StopAsync(Guid strategyId, CancellationToken ct = default);
     bool IsRunning(Guid strategyId);
+
+    /// <summary>
+    /// 一次停掉所有正在跑的 executor — 環境切換 / 緊急熔斷情境用。
+    /// 回傳實際停下來的 strategyId 清單；DB 狀態同步翻為 Stopped 並寫入給定原因。
+    /// </summary>
+    Task<IReadOnlyList<Guid>> StopAllAsync(string reason, CancellationToken ct = default);
+
+    /// <summary>當下所有掛載中的策略 id 快照（含 IsRunning=true 的）。</summary>
+    IReadOnlyList<Guid> RunningStrategyIds { get; }
 }

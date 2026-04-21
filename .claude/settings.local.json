@@ -40,7 +40,9 @@
       "Bash(rm -f src/CryptoBot.ConsoleApp/cryptobot.db src/CryptoBot.ConsoleApp/logs/cryptobot-*.log)",
       "Bash(ls src/CryptoBot.ConsoleApp/logs/)",
       "Bash(taskkill //F //IM CryptoBot.ConsoleApp.exe)",
-      "Bash(taskkill //F //IM dotnet.exe)"
+      "Bash(taskkill //F //IM dotnet.exe)",
+      "Bash(taskkill /F /PID 34452)",
+      "Bash(taskkill //F //PID 34452)"
     ]
   }
 }

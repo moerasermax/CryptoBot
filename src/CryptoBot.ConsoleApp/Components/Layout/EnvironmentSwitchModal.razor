@@ -1,0 +1,76 @@
+@using CryptoBot.Application.Common
+
+@*
+    Demo → Live 的二次確認對話框。
+    刻意做成內嵌 Razor 模型 + 父元件控制 IsVisible，避免引入 SweetAlert / MudBlazor 等大套件。
+
+    防呆要點：
+    - 預設「取消」聚焦：使用者按 Enter 不會誤觸「確認」。
+    - 必須勾選 "I understand" checkbox 才能點 Confirm。
+    - 紅色警告色 + ⚠️ icon。
+*@
+
+@if (IsVisible)
+{
+    <div class="env-modal-backdrop" @onclick="OnCancelClicked">
+        <div class="env-modal env-modal-danger" @onclick:stopPropagation="true" role="dialog" aria-modal="true">
+            <div class="env-modal-header">
+                <span class="env-modal-icon">⚠️</span>
+                <h3>切換到 LIVE 真實交易環境</h3>
+            </div>
+
+            <div class="env-modal-body">
+                <p class="env-modal-warn-line">
+                    您即將切換至 <strong>真實交易環境</strong>，系統將動用 <strong>真實 USDT 資產</strong>。
+                </p>
+                <ul class="env-modal-bullets">
+                    <li>目前正在運行的所有策略 executor 將被 <b>強制 Stop</b>（避免用 demo 配置打 live 訂單）。</li>
+                    <li>切換完成後，您必須在新環境中 <b>手動重新啟動</b> 策略 — 等於再做一次人為確認。</li>
+                    <li>WebSocket 與 listenKey 會重建一次，期間約 1–2 秒收不到 push。</li>
+                </ul>
+                <p class="env-modal-warn-line strong">請確認您已了解風險。</p>
+
+                <label class="env-modal-ack">
+                    <input type="checkbox" @bind="_acknowledged" />
+                    <span>我了解切換到 Live 會動用真實資產，並接受相關風險。</span>
+                </label>
+            </div>
+
+            <div class="env-modal-actions">
+                <button type="button"
+                        class="env-modal-btn env-modal-btn-cancel"
+                        autofocus
+                        @onclick="OnCancelClicked"
+                        disabled="@IsBusy">
+                    取消（保持 Demo）
+                </button>
+                <button type="button"
+                        class="env-modal-btn env-modal-btn-danger"
+                        @onclick="OnConfirmClicked"
+                        disabled="@(!_acknowledged || IsBusy)">
+                    @(IsBusy ? "切換中…" : "確認切換到 LIVE")
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public bool IsVisible { get; set; }
+    [Parameter] public bool IsBusy { get; set; }
+    [Parameter] public EventCallback OnConfirm { get; set; }
+    [Parameter] public EventCallback OnCancel { get; set; }
+
+    private bool _acknowledged;
+
+    protected override void OnParametersSet()
+    {
+        if (!IsVisible) _acknowledged = false;
+    }
+
+    private Task OnConfirmClicked() =>
+        _acknowledged && !IsBusy ? OnConfirm.InvokeAsync() : Task.CompletedTask;
+
+    private Task OnCancelClicked() =>
+        IsBusy ? Task.CompletedTask : OnCancel.InvokeAsync();
+}

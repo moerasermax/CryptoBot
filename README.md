@@ -17,6 +17,7 @@
 | 🧠 **動態策略插槽 UI** | `StrategyCatalog` + `DynamicComponent` — 加新策略只需 3 步，不必碰主頁 |
 | 🪟 **玻璃擬態戰情室** | `#121212` 深色基底、Pills nav、金黃進度條、ETA、skeleton + fade-in |
 | 🔒 **狀態艙 Singleton** | `LabStateContainer` 跨頁面/刷新/tab 不丟資料 |
+| ♻️ **Demo↔Live 熱切換** | `IEnvironmentSwitcher` Stop-First 編排 + 二次確認 Modal + 切換後不自動重啟（強制人為再確認） |
 | 🧪 **零容忍品質** | 0 Warning / 0 Error · 46/46 tests green |
 
 ---
@@ -65,6 +66,27 @@
 - .NET 10 preview SDK（target: net8.0；用 preview SDK 才不會建置警告）
 - 任何作業系統（Windows / Linux / macOS）— 預設使用 SQLite，零外部 DB 依賴
 
+### 設定本機憑證（**第一次跑必做**）
+
+`src/CryptoBot.ConsoleApp/appsettings.json` 內的金鑰欄位是 **placeholder**（`<YOUR_BINGX_API_KEY_HERE>` 之類）— 真實憑證請寫在 **`appsettings.Local.json`**，這個檔名已加入 `.gitignore`，永遠不會被 commit。
+
+在 `src/CryptoBot.ConsoleApp/` 下新建 `appsettings.Local.json`：
+
+```jsonc
+{
+  "BingX": {
+    "ApiKey":    "你的 BingX Demo API Key",
+    "ApiSecret": "你的 BingX Demo API Secret"
+  },
+  "Discord": {
+    "Enabled":    true,
+    "WebhookUrl": "https://discord.com/api/webhooks/.../..."
+  }
+}
+```
+
+> ⚠️ 強烈建議只放 **BingX Demo (VST)** 額度的金鑰。專案預設 `TradingMode: "Demo"`；切到 Live 前 Modal 會二次確認，但金鑰本身就用 demo 的最安全。
+
 ### 啟動
 
 ```bash
@@ -100,11 +122,11 @@ dotnet run --project src/CryptoBot.ConsoleApp -- backtest <args>
 
 ---
 
-## 🗺️ Roadmap / Changelog · 開發歷程 (S1 → S20)
+## 🗺️ Roadmap / Changelog · 開發歷程 (S1 → S21)
 
 > 從零到 Beta v0.1 的全部里程碑。每個 SXX 對應一份 `HANDOFF_N.md` 交接文件。
 
-### Phase 1 · 核心架構與 API 串接
+### Phase 1 · 基礎設施與 API 串接 (S1–S6)
 
 | Sprint | 內容 |
 |---|---|
@@ -113,37 +135,38 @@ dotnet run --project src/CryptoBot.ConsoleApp -- backtest <args>
 | **S3** | Repository 介面定義（Domain）+ EF Core `AppDbContext` 雛形（Infrastructure） |
 | **S4** | BingX SDK 探針：以 build-time XML 路徑解析 SDK 真實簽章（避免訓練資料誤導） |
 | **S5** | `BingXExchangeClient` REST 包裝：下單 / 查倉 / 取 K 線 — 全程 decimal-strict |
+| **S6** | `BingXMarketDataStream`：強型別 WS handlers + ListenKey 30-min 自動續期 + expired 事件政策（不自動重訂閱避免與 SDK auto-reconnect 競賽） |
 
-### Phase 2 · 交易引擎與風控
-
-| Sprint | 內容 |
-|---|---|
-| **S6** | `IStrategy` 介面 + `SmaCrossoverStrategy` 第一版實作（純函式、Domain-only） |
-| **S7** | `StrategyExecutor` + `StrategyRuntimeHostedService` 主迴圈；S7 整合測試 (test-drive) 落地 |
-| **S8** | `AccountSynchronizer`：每 N 秒 reconcile 帳戶 → 寫 EF；`PositionSizingService` Domain Service 完成 |
-| **S9** | `BingXMarketDataStream`：強型別 WS handlers + ListenKey 30-min 自動續期 + expired 事件政策 |
-| **S10** | `InitialStrategySeeder` + Discord Webhook 通知（重大成交事件即時推播） |
-
-### Phase 3 · 回測緩存與優化器
+### Phase 2 · 核心交易引擎與狀態同步 (S7–S12)
 
 | Sprint | 內容 |
 |---|---|
-| **S11** | `IHistoricalDataProvider` + `IHistoricalKlineStore`（SQLite 緩存），下載一次後永遠離線 |
-| **S12** | `BacktestSimulator` + `BacktestEngine`：滑點 / 手續費 / warmup bars，產出 `BacktestReport` |
-| **S13** | `StrategyOptimizer`：`ParameterRange` 笛卡兒積展開、scope-per-run 並行、最後 P/DD 排名 |
-| **S14** | CLI `BacktestRunner` 子命令；DataProvider 端串接 BingX REST 歷史補單 |
+| **S7** | `IStrategy` 介面 + `SmaCrossoverStrategy` 第一版實作（純函式、Domain-only） |
+| **S8** | `StrategyExecutor` + `StrategyRuntimeHostedService` 主迴圈；S7 整合測試 (test-drive) 落地 |
+| **S9** | `AccountSynchronizer`：每 N 秒 reconcile balances/positions/orders 寫 EF；`PositionSizingService` Domain Service 完成 |
+| **S10** | Order / Position 領域狀態機（Pending → Filled / Cancelled、Open → Closed / Liquidated）+ Domain 事件 |
+| **S11** | EF Core repos + SQLite 持久化全鏈接通；migration / `AutoMigrateOnStartup` |
+| **S12** | `InitialStrategySeeder` + Discord Webhook 通知（重大成交事件即時推播） |
 
-### Phase 4 · Blazor 戰情室 UI 與模組化封裝
+### Phase 3 · 回測緩存與並行優化器 (S13–S16)
 
 | Sprint | 內容 |
 |---|---|
-| **S15** | `Microsoft.NET.Sdk.Web` 改造 ConsoleApp；Blazor Server + SignalR + Minimal API 同進程 |
-| **S16** | `TradeHub` + `DashboardEventBus` + `SignalRRealtimeBroadcaster`：雙通道推播架構落地 |
-| **S17** | Backtest Lab 第一版：`BacktestLab.razor` 整合 `OptimizationOrchestrator` + Leaderboard + Apply hot-swap |
-| **S17.5** | 修 EF Core `Symbol` value converter 在 `EF.Property<string>` 路徑炸的問題；新增 `OrderRepo.GetRecentAsync` 繞開 |
-| **S18** | UI/UX 大升級：`StrategyCatalog` 模組化目錄、`LabStateContainer` 狀態艙、`StrategyParameterFormBase` 抽象、`SmaParameterForm` 抽出、`StrategyTabsBar` pills nav、`#121212` 玻璃擬態 + 金黃進度條 + ETA + skeleton + fade-in |
-| **S19** | **CryptoBot Dev Protocol** 開發憲章 + `/docs/architecture/` 三份 Mermaid 文件（System / Data Flow / UML） |
-| **S20** | 🎉 **Beta v0.1 release** — README 重寫 + git tag `v0.1-beta` |
+| **S13** | `IHistoricalDataProvider` + `IHistoricalKlineStore`（SQLite 緩存），下載一次後永遠離線 |
+| **S14** | `BacktestSimulator` + `BacktestEngine`：滑點 / 手續費 / warmup bars，產出 `BacktestReport` |
+| **S15** | `StrategyOptimizer`：`ParameterRange` 笛卡兒積展開、scope-per-run 並行、最後 P/DD 排名 |
+| **S16** | CLI `BacktestRunner` 子命令；DataProvider 端串接 BingX REST 歷史補單 |
+
+### Phase 4 · Blazor 戰情室與動態熱切換 (S17–S21)
+
+| Sprint | 內容 |
+|---|---|
+| **S17** | `Microsoft.NET.Sdk.Web` 改造 ConsoleApp；Blazor Server + SignalR + Minimal API 同進程；`TradeHub` + `DashboardEventBus` + `SignalRRealtimeBroadcaster` 雙通道推播 |
+| **S18** | Backtest Lab 第一版：`BacktestLab.razor` 整合 `OptimizationOrchestrator` + Leaderboard + Apply hot-swap；`#121212` 玻璃擬態 + 金黃進度條 + ETA + skeleton + fade-in |
+| **S19** | **動態策略插槽**：`StrategyCatalog` 模組化目錄、`LabStateContainer` 狀態艙、`StrategyParameterFormBase` 抽象、`SmaParameterForm` 抽出、`StrategyTabsBar` pills nav |
+| **S20** | **CryptoBot Dev Protocol** 開發憲章 v1.0 + `/docs/architecture/` 三份 Mermaid 文件（System / Data Flow / UML） |
+| **S21** | **Demo↔Live 熱切換安全機制**：`IEnvironmentSwitcher` 編排（Stop-First → Reconfigure → Restart）+ `BingXExchangeClient` / `BingXMarketDataStream` SDK client `_clientGate` 原子換 + `GlobalStatusBar` MODE/ACTIVE/ENGINE/SWITCH 四段式狀態列 + `EnvironmentSwitchModal` Demo→Live 二次確認（autofocus 取消 + acknowledgment checkbox）+ 切換後策略**不**自動重啟（強制人為再確認）|
+| **🎉 Release** | **Beta v0.1** — 0 Warning / 0 Error · 46/46 tests green · Dev Protocol v1.1 · `v0.1-beta` git tag |
 
 ### 🔮 Next（Phase 5 預告）
 
@@ -166,7 +189,7 @@ CryptoBot/
 │     ├─ Components/               Blazor 元件
 │     │  ├─ Pages/                   /  /lab
 │     │  ├─ Lab/                     SmaParameterForm · StrategyTabsBar
-│     │  └─ Layout/                  MainLayout
+│     │  └─ Layout/                  MainLayout · GlobalStatusBar · EnvironmentSwitchModal
 │     ├─ Lab/                      StrategyCatalog · LabStateContainer · StrategyParameterFormBase
 │     ├─ Realtime/                 TradeHub · DashboardEventBus · OptimizationEvents
 │     ├─ Services/                 OptimizationOrchestrator

@@ -139,9 +139,51 @@ stateDiagram-v2
 
 > 細節（30-min 而非 40-min、為何 expired 不自動重訂閱）見 `memory/reference_bingx_listenkey.md`。
 
-## 4. 重點不變式
+## 4. 環境切換 (Demo ↔ Live) 資料流
+
+S21 加入的熱切換會**中斷**上面第 1 節主流程，但保證不漏單、不混環境。下面是切換中的資料流快照：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UI as Blazor StatusBar
+    participant L as LabStateContainer
+    participant S as IEnvironmentSwitcher
+    participant R as StrategyRuntimeHostedService
+    participant E as BingXExchangeClient
+    participant W as BingXMarketDataStream
+    participant BX as BingX API
+
+    Note over W,BX: 切換前：WS 持續接收 Demo 環境 tick
+    UI->>L: ChangeEnvironmentAsync(Live)
+    L->>S: SwitchAsync(Live)
+
+    S->>R: StopAllAsync("env switch")
+    R->>R: 每個 executor.StopAsync<br/>狀態 → Stopped
+    Note over R: 此後不再有新訂單被送出
+
+    S->>E: ReconfigureAsync(Live)
+    E->>BX: Dispose old BingXRestClient<br/>Build new with Live endpoint
+    Note over E: _clientGate lock 保證原子性
+
+    S->>W: ReconfigureAsync(Live)
+    W->>BX: rest.Reconfigure (defensive)<br/>Stop WS<br/>Build new BingXSocketClient<br/>(還沒訂閱任何東西)
+
+    S->>W: StartAsync
+    W->>BX: GetListenKey (Live env)<br/>SubscribeToUserDataUpdates (Live)
+    Note over W,BX: 新 WS 在 Live 環境建立 listenKey
+
+    S-->>L: raise EnvironmentChanged
+    L-->>UI: StateChanged → MODE 變紅<br/>flash "Demo → Live (N stopped)"
+    Note over UI: 策略不會自動重啟<br/>使用者必須手動重新 Start
+```
+
+**關鍵：** 整個流程中**沒有任何訂單被送出** — 因為 Runtime 在步驟 3 就全停了，直到使用者在 UI 手動重啟策略。這就是「金融安全」的具體實作。
+
+## 5. 重點不變式
 
 - **WS → Application 必經 Infrastructure 翻譯**：Application 看到的永遠是 `Kline` / `MarketSnapshot` / `Position`，不是 `BingXFuturesAccountUpdate`。
 - **DB 寫入永遠走 Repository 介面**，沒有任何路徑直接 `dbContext.SaveChanges()` 跳過抽象。
 - **推播是雙通道**：本機 Blazor 走 `DashboardEventBus`（in-process），外部 client 走 SignalR — 兩者由 Orchestrator 同步觸發。
 - **回測完全離線**：BacktestEngine 不碰任何外部 API，所有資料來自 `IHistoricalKlineStore`。
+- **環境切換 Stop-First**：`IEnvironmentSwitcher.SwitchAsync` 永遠先 `StopAllAsync` 再 `ReconfigureAsync`，順序不可重排。

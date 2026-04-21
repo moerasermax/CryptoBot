@@ -98,7 +98,100 @@ flowchart TB
 | `BingXMarketDataStream` | Infrastructure | `BingXExchangeClient` (ListenKey REST + WS) |
 | `SmaCrossoverStrategy` | Application | 純 Domain 物件，無 IO |
 
-## 4. 一頁讀懂
+## 4. 環境熱切換 (Hot-Swap) 機制 — S21
+
+S21 加入的動態環境切換不影響上述相依方向，但在 Application 層多了一個編排服務 `IEnvironmentSwitcher`，
+專門負責協調 Stop-First → Reconfigure → Restart 的流程。
+
+```mermaid
+flowchart TB
+    subgraph UI["🖥️ ConsoleApp · Blazor"]
+        Status["GlobalStatusBar.razor<br/>(MODE / ACTIVE / ENGINE / SWITCH)"]
+        Modal["EnvironmentSwitchModal.razor<br/>(二次確認 + checkbox + autofocus 取消)"]
+        Lab["LabStateContainer<br/>(CurrentMode / LastEnvChange)"]
+    end
+
+    subgraph App["⚙️ Application"]
+        Switcher["IEnvironmentSwitcher<br/>(SemaphoreSlim _switchLock)"]
+        Runtime["IStrategyRuntimeController<br/>(StopAllAsync / RunningStrategyIds)"]
+        IExch["IExchangeClient<br/>+ TradingMode CurrentMode<br/>+ ReconfigureAsync(mode)"]
+        IMD["IMarketDataStream<br/>+ ReconfigureAsync(mode)"]
+    end
+
+    subgraph Infra["🔌 Infrastructure · BingX"]
+        Rest["BingXExchangeClient<br/>(_clientGate lock<br/>+ BuildRestClient(mode))"]
+        WS["BingXMarketDataStream<br/>(_clientGate lock<br/>+ BuildSocketClient(mode))"]
+        Opts["BingXOptions (mutable)<br/>EffectiveMode / QuoteAsset (derived)"]
+    end
+
+    Status -->|Demo→Live| Modal
+    Modal -.confirmed.-> Lab
+    Status -->|Live→Demo<br/>(no modal)| Lab
+    Lab -->|ChangeEnvironmentAsync| Switcher
+
+    Switcher -->|"[3] StopAllAsync"| Runtime
+    Switcher -->|"[4] ReconfigureAsync"| IExch
+    Switcher -->|"[5] ReconfigureAsync"| IMD
+    Switcher -->|"[6] StartAsync"| IMD
+    Switcher -->|"[7] EnvironmentChanged"| Lab
+
+    IExch -.implemented by.-> Rest
+    IMD -.implemented by.-> WS
+    Rest -.mutates.-> Opts
+    WS -.reads.-> Opts
+
+    classDef ui fill:#ff4d6d33,stroke:#ff4d6d,color:#e6e8ee
+    classDef app fill:#4dd0e133,stroke:#4dd0e1,color:#e6e8ee
+    classDef infra fill:#f5b30133,stroke:#f5b301,color:#e6e8ee
+    class Status,Modal,Lab ui
+    class Switcher,Runtime,IExch,IMD app
+    class Rest,WS,Opts infra
+```
+
+### 切換時序（**順序鎖定，不准重排**）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (Browser)
+    participant SB as GlobalStatusBar
+    participant M as EnvironmentSwitchModal
+    participant L as LabStateContainer
+    participant S as IEnvironmentSwitcher
+    participant R as IStrategyRuntimeController
+    participant E as BingXExchangeClient
+    participant W as BingXMarketDataStream
+
+    U->>SB: 點「切到 LIVE ⚠️」
+    SB->>M: _modalOpen = true
+    M->>U: 顯示警示框（Cancel autofocus + checkbox 鎖定）
+    U->>M: 勾選 + 點「確認切換到 LIVE」
+    M->>L: ChangeEnvironmentAsync(Live)
+    L->>S: SwitchAsync(Live, reason)
+
+    Note over S: [1] 取 _switchLock (SemaphoreSlim 1,1)
+    Note over S: [2] 同模式? 是 → echo + return
+
+    S->>R: [3] StopAllAsync(reason)
+    R-->>S: List<StoppedIds>
+    S->>E: [4] ReconfigureAsync(Live)
+    Note over E: lock(_clientGate)<br/>Dispose old client<br/>Build new BingXRestClient(Live)
+    S->>W: [5] ReconfigureAsync(Live)
+    Note over W: rest.Reconfigure → Stop → rebuild socket
+    S->>W: [6] StartAsync()
+    S->>L: [7] raise EnvironmentChanged event
+    L->>SB: StateChanged → re-render
+    SB->>U: MODE 變紅、flash 顯示 "Demo → Live (停了 N 個)"
+```
+
+### 安全保證
+
+1. **Stop-First**：`StopAllAsync` 在 `Reconfigure` 之前 — 不可能拿舊環境配置打新環境訂單
+2. **不自動重啟策略**：使用者必須手動 Start = 再做一次人為確認
+3. **同模式冪等**：避免 UI 連點兩下造成 double-reconfigure
+4. **Atomic client swap**：`_clientGate` lock 確保 in-flight RPC 看不到「半切」狀態
+
+## 5. 一頁讀懂
 
 > 想加新功能？先想：**它應該在哪一層？**
 > 想呼叫一個別層的東西？先想：**箭頭方向對不對？**

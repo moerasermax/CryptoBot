@@ -1,3 +1,4 @@
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Notifications;
 using CryptoBot.Application.Realtime;
@@ -54,6 +55,10 @@ public static class DependencyInjection
 
         // 即時推播：預設 NoOp。Web host（ConsoleApp）啟動時會 Replace 成 SignalR 版本。
         services.TryAddSingleton<IRealtimeBroadcaster, NullRealtimeBroadcaster>();
+
+        // 環境熱切換編排器（S21）— Singleton，跨 process 內所有 UI / API 呼叫共用同一個 lock。
+        // 內部依賴 IExchangeClient / IMarketDataStream / IStrategyRuntimeController，全部由 ConsoleApp host 提供。
+        services.AddSingleton<IEnvironmentSwitcher, EnvironmentSwitcher>();
 
         return services;
     }

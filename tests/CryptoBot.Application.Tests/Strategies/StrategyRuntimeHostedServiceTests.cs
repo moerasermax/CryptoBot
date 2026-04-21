@@ -1,3 +1,4 @@
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Strategies;
 using CryptoBot.Application.Synchronization;
@@ -197,6 +198,7 @@ internal sealed class RuntimeFakeMarketDataStream : IMarketDataStream
 
     public Task StartAsync(CancellationToken ct = default) { StartCalls++; return Task.CompletedTask; }
     public Task StopAsync(CancellationToken ct = default) { StopCalls++; return Task.CompletedTask; }
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeKlinesAsync(Symbol s, KlineInterval i, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeMarkPriceAsync(Symbol s, CancellationToken ct = default) => Task.CompletedTask;
     public Task UnsubscribeAsync(Symbol s, CancellationToken ct = default) => Task.CompletedTask;

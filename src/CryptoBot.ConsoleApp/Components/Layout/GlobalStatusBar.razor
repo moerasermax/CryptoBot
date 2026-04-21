@@ -1,22 +1,24 @@
+@using CryptoBot.Application.Common
 @using CryptoBot.Application.Realtime
 @using CryptoBot.Application.Strategies
+@using CryptoBot.ConsoleApp.Lab
 @using CryptoBot.ConsoleApp.Realtime
 @using CryptoBot.Domain.Aggregates.StrategyAggregate
 @using CryptoBot.Domain.Enums
 @using CryptoBot.Domain.Repositories
-@using CryptoBot.Infrastructure.Configuration
 @using Microsoft.Extensions.DependencyInjection
-@using Microsoft.Extensions.Options
 @implements IDisposable
-@inject IOptions<BingXOptions> BingXOpts
 @inject IStrategyRuntimeController Runtime
 @inject IServiceScopeFactory ScopeFactory
 @inject DashboardEventBus Bus
+@inject LabStateContainer Lab
+@inject IEnvironmentSwitcher EnvSwitcher
+@inject ILogger<GlobalStatusBar> Logger
 
 @*
-    全局環境狀態列 — Demo/Live 模式 + 當前掛載策略 + 引擎運行狀態。
-    Push-driven：訂閱 DashboardEventBus.StatsUpdated（DashboardPushService 每幾秒就會打一次），
-    順手 reload running 策略列表，不額外輪詢。
+    全局環境狀態列 — Demo/Live 模式 + 當前掛載策略 + 引擎運行狀態 + 熱切換 toggle。
+    模式來源是 IEnvironmentSwitcher.CurrentMode（不再讀 IOptions），因為 ReconfigureAsync 後
+    要立即反映新狀態 — IOptions 是建構期快照，會錯。
 *@
 
 <div class="env-bar @ModeCssClass">
@@ -39,18 +41,60 @@
             @(EngineRunning ? "Running" : "Stopped")
         </span>
     </span>
+
+    <span class="env-segment env-toggle">
+        <span class="env-segment-label">SWITCH</span>
+        <button type="button"
+                class="env-toggle-btn env-toggle-btn-@ModeCssClass"
+                @onclick="OnToggleClicked"
+                disabled="@_switching"
+                title="@ToggleTooltip">
+            @if (_switching)
+            {
+                <span>切換中…</span>
+            }
+            else if (EnvSwitcher.CurrentMode == TradingMode.Demo)
+            {
+                <span>切到 LIVE ⚠️</span>
+            }
+            else
+            {
+                <span>切回 DEMO 🛡</span>
+            }
+        </button>
+    </span>
+
+    @if (Lab.LastEnvChange is { } e)
+    {
+        <span class="env-segment env-flash" title="最近一次切換摘要">
+            <span class="env-flash-text">
+                @e.FromMode → @e.ToMode (停了 @e.StoppedStrategyIds.Count 個策略, @e.ChangedAtUtc.ToLocalTime():HH:mm:ss)
+            </span>
+        </span>
+    }
 </div>
+
+<EnvironmentSwitchModal IsVisible="_modalOpen"
+                        IsBusy="_switching"
+                        OnConfirm="OnModalConfirm"
+                        OnCancel="OnModalCancel" />
 
 @code {
     private List<Strategy> _running = new();
+    private bool _modalOpen;
+    private bool _switching;
 
-    private string ModeLabel => BingXOpts.Value.EffectiveMode == TradingMode.Live ? "LIVE" : "DEMO";
-    private string ModeIcon  => BingXOpts.Value.EffectiveMode == TradingMode.Live ? "⚠️" : "🛡";
-    private string ModeCssClass => BingXOpts.Value.EffectiveMode == TradingMode.Live ? "live" : "demo";
+    private string ModeLabel    => EnvSwitcher.CurrentMode == TradingMode.Live ? "LIVE" : "DEMO";
+    private string ModeIcon     => EnvSwitcher.CurrentMode == TradingMode.Live ? "⚠️" : "🛡";
+    private string ModeCssClass => EnvSwitcher.CurrentMode == TradingMode.Live ? "live" : "demo";
     private string ModeTooltip =>
-        BingXOpts.Value.EffectiveMode == TradingMode.Live
-            ? $"LIVE trading on BingX — quote asset: {BingXOpts.Value.QuoteAsset} (real money!)"
-            : $"DEMO trading on BingX — quote asset: {BingXOpts.Value.QuoteAsset} (virtual funds)";
+        EnvSwitcher.CurrentMode == TradingMode.Live
+            ? "LIVE trading on BingX — quote asset: USDT (real money!)"
+            : "DEMO trading on BingX — quote asset: VST (virtual funds)";
+
+    private string ToggleTooltip => EnvSwitcher.CurrentMode == TradingMode.Demo
+        ? "切換到 LIVE：將彈出二次確認，所有策略會被強制停止。"
+        : "切回 DEMO：立即生效，所有策略會被強制停止。";
 
     private bool EngineRunning => _running.Any(s => Runtime.IsRunning(s.Id));
 
@@ -89,6 +133,8 @@
     {
         await ReloadAsync();
         Bus.StatsUpdated += OnStatsUpdated;
+        EnvSwitcher.EnvironmentChanged += OnEnvChanged;
+        Lab.StateChanged += OnLabStateChanged;
     }
 
     private void OnStatsUpdated(DashboardStatsUpdate _)
@@ -100,6 +146,22 @@
         });
     }
 
+    private void OnEnvChanged(EnvironmentChangedEvent _)
+    {
+        InvokeAsync(async () =>
+        {
+            // 環境切換後 _running 必為空（StopAll 已執行）— 重新拉一次同步 UI
+            await ReloadAsync();
+            StateHasChanged();
+        });
+    }
+
+    private void OnLabStateChanged()
+    {
+        // LabStateContainer 把 LastEnvChange 翻新後也透過 StateChanged 通知，要 re-render
+        InvokeAsync(StateHasChanged);
+    }
+
     private async Task ReloadAsync()
     {
         try
@@ -109,14 +171,64 @@
             var list = await repo.GetByStatusAsync(StrategyStatus.Running, default);
             _running = list.ToList();
         }
-        catch
+        catch (Exception ex)
         {
+            Logger.LogWarning(ex, "GlobalStatusBar.ReloadAsync failed — showing cached state.");
             _running = new();
+        }
+    }
+
+    private async Task OnToggleClicked()
+    {
+        if (_switching) return;
+
+        if (EnvSwitcher.CurrentMode == TradingMode.Demo)
+        {
+            // Demo → Live：彈出二次確認
+            _modalOpen = true;
+        }
+        else
+        {
+            // Live → Demo：直接切（更安全的方向不需要再防呆）
+            await DoSwitchAsync(TradingMode.Demo, "User switched Live → Demo from status bar");
+        }
+    }
+
+    private async Task OnModalConfirm()
+    {
+        await DoSwitchAsync(TradingMode.Live, "User confirmed Demo → Live via modal");
+        _modalOpen = false;
+    }
+
+    private void OnModalCancel()
+    {
+        if (_switching) return;
+        _modalOpen = false;
+    }
+
+    private async Task DoSwitchAsync(TradingMode target, string reason)
+    {
+        _switching = true;
+        StateHasChanged();
+        try
+        {
+            await Lab.ChangeEnvironmentAsync(target, reason);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Environment switch to {Mode} failed.", target);
+        }
+        finally
+        {
+            _switching = false;
+            StateHasChanged();
         }
     }
 
     public void Dispose()
     {
         Bus.StatsUpdated -= OnStatsUpdated;
+        EnvSwitcher.EnvironmentChanged -= OnEnvChanged;
+        Lab.StateChanged -= OnLabStateChanged;
     }
 }
