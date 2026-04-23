@@ -124,6 +124,58 @@ public class StrategyEngineTests
         Assert.Equal(0m, qty.Value);
     }
 
+    // S99-T7 / S50：保證金上限防呆 — 風險預算算出的 qty 會把保證金撐爆時，
+    // Sizer 應自動縮到 balance*leverage*0.95/entry 的可負擔規模（5% 緩衝），
+    // 而不是把必定會被 BingX Rejected 的大單丟出去。
+    [Fact]
+    public async Task OrderSizer_CapsQuantityWhenMarginExceedsBalance()
+    {
+        // balance=1_000 (VST 真實規模)、leverage=Conservative(2x)、risk=10%（上限）、
+        // entry=100、SL%=1%（下限之一，拿來放大風險預算）：
+        //   riskAmount = 1_000 * 0.10 = 100；stopDist = 100 * 0.01 = 1 → rawQty = 100
+        //   notional     = 100 * 100 = 10_000
+        //   maxNotional  = 1_000 * 2 * 0.95 = 1_900 （S50 緩衝）
+        //   notional > maxNotional → capped = 1_900 / 100 = 19 BTC
+        //   stepSize 0.001 對齊後仍是 19。
+        var exchange = new FakeExchangeClient { Balance = 1_000m };
+        var sizer = new OrderSizer(exchange);
+        var cfg = StrategyConfiguration.Create(
+            symbol: Symbol.Parse("BTC-USDT"),
+            interval: KlineInterval.FifteenMinutes,
+            leverage: Leverage.Conservative, // 2x
+            riskPerTradePercent: 0.10m,      // 10% (domain upper bound)
+            stopLossPercent: 0.01m,
+            takeProfitPercent: 0.04m);
+        var strategy = MakeStrategy(cfg);
+        var signal = TradingSignal.OpenLong(
+            Symbol.Parse("BTC-USDT"), Price.Create(100m),
+            Price.Create(99m), Price.Create(104m), 0.8m, "test");
+
+        var qty = await sizer.ComputeAsync(strategy, signal);
+
+        Assert.Equal(19m, qty.Value);
+    }
+
+    // S99-T7：如果帳戶太小、對齊後的 qty 低於交易所 minQuantity，Sizer 直接回 Zero，
+    // Executor 的 zero-quantity 分支會 log + skip，絕不硬送碎步量。
+    [Fact]
+    public async Task OrderSizer_ReturnsZero_WhenAlignedBelowMinQuantity()
+    {
+        // FakeExchangeClient 回 minQuantity=0.001、stepSize=0.001、minNotional=5。
+        // balance=1、entry=60_000、SL%=2% → stopDist=1_200；risk 2% → riskAmount=0.02
+        // rawQty = 0.02/1200 ≈ 1.67e-5，floor 到 0.001 後 = 0 → < minQuantity 0.001 → Zero。
+        var exchange = new FakeExchangeClient { Balance = 1m };
+        var sizer = new OrderSizer(exchange);
+        var strategy = MakeStrategy();
+        var signal = TradingSignal.OpenLong(
+            Symbol.Parse("BTC-USDT"), Price.Create(60_000m),
+            Price.Create(58_800m), Price.Create(62_400m), 0.8m, "test");
+
+        var qty = await sizer.ComputeAsync(strategy, signal);
+
+        Assert.Equal(0m, qty.Value);
+    }
+
     // ─────────────── RiskManager cooldown integration ───────────────
 
     [Fact]
@@ -495,6 +547,8 @@ internal sealed class FakePositionRepository : IPositionRepository
         Task.FromResult<IReadOnlyList<Position>>(Array.Empty<Position>());
     public Task<IReadOnlyList<Position>> GetClosedPositionsInRangeAsync(DateTime from, DateTime to, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Position>>(Array.Empty<Position>());
+    public Task<IReadOnlyList<Position>> GetRecentClosedAsync(int limit, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Position>>(Array.Empty<Position>());
     public Task AddAsync(Position position, CancellationToken ct = default) => Task.CompletedTask;
     public Task UpdateAsync(Position position, CancellationToken ct = default) => Task.CompletedTask;
 }
@@ -514,6 +568,8 @@ internal sealed class FakeUnitOfWork : IUnitOfWork
 {
     public int SaveChangesCalls { get; private set; }
     public Task<int> SaveChangesAsync(CancellationToken ct = default) { SaveChangesCalls++; return Task.FromResult(1); }
+    public Task<int> SaveChangesWithRetryAsync(int maxAttempts = 3, CancellationToken ct = default)
+        => SaveChangesAsync(ct);
     public Task BeginTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task CommitTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task RollbackTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;

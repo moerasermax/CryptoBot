@@ -128,7 +128,8 @@ public static class BacktestRunner
                         StartingBalance: InitialBalance, EndingBalance: InitialBalance,
                         PeakEquity: InitialBalance, MaxDrawdownPercent: 0m,
                         FirstKlineTime: null, LastKlineTime: null,
-                        Fills: Array.Empty<CryptoBot.Domain.Aggregates.OrderAggregate.Order>());
+                        Fills: Array.Empty<CryptoBot.Domain.Aggregates.OrderAggregate.Order>(),
+                        EquityCurve: Array.Empty<EquityPoint>());
                 }
 
                 var options = BuildOptions(start, end, DefaultWarmupBars);

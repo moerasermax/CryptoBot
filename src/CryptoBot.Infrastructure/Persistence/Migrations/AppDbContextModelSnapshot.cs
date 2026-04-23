@@ -17,6 +17,36 @@ namespace CryptoBot.Infrastructure.Persistence.Migrations
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "8.0.11");
 
+            modelBuilder.Entity("CryptoBot.Domain.Aggregates.AiCredentialAggregate.AiCredential", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ApiKey")
+                        .IsRequired()
+                        .HasMaxLength(512)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Mode")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Provider")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Provider")
+                        .IsUnique();
+
+                    b.ToTable("AiCredentials", (string)null);
+                });
+
             modelBuilder.Entity("CryptoBot.Domain.Aggregates.ExchangeAccountAggregate.ExchangeAccount", b =>
                 {
                     b.Property<Guid>("Id")
@@ -152,6 +182,9 @@ namespace CryptoBot.Infrastructure.Persistence.Migrations
                     b.Property<decimal>("EntryPrice")
                         .HasColumnType("TEXT");
 
+                    b.Property<decimal?>("ExitPrice")
+                        .HasColumnType("TEXT");
+
                     b.Property<bool>("IsClosed")
                         .HasColumnType("INTEGER");
 
@@ -162,6 +195,9 @@ namespace CryptoBot.Infrastructure.Persistence.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<DateTime>("OpenedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ParametersSnapshot")
                         .HasColumnType("TEXT");
 
                     b.Property<decimal>("Quantity")
@@ -177,6 +213,10 @@ namespace CryptoBot.Infrastructure.Persistence.Migrations
                         .HasColumnType("TEXT");
 
                     b.Property<Guid?>("StrategyId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("StrategyType")
+                        .HasMaxLength(64)
                         .HasColumnType("TEXT");
 
                     b.Property<string>("Symbol")
@@ -269,6 +309,35 @@ namespace CryptoBot.Infrastructure.Persistence.Migrations
                     b.HasIndex("Status");
 
                     b.ToTable("Strategies", (string)null);
+                });
+
+            modelBuilder.Entity("CryptoBot.Domain.Aggregates.StrategyOptimizationAggregate.StrategyOptimizationSettings", b =>
+                {
+                    b.Property<Guid>("StrategyId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Symbol")
+                        .HasMaxLength(32)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Interval")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ParametersJson")
+                        .IsRequired()
+                        .HasMaxLength(8192)
+                        .HasColumnType("TEXT");
+
+                    b.Property<decimal>("Score")
+                        .HasPrecision(28, 12)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("StrategyId", "Symbol", "Interval");
+
+                    b.ToTable("StrategyOptimizationSettings", (string)null);
                 });
 
             modelBuilder.Entity("CryptoBot.Infrastructure.Backtesting.Persistence.HistoricalKlineRecord", b =>

@@ -25,6 +25,12 @@ namespace CryptoBot.Application.Backtesting;
 /// </summary>
 public sealed class BacktestEngine
 {
+    /// <summary>
+    /// S25 T2：權益曲線上限點數。長週期回測（例 1 年 1m = 525k 根）若每根都記會吃掉 ~8 MB；
+    /// ×100 參數組合 = 800 MB 不可接受。用 stride 下採樣到固定 ≤1000 點。
+    /// </summary>
+    public const int MaxEquityPoints = 1000;
+
     private readonly IHistoricalKlineStore _store;
     private readonly IBacktestClock _clock;
     private readonly IExchangeClient _exchange;
@@ -73,6 +79,16 @@ public sealed class BacktestEngine
         // peak 永遠只往上，drawdown = (peak - now) / peak。
         var peakEquity = startingBalance;
         var maxDrawdownPct = 0m;
+        var isLiquidated = false;
+
+        // S25 T2：權益曲線下採樣。stride 從預期 K 線總數估出，保證序列 ≤ MaxEquityPoints 點。
+        // 估算失敗（interval=0 或時間區間反了）時退化為 stride=1，反正真實點數自然上限是 totalKlines。
+        var intervalSpan = options.Interval.ToTimeSpan();
+        var expectedKlines = intervalSpan > TimeSpan.Zero && options.EndTime > options.StartTime
+            ? (int)((options.EndTime - options.StartTime).Ticks / intervalSpan.Ticks)
+            : 0;
+        var stride = Math.Max(1, expectedKlines / MaxEquityPoints);
+        var equityCurve = new List<EquityPoint>(Math.Min(expectedKlines, MaxEquityPoints) + 1);
 
         await foreach (var kline in _store
             .StreamRangeAsync(symbol, options.Interval, options.StartTime, options.EndTime, ct)
@@ -106,14 +122,48 @@ public sealed class BacktestEngine
             }
 
             // Mark-to-market 權益：已實現的 VirtualBalance + 未平倉 Position 的 UnrealizedPnL
+            var openUnrealized = openPositions.Sum(p => p.UnrealizedPnL);
             var currentEquity = await _exchange.GetFuturesBalanceAsync("USDT", ct).ConfigureAwait(false)
-                              + openPositions.Sum(p => p.UnrealizedPnL);
+                              + openUnrealized;
+
+            // S32-T1：爆倉檢查放在權益計算「之後、回撤記錄之前」。觸發後 Simulator 會把
+            // VirtualBalance 強制歸零；此處將 currentEquity 同步歸零，後續的 peak/drawdown
+            // 與權益曲線才會一致反映「帳戶已爆」。Break 立刻中止主迴圈，不再處理後續 K 線。
+            if (_clock.CheckAndApplyLiquidation(openUnrealized))
+            {
+                isLiquidated = true;
+                currentEquity = 0m;
+                if (peakEquity > 0)
+                {
+                    var ddL = (peakEquity - currentEquity) / peakEquity * 100m;
+                    if (ddL > maxDrawdownPct) maxDrawdownPct = ddL;
+                }
+                equityCurve.Add(new EquityPoint(kline.OpenTime, 0m));
+                _logger.LogWarning(
+                    "💥 [BACKTEST] Liquidated at {Time:yyyy-MM-dd HH:mm}. Halting replay — {N} klines processed.",
+                    kline.OpenTime, totalKlines);
+                break;
+            }
+
             if (currentEquity > peakEquity) peakEquity = currentEquity;
             if (peakEquity > 0)
             {
                 var dd = (peakEquity - currentEquity) / peakEquity * 100m;
                 if (dd > maxDrawdownPct) maxDrawdownPct = dd;
             }
+
+            // S25 T2：每 stride 根記一次權益點。totalKlines 從 1 起算，用 (totalKlines - 1) 對齊起點。
+            if (((totalKlines - 1) % stride) == 0)
+                equityCurve.Add(new EquityPoint(kline.OpenTime, currentEquity));
+        }
+
+        // 末尾補一筆：若最後一根 K 線不在 stride 節奏上，UI 上的曲線尾部會缺一段 — 這裡補齊。
+        if (lastTime is not null
+            && (equityCurve.Count == 0 || equityCurve[^1].TimeUtc != lastTime.Value))
+        {
+            var finalEquity = await _exchange.GetFuturesBalanceAsync("USDT", ct).ConfigureAwait(false)
+                            + openPositions.Sum(p => p.UnrealizedPnL);
+            equityCurve.Add(new EquityPoint(lastTime.Value, finalEquity));
         }
 
         var endingBalance = await _exchange.GetFuturesBalanceAsync("USDT", ct).ConfigureAwait(false);
@@ -128,7 +178,9 @@ public sealed class BacktestEngine
             MaxDrawdownPercent: maxDrawdownPct,
             FirstKlineTime: firstTime,
             LastKlineTime: lastTime,
-            Fills: fills);
+            Fills: fills,
+            EquityCurve: equityCurve,
+            IsLiquidated: isLiquidated);
 
         _logger.LogInformation(
             "✅ [BACKTEST] Done. klines={N} signals={S} fills={F} openLeft={Open} closed={Closed} bal {From:F2} → {To:F2} ({Pct:F2}%) maxDD={DD:F2}%",
@@ -193,7 +245,11 @@ public sealed class BacktestEngine
         }
         else
         {
-            var notional = Math.Max(options.InitialBalance * 0.1m, 0m);
+            // S32-T1：用戶自訂槓桿放大開倉名目金額。10% 自有資金 × 槓桿倍數 = 本次名目部位。
+            // 1x 時行為與 S32 前相同（向下相容 VCP-Accuracy）；高槓桿（例如 100x）會讓 UnrealizedPnL 也
+            // 等比例放大，進而在 BacktestSimulator.CheckAndApplyLiquidation 中快速觸發爆倉。
+            var leverage = (decimal)strategyConfig.Leverage.Value;
+            var notional = Math.Max(options.InitialBalance * 0.1m * leverage, 0m);
             var rawQty = currentClose > 0 ? notional / currentClose : 0m;
             if (rawQty <= 0)
             {

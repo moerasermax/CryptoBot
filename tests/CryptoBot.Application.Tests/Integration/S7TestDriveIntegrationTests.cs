@@ -151,6 +151,7 @@ public class S7TestDriveIntegrationTests
             // Application 層實際組件（不走 AddApplication 因為只要 SMA 一支策略）
             services.AddSingleton(RiskLimits.Moderate);
             services.AddSingleton<IStrategyCooldownTracker, StrategyCooldownTracker>();
+            services.AddSingleton<ISafetyBreakerState, SafetyBreakerState>();
             services.AddScoped<IRiskManager, RiskManager>();
             services.AddScoped<IOrderSizer, OrderSizer>();
             services.AddSingleton<IStrategy, SmaCrossoverStrategy>();
@@ -185,6 +186,7 @@ public class S7TestDriveIntegrationTests
                 sp.GetRequiredService<IStrategyExecutorFactory>(),
                 sp.GetRequiredService<IStrategyFactory>(),
                 sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetRequiredService<ISafetyBreakerState>(),
                 NullLogger<StrategyRuntimeHostedService>.Instance);
 
             await host.StartAsync(CancellationToken.None);
@@ -368,6 +370,10 @@ internal sealed class PipelineInMemoryPositionRepo : IPositionRepository
     public Task<IReadOnlyList<Position>> GetClosedPositionsInRangeAsync(DateTime from, DateTime to, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Position>>(Store.Where(p => p.IsClosed).ToList());
 
+    public Task<IReadOnlyList<Position>> GetRecentClosedAsync(int limit, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Position>>(
+            Store.Where(p => p.IsClosed).OrderByDescending(p => p.ClosedAt).Take(limit).ToList());
+
     public Task AddAsync(Position position, CancellationToken ct = default) { Store.Add(position); return Task.CompletedTask; }
     public Task UpdateAsync(Position position, CancellationToken ct = default) => Task.CompletedTask;
 }
@@ -397,6 +403,8 @@ internal sealed class PipelineInMemoryUnitOfWork : IUnitOfWork
 {
     public int SaveChangesCalls { get; private set; }
     public Task<int> SaveChangesAsync(CancellationToken ct = default) { SaveChangesCalls++; return Task.FromResult(1); }
+    public Task<int> SaveChangesWithRetryAsync(int maxAttempts = 3, CancellationToken ct = default)
+        => SaveChangesAsync(ct);
     public Task BeginTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task CommitTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task RollbackTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;

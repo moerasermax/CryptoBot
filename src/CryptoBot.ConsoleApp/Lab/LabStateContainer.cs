@@ -1,8 +1,32 @@
+using System.Collections.Concurrent;
+using CryptoBot.Application.Ai;
 using CryptoBot.Application.Common;
 using CryptoBot.ConsoleApp.Realtime;
 using CryptoBot.ConsoleApp.Services;
+using CryptoBot.Domain.Enums;
 
 namespace CryptoBot.ConsoleApp.Lab;
+
+/// <summary>
+/// S47-REVISED：整個 Lab 頁面全域表單的「鋼鐵級快照」—
+/// Symbol / Interval / Slippage / Initial / Leverage / Window 全部入袋，
+/// 切到 Dashboard 再回 /lab 時原樣恢復。
+///
+/// <para>
+/// 為什麼不只存 Grid：PM 驗收條件是「所有網格參數必須完好如初」——
+/// 使用者心裡「網格」含全表單（從 Market 到 Window 到槓桿），不只是策略 Min/Max/Step。
+/// </para>
+/// </summary>
+public sealed record LabFormSnapshot(
+    string SymbolInput,
+    string SymbolSelect,
+    bool IsManualSymbol,
+    KlineInterval Interval,
+    decimal SlippageBps,
+    decimal InitialBalance,
+    int Leverage,
+    DateTime StartDateUtc,
+    DateTime EndDateUtc);
 
 /// <summary>
 /// 整個 Lab 介面的「狀態艙」— Singleton，跨頁面、跨重整、跨 tab 切換都不丟資料。
@@ -22,6 +46,15 @@ public sealed class LabStateContainer : IDisposable
     private readonly object _lock = new();
     private DateTime? _runStartedUtc;
     private Timer? _etaTimer;
+
+    // S47：策略 key → 最後一次的網格 Min/Max/Step 快照。Container 是 Singleton，
+    // 使用者切頁到 Dashboard 再回來時，BacktestLab 能從這裡拿回自己上次的設定。
+    // ConcurrentDictionary 因為 BacktestLab 可能在不同 circuit 被並行存取（多分頁）。
+    private readonly ConcurrentDictionary<string, IReadOnlyDictionary<string, ParameterGridRange>> _gridCache = new();
+
+    // S47-REVISED：全域表單快照 — Symbol / Interval / Slippage / Initial / Leverage / Window。
+    // 單一 singleton 對單一老闆面板，不用 keyed 結構；null = 從未保存過（用 UI 預設值）。
+    private LabFormSnapshot? _formSnapshot;
 
     public LabStateContainer(
         DashboardEventBus bus,
@@ -69,6 +102,43 @@ public sealed class LabStateContainer : IDisposable
     }
 
     public event Action? StateChanged;
+
+    // ── S47 grid settings persistence ──
+
+    /// <summary>
+    /// S47：儲存某策略 key 目前的 Min/Max/Step 網格設定。空字典會被忽略，避免表單初始化
+    /// 尚未回報時把有用的舊快取洗掉。
+    /// </summary>
+    public void SaveGridSettings(string strategyKey, IReadOnlyDictionary<string, ParameterGridRange> grid)
+    {
+        if (string.IsNullOrWhiteSpace(strategyKey)) return;
+        if (grid is null || grid.Count == 0) return;
+        _gridCache[strategyKey] = grid;
+    }
+
+    /// <summary>
+    /// S47：取某策略 key 的快取網格；沒有快取時回 <c>null</c>，讓 UI 維持表單預設值。
+    /// </summary>
+    public IReadOnlyDictionary<string, ParameterGridRange>? TryGetGridSettings(string strategyKey)
+        => _gridCache.TryGetValue(strategyKey, out var v) ? v : null;
+
+    /// <summary>
+    /// S47-REVISED：保存全域表單快照 — BacktestLab 任何 <c>@bind:after</c> 觸發時呼叫，
+    /// 讓切頁 / refresh 都不丟 Symbol / Interval / Slippage / Initial / Leverage / Window。
+    /// </summary>
+    public void SaveFormSnapshot(LabFormSnapshot snapshot)
+    {
+        if (snapshot is null) return;
+        lock (_lock) _formSnapshot = snapshot;
+    }
+
+    /// <summary>
+    /// S47-REVISED：取全域表單快照；沒快照時回 <c>null</c>，由 UI 用自身預設值。
+    /// </summary>
+    public LabFormSnapshot? TryGetFormSnapshot()
+    {
+        lock (_lock) return _formSnapshot;
+    }
 
     // ── mutations ──
     public void SelectModel(string key)

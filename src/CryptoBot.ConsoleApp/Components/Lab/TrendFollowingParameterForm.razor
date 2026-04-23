@@ -1,0 +1,132 @@
+@namespace CryptoBot.ConsoleApp.Components.Lab
+@inherits CryptoBot.ConsoleApp.Lab.StrategyParameterFormBase
+@using CryptoBot.Application.Ai
+@using CryptoBot.ConsoleApp.Services
+
+@*
+    趨勢跟蹤策略的參數掃描表單。四個維度：
+    Fast EMA (5..50) / Slow EMA (20..200) / RSI Period (7..28) / RSI Midline (40..60)。
+    Grid size 由父頁面讀 CurrentGridSize 計算，LabEndpoints 會擋 > 1000 組合的誤輸。
+*@
+
+<div class="glass-form">
+    <div class="glass-row">
+        <label class="glass-label">Fast EMA</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="5"  max="50"  disabled="@Disabled" @bind="_fastMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="5"  max="50"  disabled="@Disabled" @bind="_fastMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="10"  disabled="@Disabled" @bind="_fastStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">Slow EMA</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="20" max="200" disabled="@Disabled" @bind="_slowMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="20" max="200" disabled="@Disabled" @bind="_slowMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="20"  disabled="@Disabled" @bind="_slowStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">RSI Period</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="7"  max="28"  disabled="@Disabled" @bind="_rsiPeriodMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="7"  max="28"  disabled="@Disabled" @bind="_rsiPeriodMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="5"   disabled="@Disabled" @bind="_rsiPeriodStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">RSI Midline</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="40" max="60"  disabled="@Disabled" @bind="_rsiMidMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="40" max="60"  disabled="@Disabled" @bind="_rsiMidMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="10"  disabled="@Disabled" @bind="_rsiMidStep" @bind:after="OnChanged" /></div>
+    </div>
+</div>
+
+@code {
+    private decimal _fastMin      = 8,   _fastMax      = 20,  _fastStep      = 2;
+    private decimal _slowMin      = 26,  _slowMax      = 60,  _slowStep      = 4;
+    private decimal _rsiPeriodMin = 14,  _rsiPeriodMax = 14,  _rsiPeriodStep = 1;
+    private decimal _rsiMidMin    = 50,  _rsiMidMax    = 50,  _rsiMidStep    = 1;
+
+    public override int CurrentGridSize =>
+        Math.Max(0, Count(_fastMin, _fastMax, _fastStep))
+        * Math.Max(0, Count(_slowMin, _slowMax, _slowStep))
+        * Math.Max(0, Count(_rsiPeriodMin, _rsiPeriodMax, _rsiPeriodStep))
+        * Math.Max(0, Count(_rsiMidMin, _rsiMidMax, _rsiMidStep));
+
+    protected override Task OnInitializedAsync() => NotifyChangedAsync();
+
+    private Task OnChanged() => NotifyChangedAsync();
+
+    private static int Count(decimal min, decimal max, decimal step)
+    {
+        if (step <= 0 || max < min) return 0;
+        return (int)Math.Floor((double)((max - min) / step)) + 1;
+    }
+
+    public override async Task ApplyParametersAsync(IReadOnlyDictionary<string, decimal> parameters)
+    {
+        if (TryResolve(parameters, out var fast, "FastEmaPeriod", "fast_ema_period", "fast_ema", "FastEma", "FastPeriod", "fast_period", "fast"))
+        { _fastMin = _fastMax = fast; _fastStep = 1; }
+        if (TryResolve(parameters, out var slow, "SlowEmaPeriod", "slow_ema_period", "slow_ema", "SlowEma", "SlowPeriod", "slow_period", "slow"))
+        { _slowMin = _slowMax = slow; _slowStep = 1; }
+        if (TryResolve(parameters, out var rsiP, "RsiPeriod", "rsi_period", "rsi", "RsiLen", "rsi_len"))
+        { _rsiPeriodMin = _rsiPeriodMax = rsiP; _rsiPeriodStep = 1; }
+        if (TryResolve(parameters, out var mid, "RsiMidline", "rsi_midline", "RsiMid", "rsi_mid", "midline"))
+        { _rsiMidMin = _rsiMidMax = mid; _rsiMidStep = 1; }
+        await NotifyChangedAsync();
+    }
+
+    // S30-GRID-FIX T2：AI 輸出 JSON key 常不照 PascalCase — 透過 TryResolve 做 case-insensitive + 同義詞比對，
+    // 避免 `fast_ema` / `rsi_midline` 這類寫法讓整筆建議被默默吃掉。結尾 NotifyChangedAsync 讓 Grid size 立刻跳轉。
+    public override async Task ApplyGridParametersAsync(IReadOnlyDictionary<string, ParameterGridRange> parameters)
+    {
+        if (TryResolve(parameters, out var fast, "FastEmaPeriod", "fast_ema_period", "fast_ema", "FastEma", "FastPeriod", "fast_period", "fast"))
+        { _fastMin = fast.Min; _fastMax = fast.Max; _fastStep = fast.Step > 0 ? fast.Step : 1; }
+        if (TryResolve(parameters, out var slow, "SlowEmaPeriod", "slow_ema_period", "slow_ema", "SlowEma", "SlowPeriod", "slow_period", "slow"))
+        { _slowMin = slow.Min; _slowMax = slow.Max; _slowStep = slow.Step > 0 ? slow.Step : 1; }
+        if (TryResolve(parameters, out var rsiP, "RsiPeriod", "rsi_period", "rsi", "RsiLen", "rsi_len"))
+        { _rsiPeriodMin = rsiP.Min; _rsiPeriodMax = rsiP.Max; _rsiPeriodStep = rsiP.Step > 0 ? rsiP.Step : 1; }
+        if (TryResolve(parameters, out var mid, "RsiMidline", "rsi_midline", "RsiMid", "rsi_mid", "midline"))
+        { _rsiMidMin = mid.Min; _rsiMidMax = mid.Max; _rsiMidStep = mid.Step > 0 ? mid.Step : 1; }
+        await NotifyChangedAsync();
+    }
+
+    // S47：當前網格 snapshot — LabStateContainer 快取用。
+    public override IReadOnlyDictionary<string, ParameterGridRange> CurrentGrid
+        => new Dictionary<string, ParameterGridRange>
+        {
+            ["FastEmaPeriod"] = new(_fastMin,      _fastMax,      _fastStep),
+            ["SlowEmaPeriod"] = new(_slowMin,      _slowMax,      _slowStep),
+            ["RsiPeriod"]     = new(_rsiPeriodMin, _rsiPeriodMax, _rsiPeriodStep),
+            ["RsiMidline"]    = new(_rsiMidMin,    _rsiMidMax,    _rsiMidStep),
+        };
+
+    public override OptimizationRequest? BuildRequest(
+        OptimizationGlobals globals, DateTime startUtc, DateTime endUtc, out string? error)
+    {
+        if (_fastStep <= 0 || _slowStep <= 0 || _rsiPeriodStep <= 0 || _rsiMidStep <= 0)
+        { error = "Step must be positive."; return null; }
+
+        if (_fastMax < _fastMin || _slowMax < _slowMin
+            || _rsiPeriodMax < _rsiPeriodMin || _rsiMidMax < _rsiMidMin)
+        { error = "Max must be >= Min."; return null; }
+
+        if (_fastMax >= _slowMin)
+        { error = "Fast EMA.Max 必須 < Slow EMA.Min（快線週期必須短於慢線週期）."; return null; }
+
+        if (startUtc >= endUtc) { error = "Start must be before End."; return null; }
+
+        error = null;
+        return new OptimizationRequest(
+            StrategyKey: "trend",
+            Ranges: new[]
+            {
+                new ParameterRangeDto("FastEmaPeriod", _fastMin,      _fastMax,      _fastStep),
+                new ParameterRangeDto("SlowEmaPeriod", _slowMin,      _slowMax,      _slowStep),
+                new ParameterRangeDto("RsiPeriod",     _rsiPeriodMin, _rsiPeriodMax, _rsiPeriodStep),
+                new ParameterRangeDto("RsiMidline",    _rsiMidMin,    _rsiMidMax,    _rsiMidStep),
+            },
+            StartUtc: startUtc,
+            EndUtc: endUtc,
+            Symbol: globals.Symbol,
+            Interval: globals.Interval,
+            SlippageBps: globals.SlippageBps,
+            InitialBalance: globals.InitialBalance,
+            Leverage: globals.Leverage);
+    }
+}

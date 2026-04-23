@@ -21,14 +21,44 @@ public sealed class StrategyCatalog
             DisplayName: "SMA Crossover",
             Subtitle: "雙均線金叉 / 死叉",
             FormComponent: typeof(Components.Lab.SmaParameterForm),
-            IsLocked: false));
+            IsLocked: false,
+            ExpectedParameterKeys: new[] { "FastSmaPeriod", "SlowSmaPeriod" }));
 
+        // S32-S35-REVISED T1：業界術語大一統 — DisplayName 改為 `<指標>` + `<形式>` 一眼能看懂的英文命名。
+        // 同名字也會透過 AiAdvisorEndpoints 傳進 Gemini Prompt (`{req.StrategyDisplayName}`)，Prompt 自動對齊。
         Register(new StrategyModel(
             Key: "rsi-bb",
-            DisplayName: "B46 · RSI + Bollinger",
-            Subtitle: "通道反轉 × 超買超賣",
+            DisplayName: "B46 Hybrid Model",
+            Subtitle: "RSI 超買超賣 × Bollinger 通道反轉 複合訊號",
             FormComponent: typeof(Components.Lab.B46ParameterForm),
-            IsLocked: false));
+            IsLocked: false,
+            ExpectedParameterKeys: new[] { "RsiPeriod", "RsiOversold", "RsiOverbought", "BbPeriod", "BbStdDev" }));
+
+        Register(new StrategyModel(
+            Key: "trend",
+            DisplayName: "EMA Trend Following",
+            Subtitle: "EMA 黃金/死亡交叉 × RSI 動能確認",
+            FormComponent: typeof(Components.Lab.TrendFollowingParameterForm),
+            IsLocked: false,
+            ExpectedParameterKeys: new[] { "FastEmaPeriod", "SlowEmaPeriod", "RsiPeriod", "RsiMidline" }));
+
+        Register(new StrategyModel(
+            Key: "mean-reversion",
+            DisplayName: "Bollinger Reversion",
+            Subtitle: "Bollinger 觸軌 × RSI 極端反轉",
+            FormComponent: typeof(Components.Lab.MeanReversionParameterForm),
+            IsLocked: false,
+            ExpectedParameterKeys: new[] { "BbPeriod", "BbStdDev", "RsiPeriod", "RsiOversold", "RsiOverbought" }));
+
+        // S43：Price Action Predictor — 裸 K 形態 + 動能。不依賴任何移動平均 / 震盪指標，
+        // 純從 OHLC 結構推斷方向 + 主動反轉出場。
+        Register(new StrategyModel(
+            Key: "pa",
+            DisplayName: "Price Action Predictor",
+            Subtitle: "裸 K 形態 × 動能雙驗證，反向形態主動平倉",
+            FormComponent: typeof(Components.Lab.PaParameterForm),
+            IsLocked: false,
+            ExpectedParameterKeys: new[] { "LookbackPeriod", "MomentumThreshold", "WickToBodyRatio", "EngulfingEnabled", "Confidence" }));
     }
 
     public IReadOnlyList<StrategyModel> Models => _models;
@@ -43,4 +73,5 @@ public sealed record StrategyModel(
     string DisplayName,
     string Subtitle,
     Type? FormComponent,
-    bool IsLocked);
+    bool IsLocked,
+    IReadOnlyList<string> ExpectedParameterKeys);

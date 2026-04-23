@@ -558,6 +558,10 @@ internal sealed class StatefulPositionRepo : IPositionRepository
     public Task<IReadOnlyList<Position>> GetClosedPositionsInRangeAsync(DateTime from, DateTime to, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Position>>(_store.Where(p => p.IsClosed && p.ClosedAt >= from && p.ClosedAt <= to).ToList());
 
+    public Task<IReadOnlyList<Position>> GetRecentClosedAsync(int limit, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Position>>(
+            _store.Where(p => p.IsClosed).OrderByDescending(p => p.ClosedAt).Take(limit).ToList());
+
     public Task AddAsync(Position position, CancellationToken ct = default) { _store.Add(position); return Task.CompletedTask; }
     public Task UpdateAsync(Position position, CancellationToken ct = default) => Task.CompletedTask;
 }
@@ -566,6 +570,8 @@ internal sealed class CountingUnitOfWork : IUnitOfWork
 {
     public int SaveChangesCalls { get; private set; }
     public Task<int> SaveChangesAsync(CancellationToken ct = default) { SaveChangesCalls++; return Task.FromResult(1); }
+    public Task<int> SaveChangesWithRetryAsync(int maxAttempts = 3, CancellationToken ct = default)
+        => SaveChangesAsync(ct);
     public Task BeginTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task CommitTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task RollbackTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;

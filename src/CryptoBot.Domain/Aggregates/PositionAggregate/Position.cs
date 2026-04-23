@@ -53,6 +53,29 @@ public sealed class Position : AggregateRoot<Guid>
     /// <summary>累計手續費</summary>
     public decimal TotalCommission { get; private set; }
 
+    // ===== S39 交易歷史 / AI 複盤用欄位 =====
+
+    /// <summary>
+    /// 平倉成交價 — Close() 時落地的快照，與 CurrentPrice 分開儲存
+    /// 目的是讓歷史報表有一個永遠等於「這筆交易的出場價」的欄位，
+    /// 不會被任何後續 UpdateCurrentPrice 覆寫（理論上不會發生，但語意分離更乾淨）。
+    /// </summary>
+    public Price? ExitPrice { get; private set; }
+
+    /// <summary>
+    /// 開倉時鎖定的策略類型 — 例如 "SmaCrossover" / "B46RsiBb"。
+    /// 存字串而不是 Guid，是為了「即使 Strategy Aggregate 後來改名或換型，
+    /// 歷史交易仍能顯示下單當下使用的決策大腦」。
+    /// </summary>
+    public string? StrategyType { get; private set; }
+
+    /// <summary>
+    /// 開倉當下策略參數的 JSON 快照（含 Parameters dict + 風控/槓桿/止損止盈 %）。
+    /// 給 AI 複盤用 — 複盤時必須知道「這筆交易用的是哪一組參數」，
+    /// 才能做策略表現分析與網格比對。
+    /// </summary>
+    public string? ParametersSnapshot { get; private set; }
+
     // ===== 計算屬性 =====
 
     /// <summary>未實現盈虧 (需要提供當前價格)</summary>
@@ -139,7 +162,9 @@ public sealed class Position : AggregateRoot<Guid>
         MarginMode marginMode = MarginMode.Isolated,
         Price? stopLossPrice = null,
         Price? takeProfitPrice = null,
-        Guid? strategyId = null)
+        Guid? strategyId = null,
+        string? strategyType = null,
+        string? parametersSnapshot = null)
     {
         if (quantity.Value <= 0)
             throw new DomainException("Position quantity must be positive.");
@@ -160,6 +185,8 @@ public sealed class Position : AggregateRoot<Guid>
             StopLossPrice = stopLossPrice,
             TakeProfitPrice = takeProfitPrice,
             StrategyId = strategyId,
+            StrategyType = strategyType,
+            ParametersSnapshot = parametersSnapshot,
             OpenedAt = DateTime.UtcNow,
             IsClosed = false
         };
@@ -299,6 +326,7 @@ public sealed class Position : AggregateRoot<Guid>
         IsClosed = true;
         ClosedAt = DateTime.UtcNow;
         CurrentPrice = exitPrice;
+        ExitPrice = exitPrice;
 
         RaiseDomainEvent(new PositionClosedEvent(
             Id, Symbol, Side, Quantity, EntryPrice, exitPrice, RealizedPnL, reason));
@@ -341,6 +369,7 @@ public sealed class Position : AggregateRoot<Guid>
         {
             IsClosed = true;
             ClosedAt = DateTime.UtcNow;
+            ExitPrice = reducePrice;
         }
     }
 

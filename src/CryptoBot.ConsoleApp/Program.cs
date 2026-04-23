@@ -1,15 +1,18 @@
 using CryptoBot.Application;
 using CryptoBot.Application.Realtime;
+using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Strategies;
 using CryptoBot.ConsoleApp.Api;
 using CryptoBot.ConsoleApp.Components;
 using CryptoBot.ConsoleApp.Lab;
+using CryptoBot.ConsoleApp.Middleware;
 using CryptoBot.ConsoleApp.Realtime;
 using CryptoBot.ConsoleApp.Services;
 using CryptoBot.Infrastructure;
 using CryptoBot.Infrastructure.Configuration;
 using CryptoBot.Infrastructure.Persistence;
 using CryptoBot.Infrastructure.Seeding;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -31,6 +34,10 @@ namespace CryptoBot.ConsoleApp;
 /// </summary>
 public static class Program
 {
+    /// <summary>
+    /// 僅供啟動 log 使用的顯示值。實際綁定由 <c>appsettings.json :: Kestrel:Endpoints</c>
+    /// 掌握（S27 起外網部署需 <c>http://0.0.0.0:5000</c>）。
+    /// </summary>
     public const string DefaultWebUrl = "http://localhost:5080";
 
     public static async Task<int> Main(string[] args)
@@ -62,7 +69,8 @@ public static class Program
 
             await SeedInitialStrategyAsync(app.Services).ConfigureAwait(false);
 
-            Log.Information("🌐 Web UI 指揮中心：{Url}", DefaultWebUrl);
+            var kestrelUrl = app.Configuration["Kestrel:Endpoints:Http:Url"];
+            Log.Information("🌐 Web UI 指揮中心：{Url}", string.IsNullOrWhiteSpace(kestrelUrl) ? DefaultWebUrl : kestrelUrl);
             await app.RunAsync().ConfigureAwait(false);
 
             Log.Information("CryptoBot 已正常關閉。");
@@ -90,7 +98,25 @@ public static class Program
             .AddEnvironmentVariables();
 
         builder.Host.UseSerilog();
-        builder.WebHost.UseUrls(DefaultWebUrl);
+        // S27：Kestrel 綁定改走 appsettings.json (Kestrel:Endpoints:Http:Url)，
+        // 不再用 UseUrls 鎖死 localhost:5080 — 外網部署需要 0.0.0.0:5000。
+        // IP 白名單由 IpWhitelistMiddleware 擋在最前面，杜絕非授權來源。
+        builder.Services.Configure<IpWhitelistOptions>(
+            builder.Configuration.GetSection(IpWhitelistOptions.SectionName));
+
+        // S27-NGROK T1：ngrok 會把真正的客戶端 IP 放進 X-Forwarded-For，socket 上的 RemoteIpAddress
+        // 只會是 127.0.0.1 / ngrok 代理的內部 IP。UseForwardedHeaders 會把 context.Connection.RemoteIpAddress
+        // 改寫成 X-Forwarded-For 的第一跳（真實 client IP），之後 IpWhitelistMiddleware 才能拿到正確值。
+        // Known{Networks,Proxies} 清空 — ngrok 代理 IP 是動態的，固定清單沒意義；若未來要限制只能走 ngrok，
+        // 改在 appsettings 加 IpWhitelist 值（不是白名單代理）。
+        // ForwardLimit = null：不管經過多少層代理（ngrok 可能有多跳），一律取 X-Forwarded-For 的最左側原始 IP。
+        builder.Services.Configure<ForwardedHeadersOptions>(options =>
+        {
+            options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+            options.KnownNetworks.Clear();
+            options.KnownProxies.Clear();
+            options.ForwardLimit = null;
+        });
 
         // 核心三層（保持與之前 console 版一致）
         builder.Services.AddApplication();
@@ -112,6 +138,15 @@ public static class Program
             // 儀表板每 2 秒心跳
             builder.Services.AddScoped<DashboardStatsService>();
             builder.Services.AddHostedService<DashboardPushService>();
+
+            // S27：交易所 REST 延遲探測（每 15s → DashboardEventBus → GlobalStatusBar）
+            builder.Services.AddHostedService<ExchangeHealthCheckService>();
+
+            // S28 T1：日損熔斷監控（每 1 分鐘巡檢 → StopAll + 紫色 Discord 通知）
+            builder.Services.AddHostedService<SafetyBreakerMonitor>();
+
+            // S28 T1：將熔斷狀態事件橋接到 DashboardEventBus，讓 Blazor UI 即時解鎖/上鎖
+            builder.Services.AddHostedService<SafetyBreakerDashboardBridge>();
 
             // 回測實驗室（參數優化）單例 + 內部閘門保證同時只跑一個 job
             builder.Services.AddSingleton<OptimizationOrchestrator>();
@@ -135,6 +170,13 @@ public static class Program
 
         if (!isBacktest)
         {
+            // S27-NGROK T1：UseForwardedHeaders 必須先於 IpWhitelistMiddleware — 讓白名單檢查看到的是
+            // X-Forwarded-For 的真實客戶端 IP，而不是 ngrok 代理的內部位址。
+            app.UseForwardedHeaders();
+
+            // S27：IP 白名單必須先於 StaticFiles / Routing，否則非授權來源能拉到靜態資源。
+            app.UseMiddleware<IpWhitelistMiddleware>();
+
             app.UseStaticFiles();
             app.UseRouting();
             app.UseAntiforgery();
@@ -148,6 +190,8 @@ public static class Program
             app.MapStrategyEndpoints();
             app.MapLabEndpoints();
             app.MapExchangeAccountEndpoints();
+            app.MapAiCredentialEndpoints();
+            app.MapAiAdvisorEndpoints();
         }
 
         return app;

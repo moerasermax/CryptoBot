@@ -19,6 +19,12 @@ public interface IStrategyExecutor : IAsyncDisposable
     bool IsRunning { get; }
 
     /// <summary>
+    /// S42：上一次完成 <see cref="IStrategy.AnalyzeAsync"/> 的 UTC 時間；未執行過則為 <c>null</c>。
+    /// Dashboard 心跳標籤靠這個屬性 + WS 推播雙管齊下（REST 拿初值、WS 拿後續跳動）。
+    /// </summary>
+    DateTime? LastEvaluatedAtUtc { get; }
+
+    /// <summary>
     /// 啟動策略：預載歷史 K 線、訂閱即時 K 線更新，開始分析迴圈。
     /// 同一實例重複呼叫為冪等（已啟動則直接回傳）。
     /// </summary>

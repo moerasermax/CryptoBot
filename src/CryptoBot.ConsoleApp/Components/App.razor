@@ -16,5 +16,9 @@
 <body>
     <Routes @rendermode="InteractiveServer" />
     <script src="_framework/blazor.web.js"></script>
+    @* S26 T2：ApexCharts CDN + 本地 interop wrapper。
+       CDN 先載入，chart_interop.js 才能引用全域 ApexCharts。 *@
+    <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+    <script src="chart_interop.js"></script>
 </body>
 </html>

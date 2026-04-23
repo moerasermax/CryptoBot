@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Strategies;
@@ -124,14 +125,17 @@ public sealed class StrategyExecutor
                     break;
             }
 
-            await _unitOfWork.SaveChangesAsync(ct);
+            // S53 T2：下單主流程走併發重試版 — 即便 WS 事件或其他服務已先寫入 Order/Position，
+            //          reload OriginalValues 後客端改動仍能落地（client-wins）。
+            await _unitOfWork.SaveChangesWithRetryAsync(ct: ct);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Strategy {StrategyName} execution failed", strategyState.Name);
             strategyState.ReportError(ex.Message);
             await _strategyRepository.UpdateAsync(strategyState, ct);
-            await _unitOfWork.SaveChangesAsync(ct);
+            // 錯誤狀態同樣走重試版：避免 ReportError 與併發 Stop/Rename 衝突卡住錯誤日誌落地。
+            await _unitOfWork.SaveChangesWithRetryAsync(ct: ct);
             await _notifications.NotifyErrorAsync(ex, ct);
         }
     }
@@ -217,6 +221,11 @@ public sealed class StrategyExecutor
 
         if (order.Status == OrderStatus.Filled && order.AverageFillPrice is not null)
         {
+            // S39：在 Position 上鎖定「下單當下」的策略型別與參數快照。
+            // 存成字串+JSON 是為了歷史交易能獨立於 Strategy Aggregate 存在
+            // （未來 Strategy 改名、Parameters 被熱更新，歷史 row 仍還原得了現場）。
+            var parametersSnapshot = BuildParametersSnapshot(strategyState.Configuration);
+
             var position = Position.Open(
                 symbol: signal.Symbol,
                 side: posSide,
@@ -226,7 +235,9 @@ public sealed class StrategyExecutor
                 marginMode: MarginMode.Isolated,
                 stopLossPrice: signal.SuggestedStopLoss,
                 takeProfitPrice: signal.SuggestedTakeProfit,
-                strategyId: strategyState.Id);
+                strategyId: strategyState.Id,
+                strategyType: strategyState.StrategyType,
+                parametersSnapshot: parametersSnapshot);
 
             position.AddCommission(order.Commission);
 
@@ -242,6 +253,25 @@ public sealed class StrategyExecutor
                 order.FilledQuantity.Value,
                 ct);
         }
+    }
+
+    /// <summary>
+    /// S39：序列化 StrategyConfiguration 中「與交易決策相關」的欄位成 JSON 字串。
+    /// 選這幾個欄位而不是整個 Configuration — Symbol/Interval 已在 Position 上、
+    /// CooldownPeriod/MaxKlineWindow 對複盤無意義、Parameters dict 是策略自定指標閾值（最關鍵）。
+    /// </summary>
+    private static string BuildParametersSnapshot(StrategyConfiguration config)
+    {
+        var payload = new
+        {
+            leverage = config.Leverage.Value,
+            riskPerTradePercent = config.RiskPerTradePercent,
+            stopLossPercent = config.StopLossPercent,
+            takeProfitPercent = config.TakeProfitPercent,
+            trailingStopPercent = config.TrailingStopPercent,
+            parameters = config.Parameters,
+        };
+        return JsonSerializer.Serialize(payload);
     }
 
     private async Task ClosePositionAsync(

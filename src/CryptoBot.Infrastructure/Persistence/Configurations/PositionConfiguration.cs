@@ -32,6 +32,12 @@ public sealed class PositionConfiguration : IEntityTypeConfiguration<Position>
         b.Property(p => p.StopLossPrice).HasConversion(new NullablePriceConverter());
         b.Property(p => p.TakeProfitPrice).HasConversion(new NullablePriceConverter());
         b.Property(p => p.TrailingStopPrice).HasConversion(new NullablePriceConverter());
+        b.Property(p => p.ExitPrice).HasConversion(new NullablePriceConverter());
+
+        // S39: 策略類型字串快照（不跟 Strategy 外鍵 — 歷史紀錄不怕上游改名）
+        b.Property(p => p.StrategyType).HasMaxLength(64);
+        // S39: 開倉當下的參數 JSON 快照，給 AI 複盤讀用
+        b.Property(p => p.ParametersSnapshot);
 
         b.Property(p => p.Leverage)
             .HasConversion(new LeverageConverter())

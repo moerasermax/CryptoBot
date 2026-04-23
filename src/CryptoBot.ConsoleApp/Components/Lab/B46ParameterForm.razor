@@ -1,5 +1,6 @@
 @namespace CryptoBot.ConsoleApp.Components.Lab
 @inherits CryptoBot.ConsoleApp.Lab.StrategyParameterFormBase
+@using CryptoBot.Application.Ai
 @using CryptoBot.ConsoleApp.Services
 
 @*
@@ -65,7 +66,51 @@
         return (int)Math.Floor((double)((max - min) / step)) + 1;
     }
 
-    public override OptimizationRequest? BuildRequest(DateTime startUtc, DateTime endUtc, out string? error)
+    public override async Task ApplyParametersAsync(IReadOnlyDictionary<string, decimal> parameters)
+    {
+        if (TryResolve(parameters, out var rsiP, "RsiPeriod", "rsi_period", "rsi", "RsiLen", "rsi_len"))
+            { _rsiPeriodMin  = _rsiPeriodMax  = rsiP;  _rsiPeriodStep = 1; }
+        if (TryResolve(parameters, out var over, "RsiOversold", "Oversold", "rsi_oversold", "low_rsi", "oversold"))
+            { _oversoldMin   = _oversoldMax   = over;  _oversoldStep = 1; }
+        if (TryResolve(parameters, out var up, "RsiOverbought", "Overbought", "rsi_overbought", "high_rsi", "overbought"))
+            { _overboughtMin = _overboughtMax = up;    _overboughtStep = 1; }
+        if (TryResolve(parameters, out var bbP, "BbPeriod", "bb_period", "bollinger_period", "BollingerPeriod"))
+            { _bbPeriodMin   = _bbPeriodMax   = bbP;   _bbPeriodStep = 1; }
+        if (TryResolve(parameters, out var sd, "BbStdDev", "bb_stddev", "bb_std", "BollingerStdDev", "bollinger_stddev"))
+            { _bbStdDevMin   = _bbStdDevMax   = sd;    _bbStdDevStep = 0.1m; }
+        await NotifyChangedAsync();
+    }
+
+    // S30-GRID-FIX T2：AI 輸出 JSON key 常不照 PascalCase 交 — 透過 TryResolve 做 case-insensitive + 同義詞比對，
+    // 避免 `rsi_period` / `low_rsi` 這類寫法讓整筆建議被默默吃掉。結尾的 NotifyChangedAsync 確保 Grid size 立刻跳轉。
+    public override async Task ApplyGridParametersAsync(IReadOnlyDictionary<string, ParameterGridRange> parameters)
+    {
+        if (TryResolve(parameters, out var rsiP, "RsiPeriod", "rsi_period", "rsi", "RsiLen", "rsi_len"))
+        { _rsiPeriodMin = rsiP.Min; _rsiPeriodMax = rsiP.Max; _rsiPeriodStep = rsiP.Step > 0 ? rsiP.Step : 1; }
+        if (TryResolve(parameters, out var over, "RsiOversold", "Oversold", "rsi_oversold", "low_rsi", "oversold"))
+        { _oversoldMin = over.Min; _oversoldMax = over.Max; _oversoldStep = over.Step > 0 ? over.Step : 1; }
+        if (TryResolve(parameters, out var up, "RsiOverbought", "Overbought", "rsi_overbought", "high_rsi", "overbought"))
+        { _overboughtMin = up.Min; _overboughtMax = up.Max; _overboughtStep = up.Step > 0 ? up.Step : 1; }
+        if (TryResolve(parameters, out var bbP, "BbPeriod", "bb_period", "bollinger_period", "BollingerPeriod"))
+        { _bbPeriodMin = bbP.Min; _bbPeriodMax = bbP.Max; _bbPeriodStep = bbP.Step > 0 ? bbP.Step : 1; }
+        if (TryResolve(parameters, out var sd, "BbStdDev", "bb_stddev", "bb_std", "BollingerStdDev", "bollinger_stddev"))
+        { _bbStdDevMin = sd.Min; _bbStdDevMax = sd.Max; _bbStdDevStep = sd.Step > 0 ? sd.Step : 0.1m; }
+        await NotifyChangedAsync();
+    }
+
+    // S47：當前網格 snapshot — LabStateContainer 快取用。
+    public override IReadOnlyDictionary<string, ParameterGridRange> CurrentGrid
+        => new Dictionary<string, ParameterGridRange>
+        {
+            ["RsiPeriod"]     = new(_rsiPeriodMin,  _rsiPeriodMax,  _rsiPeriodStep),
+            ["RsiOversold"]   = new(_oversoldMin,   _oversoldMax,   _oversoldStep),
+            ["RsiOverbought"] = new(_overboughtMin, _overboughtMax, _overboughtStep),
+            ["BbPeriod"]      = new(_bbPeriodMin,   _bbPeriodMax,   _bbPeriodStep),
+            ["BbStdDev"]      = new(_bbStdDevMin,   _bbStdDevMax,   _bbStdDevStep),
+        };
+
+    public override OptimizationRequest? BuildRequest(
+        OptimizationGlobals globals, DateTime startUtc, DateTime endUtc, out string? error)
     {
         if (_rsiPeriodStep <= 0 || _oversoldStep <= 0 || _overboughtStep <= 0
             || _bbPeriodStep <= 0 || _bbStdDevStep <= 0)
@@ -93,6 +138,11 @@
                 new ParameterRangeDto("BbStdDev",      _bbStdDevMin,   _bbStdDevMax,   _bbStdDevStep),
             },
             StartUtc: startUtc,
-            EndUtc: endUtc);
+            EndUtc: endUtc,
+            Symbol: globals.Symbol,
+            Interval: globals.Interval,
+            SlippageBps: globals.SlippageBps,
+            InitialBalance: globals.InitialBalance,
+            Leverage: globals.Leverage);
     }
 }

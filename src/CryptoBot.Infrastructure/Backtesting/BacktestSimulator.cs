@@ -48,6 +48,12 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
     /// <summary>目前虛擬餘額（USDT），由成交即時扣帳。</summary>
     public decimal VirtualBalance { get; private set; }
 
+    /// <summary>
+    /// S32 爆倉旗標。一旦 <see cref="CheckAndApplyLiquidation"/> 回傳 true，此值永遠為 true，
+    /// 虛擬餘額會被強制歸零；BacktestEngine 會據此中止回測主迴圈，避免用已歸零的帳戶繼續下單。
+    /// </summary>
+    public bool IsLiquidated { get; private set; }
+
     public IReadOnlyList<Order> FilledOrders => _fills;
 
     public Kline? CurrentKline => _currentKline;
@@ -67,6 +73,36 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
     /// Simulator 本身只負責成交手續費，Position P&amp;L 由 Engine 側計算後回灌。
     /// </summary>
     public void ApplyRealizedPnL(decimal realizedPnL) => VirtualBalance += realizedPnL;
+
+    /// <summary>
+    /// S32-T1 爆倉核心判斷：當權益（虛擬餘額 + 未實現損益）≤ 0 即判定爆倉。
+    ///
+    /// <para>
+    /// 執行後果：虛擬餘額強制歸零、<see cref="IsLiquidated"/> 設為 true。回傳 true 表示本輪已爆倉，
+    /// 上層 <see cref="BacktestEngine"/> 應立即中止主迴圈、不再處理後續 K 線 / 訊號 / 下單。
+    /// 已爆倉後再次呼叫一律回傳 true（idempotent），不會回補餘額。
+    /// </para>
+    ///
+    /// <para>
+    /// 手續費已於 <see cref="PlaceOrderAsync"/> 扣進 <see cref="VirtualBalance"/>，因此此處的
+    /// 「餘額 + 浮動損益」已內含手續費損耗 — 高槓桿下這會加速爆倉。
+    /// </para>
+    /// </summary>
+    public bool CheckAndApplyLiquidation(decimal unrealizedPnL)
+    {
+        if (IsLiquidated) return true;
+
+        var balBefore = VirtualBalance;
+        var equity = balBefore + unrealizedPnL;
+        if (equity > 0m) return false;
+
+        VirtualBalance = 0m;
+        IsLiquidated = true;
+        _logger.LogWarning(
+            "💥 [BACKTEST-LIQUIDATION] Equity ≤ 0 (bal={Bal:F4} + uPnL={UPnL:F4} = {Eq:F4}). Balance forced to 0, backtest will halt.",
+            balBefore, unrealizedPnL, equity);
+        return true;
+    }
 
     // ===== 帳戶 =====
 

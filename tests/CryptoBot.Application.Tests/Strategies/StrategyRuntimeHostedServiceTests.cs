@@ -1,5 +1,6 @@
 using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
+using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Strategies;
 using CryptoBot.Application.Synchronization;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
@@ -50,6 +51,7 @@ public class StrategyRuntimeHostedServiceTests
 
         var svc = new StrategyRuntimeHostedService(
             market, sync, executorFactory, strategyFactory, sp,
+            new SafetyBreakerState(),
             NullLogger<StrategyRuntimeHostedService>.Instance);
 
         return (svc, market, sync, executorFactory, strategyRepo);
@@ -234,28 +236,33 @@ internal sealed class RecordingExecutor : IStrategyExecutor
 {
     public Guid StrategyId { get; }
     public bool IsRunning { get; private set; }
+    public DateTime? LastEvaluatedAtUtc { get; set; }
     public int StartCalls { get; private set; }
     public int StopCalls { get; private set; }
     public int DisposeCalls { get; private set; }
     public bool ThrowOnStart { get; set; }
     public bool ThrowOnStop { get; set; }
+    /// <summary>S27：故意拉長臨界區以放大 race window（預設 0 = 行為不變）。</summary>
+    public int StartDelayMs { get; set; }
+    /// <summary>S27：同上，Stop 階段的延遲。</summary>
+    public int StopDelayMs { get; set; }
 
     public RecordingExecutor(Guid strategyId) => StrategyId = strategyId;
 
-    public Task StartAsync(CancellationToken ct = default)
+    public async Task StartAsync(CancellationToken ct = default)
     {
         StartCalls++;
         if (ThrowOnStart) throw new InvalidOperationException("start boom");
+        if (StartDelayMs > 0) await Task.Delay(StartDelayMs, ct).ConfigureAwait(false);
         IsRunning = true;
-        return Task.CompletedTask;
     }
 
-    public Task StopAsync(CancellationToken ct = default)
+    public async Task StopAsync(CancellationToken ct = default)
     {
         StopCalls++;
         if (ThrowOnStop) throw new InvalidOperationException("stop boom");
+        if (StopDelayMs > 0) await Task.Delay(StopDelayMs, ct).ConfigureAwait(false);
         IsRunning = false;
-        return Task.CompletedTask;
     }
 
     public ValueTask DisposeAsync() { DisposeCalls++; return ValueTask.CompletedTask; }
@@ -266,12 +273,18 @@ internal sealed class RecordingExecutorFactory : IStrategyExecutorFactory
     public List<RecordingExecutor> Created { get; } = new();
     public bool FailFirst { get; set; }
     public bool StopThrows { get; set; }
+    /// <summary>S27：傳給每個新 executor 的 Start 延遲（毫秒）。</summary>
+    public int StartDelayMs { get; set; }
+    /// <summary>S27：傳給每個新 executor 的 Stop 延遲（毫秒）。</summary>
+    public int StopDelayMs { get; set; }
 
     public IStrategyExecutor Create(Strategy strategy, IStrategy strategyImpl)
     {
         var exec = new RecordingExecutor(strategy.Id);
         if (FailFirst && Created.Count == 0) exec.ThrowOnStart = true;
         if (StopThrows) exec.ThrowOnStop = true;
+        exec.StartDelayMs = StartDelayMs;
+        exec.StopDelayMs = StopDelayMs;
         Created.Add(exec);
         return exec;
     }

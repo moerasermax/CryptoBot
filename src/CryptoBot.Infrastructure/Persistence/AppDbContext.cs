@@ -1,7 +1,9 @@
+using CryptoBot.Domain.Aggregates.AiCredentialAggregate;
 using CryptoBot.Domain.Aggregates.ExchangeAccountAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
 using CryptoBot.Domain.Aggregates.PositionAggregate;
 using CryptoBot.Domain.Aggregates.StrategyAggregate;
+using CryptoBot.Domain.Aggregates.StrategyOptimizationAggregate;
 using CryptoBot.Infrastructure.Backtesting.Persistence;
 using Microsoft.EntityFrameworkCore;
 
@@ -25,6 +27,8 @@ public sealed class AppDbContext : DbContext
     public DbSet<Strategy> Strategies => Set<Strategy>();
     public DbSet<HistoricalKlineRecord> HistoricalKlines => Set<HistoricalKlineRecord>();
     public DbSet<ExchangeAccount> ExchangeAccounts => Set<ExchangeAccount>();
+    public DbSet<StrategyOptimizationSettings> StrategyOptimizationSettings => Set<StrategyOptimizationSettings>();
+    public DbSet<AiCredential> AiCredentials => Set<AiCredential>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {

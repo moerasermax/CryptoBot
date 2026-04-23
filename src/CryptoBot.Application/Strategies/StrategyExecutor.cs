@@ -1,8 +1,10 @@
+using System.Text.Json;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Realtime;
 using CryptoBot.Application.RiskManagement;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
+using CryptoBot.Domain.Aggregates.PositionAggregate;
 using CryptoBot.Domain.Aggregates.StrategyAggregate;
 using CryptoBot.Domain.Enums;
 using CryptoBot.Domain.Repositories;
@@ -78,6 +80,12 @@ public sealed class StrategyExecutor : IStrategyExecutor
 
     public Guid StrategyId => _strategy.Id;
     public bool IsRunning => _running;
+
+    /// <summary>
+    /// S42 T1：上一次完成 <see cref="IStrategy.AnalyzeAsync"/> 的 UTC 時間。
+    /// 未執行過則為 <c>null</c>。純 in-process 心跳指標，不落 DB。
+    /// </summary>
+    public DateTime? LastEvaluatedAtUtc { get; private set; }
 
     public async Task StartAsync(CancellationToken ct = default)
     {
@@ -203,6 +211,31 @@ public sealed class StrategyExecutor : IStrategyExecutor
                 .AnalyzeAsync(cfg, klinesSnapshot, snapshot, openPositions, CancellationToken.None)
                 .ConfigureAwait(false);
 
+            // S42 T1 / S44 T1：每次評估完就廣播心跳 — 不管 Signal 是不是 None。
+            // Dashboard 靠這個事件證明「策略大腦還在跑」而不是卡在某處；
+            // S44 擴充：payload 帶上 StrategyName / SignalType / Note（= TradingSignal.Reason），
+            // Dashboard 決策日誌面板靠這三個欄位上色（INF 灰 / SIGNAL 綠紅）與顯示原因。
+            // broadcast 失敗不阻擋主流程（策略繼續跑比 UI 亮燈更重要）。
+            LastEvaluatedAtUtc = DateTime.UtcNow;
+            try
+            {
+                await _broadcaster.BroadcastStrategyEvaluatedAsync(new StrategyEvaluatedUpdate(
+                    StrategyId: _strategy.Id,
+                    StrategyName: _strategy.Name,
+                    EvaluatedAtUtc: LastEvaluatedAtUtc.Value,
+                    Symbol: cfg.Symbol.BingXFormat,
+                    Interval: cfg.Interval.ToString(),
+                    LastClosePrice: kline.Close,
+                    SignalType: signal.Type.ToString(),
+                    Note: signal.Reason,
+                    // S45：Dashboard 靠這欄位即時同步卡片的模型標籤，不必重拉 /api/strategies
+                    StrategyType: _strategy.StrategyType), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Heartbeat broadcast failed for {Name}.", _strategy.Name);
+            }
+
             if (signal.Type == SignalType.None)
             {
                 _consecutiveErrors = 0;
@@ -223,6 +256,23 @@ public sealed class StrategyExecutor : IStrategyExecutor
                 "Strategy {Name} errored on kline {OpenTime} (consecutive={Count}).",
                 _strategy.Name, kline.OpenTime, _consecutiveErrors);
 
+            // S44 T1：把錯誤推給 Dashboard 決策日誌（橘色 [ERROR]），
+            // 讓使用者能看到每次失敗的原因，不用翻 log 檔。
+            try
+            {
+                await _broadcaster.BroadcastStrategyEvaluationFailedAsync(new StrategyEvaluationFailedUpdate(
+                    StrategyId: _strategy.Id,
+                    StrategyName: _strategy.Name,
+                    OccurredAtUtc: DateTime.UtcNow,
+                    Symbol: _strategy.Configuration.Symbol.BingXFormat,
+                    ErrorMessage: ex.Message), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception broadcastEx)
+            {
+                _logger.LogWarning(broadcastEx,
+                    "Failed to broadcast evaluation-failed event for {Name}.", _strategy.Name);
+            }
+
             if (_consecutiveErrors >= ConsecutiveErrorThreshold)
             {
                 _logger.LogError(
@@ -238,6 +288,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
         var sizer = sp.GetRequiredService<IOrderSizer>();
         var risk = sp.GetRequiredService<IRiskManager>();
         var orderRepo = sp.GetRequiredService<IOrderRepository>();
+        var positionRepo = sp.GetRequiredService<IPositionRepository>();
         var uow = sp.GetRequiredService<IUnitOfWork>();
 
         // 1) 計算目標數量
@@ -268,15 +319,66 @@ public sealed class StrategyExecutor : IStrategyExecutor
 
         // 4) 下單
         await _exchange.PlaceOrderAsync(order, CancellationToken.None).ConfigureAwait(false);
-
-        // 5) 寫入 repo + 記錄冷卻
         await orderRepo.AddAsync(order, CancellationToken.None).ConfigureAwait(false);
-        await uow.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
         _cooldownTracker.RecordOrderPlaced(_strategy.Id);
 
+        // 5) S99-S43 T4：開單後必須「立刻建立本地 Position」— 否則 Dashboard 的
+        //    GetOpenPositionsAsync 會拿不到任何資料，使用者看到「持倉隱形」的錯覺。
+        //    作法參照舊 Trading/StrategyExecutor：短暫等待 → 刷新成交狀態 → 若 Filled
+        //    則 Position.Open + AddAsync。只對 Open* 訊號做；Close* 交給 AccountSynchronizer
+        //    的 WS HandleAccountUpdate 處理（那邊會偵測 remote.Quantity == 0 自動 Close()）。
+        Position? newPosition = null;
+        var isOpenSignal = signal.Type == SignalType.OpenLong || signal.Type == SignalType.OpenShort;
+        if (isOpenSignal && order.IsActive)
+        {
+            try
+            {
+                await Task.Delay(500, CancellationToken.None).ConfigureAwait(false);
+                await _exchange.RefreshOrderStatusAsync(order, CancellationToken.None).ConfigureAwait(false);
+                await orderRepo.UpdateAsync(order, CancellationToken.None).ConfigureAwait(false);
+
+                if (order.Status == OrderStatus.Filled && order.AverageFillPrice is not null)
+                {
+                    var parametersSnapshot = BuildParametersSnapshot(_strategy.Configuration);
+                    newPosition = Position.Open(
+                        symbol: signal.Symbol,
+                        side: positionSide,
+                        quantity: order.FilledQuantity,
+                        entryPrice: order.AverageFillPrice,
+                        leverage: _strategy.Configuration.Leverage,
+                        marginMode: MarginMode.Isolated,
+                        stopLossPrice: signal.SuggestedStopLoss,
+                        takeProfitPrice: signal.SuggestedTakeProfit,
+                        strategyId: _strategy.Id,
+                        strategyType: _strategy.StrategyType,
+                        parametersSnapshot: parametersSnapshot);
+                    newPosition.AddCommission(order.Commission);
+                    if (_strategy.Configuration.TrailingStopPercent is decimal trailPct)
+                        newPosition.EnableTrailingStop(trailPct);
+                    await positionRepo.AddAsync(newPosition, CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Post-order position materialization failed for {Symbol} — AccountSynchronizer will retry via WS.",
+                    signal.Symbol);
+            }
+        }
+
+        // 6) S99-S43 T4：SaveChanges 必須在 BroadcastTradeAsync 之前完成，
+        //    否則 UI 收到 SignalR 事件去打 /api/dashboard/stats 時，DB 還看不到 Order/Position，
+        //    Active Positions 會呈現「空了一瞬間」的隱形狀態。
+        // S53 T2：走重試版 — AccountSynchronizer WS 事件可能已經先一步 UPDATE 了 order row，
+        //    SaveChangesAsync 會噴 DbUpdateConcurrencyException；重試會 reload DB 值再套 client 改動，
+        //    確保訂單 / 倉位在任何時序下都能落地。
+        await uow.SaveChangesWithRetryAsync(ct: CancellationToken.None).ConfigureAwait(false);
+
         _logger.LogInformation(
-            "Order placed: {Side} {PositionSide} {Qty} {Symbol} (exchangeId={ExId})",
-            orderSide, positionSide, qty, signal.Symbol, order.ExchangeOrderId ?? "pending");
+            "Order placed: {Side} {PositionSide} {Qty} {Symbol} (exchangeId={ExId}, positionCreated={Pos})",
+            orderSide, positionSide, qty, signal.Symbol,
+            order.ExchangeOrderId ?? "pending",
+            newPosition is not null);
 
         // S7 全線試車的醒目標記 — 確認管線全線串通
         _logger.LogInformation(
@@ -298,7 +400,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
             _logger.LogWarning(ex, "Notification dispatch failed for STRATEGY-MATCH on {Symbol}.", signal.Symbol);
         }
 
-        // Web UI 即時推播（無 Web host 時注入 NullRealtimeBroadcaster，不會做事）
+        // Web UI 即時推播 — **DB 已 commit 後**才廣播，UI 重拉資料必能看到新倉位。
         try
         {
             await _broadcaster.BroadcastTradeAsync(new TradeFilledUpdate(
@@ -314,6 +416,24 @@ public sealed class StrategyExecutor : IStrategyExecutor
         {
             _logger.LogWarning(ex, "Realtime broadcast failed for STRATEGY-MATCH on {Symbol}.", signal.Symbol);
         }
+    }
+
+    /// <summary>
+    /// S39 / S99-S43 T4：序列化 StrategyConfiguration 的決策相關欄位 — Position 用來做歷史複盤，
+    /// 即便未來 Strategy 被改名或 Parameters 被熱更新，歷史 row 仍能還原當時決策現場。
+    /// </summary>
+    private static string BuildParametersSnapshot(StrategyConfiguration config)
+    {
+        var payload = new
+        {
+            leverage = config.Leverage.Value,
+            riskPerTradePercent = config.RiskPerTradePercent,
+            stopLossPercent = config.StopLossPercent,
+            takeProfitPercent = config.TakeProfitPercent,
+            trailingStopPercent = config.TrailingStopPercent,
+            parameters = config.Parameters,
+        };
+        return JsonSerializer.Serialize(payload);
     }
 
     private async Task SelfStopOnErrorAsync(string reason)

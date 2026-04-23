@@ -1,4 +1,5 @@
 using CryptoBot.Application.Common.Interfaces;
+using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Synchronization;
 using CryptoBot.Domain.Enums;
 using CryptoBot.Domain.Repositories;
@@ -34,6 +35,7 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
     private readonly IStrategyExecutorFactory _executorFactory;
     private readonly IStrategyFactory _strategyFactory;
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ISafetyBreakerState _breaker;
     private readonly ILogger<StrategyRuntimeHostedService> _logger;
 
     private readonly Dictionary<Guid, IStrategyExecutor> _executors = new();
@@ -46,6 +48,7 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         IStrategyExecutorFactory executorFactory,
         IStrategyFactory strategyFactory,
         IServiceScopeFactory scopeFactory,
+        ISafetyBreakerState breaker,
         ILogger<StrategyRuntimeHostedService> logger)
     {
         _marketData = marketData;
@@ -53,6 +56,7 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         _executorFactory = executorFactory;
         _strategyFactory = strategyFactory;
         _scopeFactory = scopeFactory;
+        _breaker = breaker;
         _logger = logger;
     }
 
@@ -168,6 +172,16 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         get { lock (_executors) return _executors.Keys.ToArray(); }
     }
 
+    public DateTime? GetLastEvaluatedAtUtc(Guid strategyId)
+    {
+        lock (_executors)
+        {
+            return _executors.TryGetValue(strategyId, out var exec)
+                ? exec.LastEvaluatedAtUtc
+                : null;
+        }
+    }
+
     public async Task<IReadOnlyList<Guid>> StopAllAsync(string reason, CancellationToken ct = default)
     {
         await _mutateLock.WaitAsync(ct).ConfigureAwait(false);
@@ -225,6 +239,15 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
 
     public async Task<bool> StartAsync(Guid strategyId, CancellationToken ct = default)
     {
+        // S28 T1：熔斷期間禁止啟動 — 在取鎖前先短路，省下 scope 建立與 DB 讀取的成本
+        if (_breaker.IsTripped)
+        {
+            _logger.LogWarning(
+                "Start rejected for {Id}: safety breaker is TRIPPED (reason: {Reason}).",
+                strategyId, _breaker.Reason ?? "unknown");
+            return false;
+        }
+
         await _mutateLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {

@@ -42,6 +42,14 @@
         </span>
     </span>
 
+    <span class="env-segment env-link" title="@LinkTooltip">
+        <span class="env-segment-label">LINK</span>
+        <span class="env-link-state env-link-@LinkCssClass">
+            <span class="env-dot"></span>
+            @LinkLabel
+        </span>
+    </span>
+
     <span class="env-segment env-toggle">
         <span class="env-segment-label">SWITCH</span>
         <button type="button"
@@ -83,6 +91,40 @@
     private List<Strategy> _running = new();
     private bool _modalOpen;
     private bool _switching;
+
+    // S27：交易所 REST 延遲心跳 — 綠 ≤300ms、黃 ≤1000ms、紅 >1000ms 或 IsHealthy=false。
+    private ExchangeHealthUpdate? _lastHealth;
+
+    private string LinkCssClass
+    {
+        get
+        {
+            if (_lastHealth is null) return "idle";
+            if (!_lastHealth.IsHealthy) return "down";
+            return _lastHealth.LatencyMs switch
+            {
+                <= 300  => "good",
+                <= 1000 => "warn",
+                _       => "slow",
+            };
+        }
+    }
+
+    private string LinkLabel
+    {
+        get
+        {
+            if (_lastHealth is null) return "— probing";
+            if (!_lastHealth.IsHealthy) return $"{_lastHealth.ExchangeName} offline";
+            return $"{_lastHealth.ExchangeName} · {_lastHealth.LatencyMs} ms";
+        }
+    }
+
+    private string LinkTooltip => _lastHealth is null
+        ? "尚未完成第一次 REST 心跳探測。"
+        : _lastHealth.IsHealthy
+            ? $"最近一次 {_lastHealth.ExchangeName} REST 探測：{_lastHealth.LatencyMs}ms @ {_lastHealth.Timestamp.ToLocalTime():HH:mm:ss}"
+            : $"{_lastHealth.ExchangeName} 連線異常（{_lastHealth.ErrorMessage}）@ {_lastHealth.Timestamp.ToLocalTime():HH:mm:ss}";
 
     private string ModeLabel    => EnvSwitcher.CurrentMode == TradingMode.Live ? "LIVE" : "DEMO";
     private string ModeIcon     => EnvSwitcher.CurrentMode == TradingMode.Live ? "⚠️" : "🛡";
@@ -133,8 +175,15 @@
     {
         await ReloadAsync();
         Bus.StatsUpdated += OnStatsUpdated;
+        Bus.ExchangeHealthUpdated += OnHealthUpdated;
         EnvSwitcher.EnvironmentChanged += OnEnvChanged;
         Lab.StateChanged += OnLabStateChanged;
+    }
+
+    private void OnHealthUpdated(ExchangeHealthUpdate update)
+    {
+        _lastHealth = update;
+        InvokeAsync(StateHasChanged);
     }
 
     private void OnStatsUpdated(DashboardStatsUpdate _)
@@ -228,6 +277,7 @@
     public void Dispose()
     {
         Bus.StatsUpdated -= OnStatsUpdated;
+        Bus.ExchangeHealthUpdated -= OnHealthUpdated;
         EnvSwitcher.EnvironmentChanged -= OnEnvChanged;
         Lab.StateChanged -= OnLabStateChanged;
     }

@@ -25,6 +25,11 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
     private readonly IExchangeCredentialProvider _credentials;
     private readonly ILogger<BingXExchangeClient> _logger;
 
+    // S31：首次成功餘額取得（或模式切換後再次）以 Information 列印，作為 DemoPreflight 巡檢證據；
+    // 之後每次 2s tick 走 Debug，避免把 log 洗掉。
+    private bool _balanceProofLogged;
+    private TradingMode _balanceProofMode;
+
     /// <summary>
     /// 守護 <see cref="_client"/> 與 <see cref="_options"/> 的可變欄位 — 切換環境時取，公開方法
     /// 只在 lock 內讀取 client 引用以避免半切。讀取本身極快 (拿 reference)，
@@ -45,7 +50,8 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
         _credentials = credentials;
         _logger = logger;
 
-        // S24：DB 的活躍金鑰優先，appsettings 只當 fallback。DbContext 在 ctor 階段需要一個 scope
+        // S22：IExchangeCredentialProvider 是 runtime 金鑰的唯一權威。appsettings.json 的 ApiKey/ApiSecret
+        // 僅視為 bootstrap 佔位，不會被套用到 REST client。DbContext 在 ctor 階段需要一個 scope
         // （IExchangeCredentialProvider 內部會自建），因此 sync-over-async 只在啟動期發生一次，
         // 之後都走事件驅動。
         TryApplyDbCredentialsAtStartup();
@@ -70,22 +76,25 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
                 _logger.LogInformation(
                     "BingX credentials loaded from SQLite | account={Account}", creds.AccountName);
             }
-            else if (!string.IsNullOrWhiteSpace(_options.ApiKey))
-            {
-                _logger.LogWarning(
-                    "No active BingX account in SQLite — falling back to appsettings.json keys. " +
-                    "Configure via /settings/exchanges to migrate.");
-            }
             else
             {
+                // S22：DB 無 active 帳號時清空 options，杜絕 appsettings.json fallback。
+                // BuildRestClient 會因此建出「無憑證」client；使用者須在 /settings/exchanges
+                // 建帳號並 Activate，觸發 CredentialsChanged 重建 REST client。
+                _options.ApiKey = string.Empty;
+                _options.ApiSecret = string.Empty;
                 _logger.LogWarning(
-                    "BingX has no credentials — user must configure at /settings/exchanges before trading.");
+                    "BingX has no active account in SQLite — appsettings.json credentials are ignored at runtime. " +
+                    "Configure via /settings/exchanges before trading.");
             }
         }
         catch (Exception ex)
         {
+            // S22：讀 DB 失敗也不允許回退 appsettings — 清空以維持「Provider 唯一權威」契約。
+            _options.ApiKey = string.Empty;
+            _options.ApiSecret = string.Empty;
             _logger.LogError(ex,
-                "Failed to load BingX credentials from SQLite — falling back to appsettings.json keys.");
+                "Failed to load BingX credentials from SQLite — runtime credentials cleared (appsettings.json fallback removed).");
         }
     }
 
@@ -206,7 +215,26 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
             return 0m;
         }
 
-        return balance.Balance.GetValueOrDefault();
+        var value = balance.Balance.GetValueOrDefault();
+
+        // S31 · Demo Preflight：首次取得 / 模式切換後首次 → Info；後續 tick → Debug。
+        // 這條 log 就是 VCP-VST-Balance 的交付證據。
+        if (!_balanceProofLogged || _balanceProofMode != _options.EffectiveMode)
+        {
+            _logger.LogInformation(
+                "✅ BingX futures balance fetched | mode={Mode} | asset={Asset} | balance={Balance}",
+                _options.EffectiveMode, queryAsset, value);
+            _balanceProofLogged = true;
+            _balanceProofMode = _options.EffectiveMode;
+        }
+        else
+        {
+            _logger.LogDebug(
+                "BingX futures balance fetched | mode={Mode} | asset={Asset} | balance={Balance}",
+                _options.EffectiveMode, queryAsset, value);
+        }
+
+        return value;
     }
 
     public async Task<decimal> GetSpotBalanceAsync(

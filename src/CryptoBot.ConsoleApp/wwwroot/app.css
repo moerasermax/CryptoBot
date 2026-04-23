@@ -55,7 +55,10 @@ body::before {
 .app-shell {
     position: relative;
     z-index: 1;
-    max-width: 1400px;
+    /* S36-S38 T3b：放寬主容器 — 1400 → 1600 上限，並以 95% 視寬撐滿小螢幕之外的空間，
+       讓資料表在 1080p / 1440p / 超寬螢幕上都不再被擠在畫面中央。 */
+    width: 95%;
+    max-width: 1600px;
     margin: 0 auto;
     padding: 24px 32px 48px;
     min-height: 100vh;
@@ -441,6 +444,19 @@ body::before {
     cursor: not-allowed;
 }
 
+/* S30-FIX2：Eco/Pro segmented toggle — 兩顆按鈕並排，當前選擇高亮 */
+.mode-toggle {
+    display: inline-flex;
+    gap: 8px;
+}
+
+.mode-toggle .mode-active {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+}
+
 .progress-wrap {
     display: flex;
     flex-direction: column;
@@ -474,6 +490,25 @@ body::before {
 .rank-1 td { background: rgba(46, 255, 139, 0.06); }
 .rank-1 td:first-child { color: var(--pos); font-weight: 600; }
 
+/* S32-T3：爆倉列 — 整列紅色底色強化「這組必死」的警示性 */
+.row-liquidated td {
+    background: rgba(255, 77, 109, 0.10);
+    color: var(--neg);
+}
+.row-liquidated td:first-child { color: var(--neg); font-weight: 600; }
+.badge-liquidated {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 8px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: #fff;
+    background: var(--neg);
+    border-radius: 3px;
+    text-transform: uppercase;
+}
+
 .lab-error {
     padding: 12px 20px;
     color: var(--neg);
@@ -491,6 +526,30 @@ body::before {
 }
 .lab-toast.ok  { background: rgba(29, 233, 130, 0.10); color: var(--pos); border: 1px solid rgba(29, 233, 130, 0.3); }
 .lab-toast.err { background: rgba(255, 77, 109, 0.10); color: var(--neg); border: 1px solid rgba(255, 77, 109, 0.3); }
+
+/* S25 T3：「上次最佳結果」提示卡 — 顯示在 DynamicComponent 下方 */
+.cached-hint {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+    margin-top: 12px;
+    border-radius: 6px;
+    background: rgba(232, 196, 104, 0.07);
+    border: 1px solid rgba(232, 196, 104, 0.25);
+    font-family: var(--mono);
+    font-size: 12px;
+    flex-wrap: wrap;
+}
+.cached-hint-label {
+    font-weight: 600;
+    color: rgba(232, 196, 104, 0.95);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    font-size: 11px;
+}
+.cached-hint-body { flex: 1; color: var(--text); }
+.cached-hint-time { opacity: 0.6; font-size: 11px; }
 
 /* ─────────────── Strategy Tabs Bar (pills) ─────────────── */
 
@@ -889,6 +948,45 @@ body::before {
 
 .env-engine-state.is-running .env-dot { animation: pulse 2s ease-in-out infinite; }
 
+/* ── env-bar link / latency ── */
+
+.env-link-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-weight: 600;
+    border: 1px solid var(--panel-edge);
+    font-variant-numeric: tabular-nums;
+}
+
+.env-link-good {
+    background: rgba(29, 233, 130, 0.10);
+    border-color: var(--pos);
+    color: var(--pos);
+}
+
+.env-link-warn {
+    background: rgba(232, 196, 104, 0.12);
+    border-color: #e8c468;
+    color: #e8c468;
+}
+
+.env-link-slow,
+.env-link-down {
+    background: rgba(255, 74, 97, 0.10);
+    border-color: var(--neg);
+    color: var(--neg);
+}
+
+.env-link-idle {
+    background: var(--bg-soft);
+    color: var(--text-dim);
+}
+
+.env-link-good .env-dot { animation: pulse 2s ease-in-out infinite; }
+
 /* ── env-bar toggle + flash ── */
 
 .env-toggle-btn {
@@ -1210,4 +1308,262 @@ body::before {
     font-weight: 500;
 }
 
+/* ===== S42：決策心跳視覺 ===== */
+/*
+ * .heartbeat-dot 是策略 Running 旁邊的呼吸燈：每次策略評估事件進來，
+ * Dashboard 會遞增 `_heartbeatPulseTick` 並把它當作 @key 綁到這顆 dot 上，
+ * Blazor 因此會重新建立該 DOM 節點，瀏覽器觸發一次完整 CSS @keyframes 動畫重播，
+ * 達到「每次心跳亮一下」的效果 — 不需要 JS interop，純 Razor @key + CSS 完成。
+ */
+.heartbeat-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    margin-left: 10px;
+    border-radius: 50%;
+    background: rgba(46, 255, 139, 0.85);
+    box-shadow: 0 0 0 0 rgba(46, 255, 139, 0.7);
+    animation: heartbeat-pulse 1s ease-out 1;
+    vertical-align: middle;
+}
 
+@keyframes heartbeat-pulse {
+    0%   { transform: scale(0.85); box-shadow: 0 0 0 0   rgba(46, 255, 139, 0.85); opacity: 1; }
+    50%  { transform: scale(1.25); box-shadow: 0 0 0 6px rgba(46, 255, 139, 0.15); opacity: 0.95; }
+    100% { transform: scale(1.00); box-shadow: 0 0 0 0   rgba(46, 255, 139, 0.00); opacity: 0.85; }
+}
+
+.heartbeat-row {
+    padding: 4px 20px 14px 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+}
+.heartbeat-time {
+    color: var(--text);
+    letter-spacing: 0.4px;
+}
+
+/* ===== S44 · 戰情室左右分欄 =====
+ * LEFT（350px）：策略控制台（Active Strategy card）
+ * RIGHT（1fr）：上半 決策動態日誌；下半 交易歷史表
+ * 940px 以下 breakpoint → 自動單欄堆疊，避免手機 / 窄視窗被截掉。
+ */
+.war-room-grid {
+    display: grid;
+    grid-template-columns: 350px 1fr;
+    gap: 16px;
+    padding: 0 20px 20px 20px;
+    align-items: start;
+}
+.war-room-left > .panel,
+.war-room-right > .panel {
+    margin: 0 0 14px 0;     /* grid gap + 內距處理 — panel 預設的外邊距在這裡會雙重累計 */
+}
+.war-room-left { min-width: 0; }
+.war-room-right {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
+}
+@media (max-width: 940px) {
+    .war-room-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ===== S44 · 決策動態日誌 ===== */
+.eval-log-panel {
+    display: flex;
+    flex-direction: column;
+    max-height: 520px;       /* 高度有上限，超出就獨立滑動；避免把右欄下半的歷史表擠出視口 */
+}
+.eval-log {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;        /* 獨立捲軸，不跟整頁滾動耦合 */
+    max-height: 460px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+}
+.eval-log-entry {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.eval-log-entry:last-child { border-bottom: none; }
+.eval-log-time {
+    color: var(--text-dim);
+    flex-shrink: 0;
+}
+.eval-log-tag {
+    flex-shrink: 0;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    padding: 1px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    min-width: 76px;
+    text-align: center;
+}
+.eval-log-body {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.eval-log-note {
+    color: var(--text-dim);
+    margin-left: 4px;
+}
+
+/* ===== S44 T3 · 日誌色碼 ===== */
+.eval-log-entry.inf .eval-log-tag {
+    color: var(--text-dim, #8a93a6);
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.eval-log-entry.inf .eval-log-body { color: #aeb7c8; }
+
+.eval-log-entry.signal-buy .eval-log-tag {
+    color: #ffffff;
+    background: rgba(46, 255, 139, 0.28);
+    border: 1px solid rgba(46, 255, 139, 0.65);
+    text-shadow: 0 0 6px rgba(46, 255, 139, 0.45);
+}
+.eval-log-entry.signal-buy .eval-log-body strong { color: #2eff8b; }
+
+.eval-log-entry.signal-sell .eval-log-tag {
+    color: #ffffff;
+    background: rgba(255, 59, 92, 0.28);
+    border: 1px solid rgba(255, 59, 92, 0.65);
+    text-shadow: 0 0 6px rgba(255, 59, 92, 0.45);
+}
+.eval-log-entry.signal-sell .eval-log-body strong { color: #ff6b86; }
+
+.eval-log-entry.error .eval-log-tag {
+    color: #ffffff;
+    background: rgba(255, 149, 0, 0.28);
+    border: 1px solid rgba(255, 149, 0, 0.65);
+}
+.eval-log-entry.error .eval-log-body {
+    color: #ffb366;
+    white-space: normal;       /* 錯誤訊息太長時允許換行 */
+}
+
+
+/* ===== S36-S38 T3a：Leaderboard 分頁控制列 ===== */
+.lb-pagination {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 20px;
+    border-top: 1px solid var(--panel-edge);
+    background: var(--bg-soft);
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+}
+.lb-pagination .btn-apply { padding: 4px 10px; }
+.lb-pagination-info {
+    padding: 0 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.3px;
+}
+.lb-pagination-info strong { color: var(--text); font-weight: 600; }
+
+/* ===== S36-S38 T1：Dashboard 策略模型 badge ===== */
+.model-tag {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    border: 1px solid transparent;
+    width: fit-content;
+}
+.model-tag-trend {
+    /* 順勢：藍色（accent cyan 系）— 代表「追擊既有方向」的能量感 */
+    background: rgba(77, 208, 225, 0.14);
+    border-color: rgba(77, 208, 225, 0.55);
+    color: var(--accent);
+}
+.model-tag-reversion {
+    /* 逆勢：紫色 — 代表「反向獵補」的神秘感 */
+    background: rgba(180, 120, 220, 0.14);
+    border-color: rgba(180, 120, 220, 0.55);
+    color: #d4a8ef;
+}
+.model-tag-neutral {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--panel-edge-strong);
+    color: var(--text-dim);
+}
+
+/* ===== S28 Safety Breaker 視覺 ===== */
+.breaker-banner {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 18px;
+    background: linear-gradient(90deg, rgba(155, 89, 182, 0.28), rgba(155, 89, 182, 0.18));
+    border: 1px solid rgba(155, 89, 182, 0.55);
+    border-radius: 6px;
+    color: #e9d4f3;
+    font-size: 13px;
+    margin: 0 20px 16px 20px;
+    box-shadow: 0 0 18px rgba(155, 89, 182, 0.18);
+}
+.breaker-banner-icon { font-size: 20px; }
+.breaker-banner-title { font-weight: 600; letter-spacing: 0.3px; color: #fff; }
+.breaker-banner-reset {
+    margin-left: auto;
+    padding: 5px 12px;
+    background: rgba(155, 89, 182, 0.3);
+    border: 1px solid rgba(155, 89, 182, 0.65);
+    border-radius: 4px;
+    color: #fff;
+    font-size: 12px;
+    cursor: pointer;
+}
+.breaker-banner-reset:hover:not(:disabled) { background: rgba(155, 89, 182, 0.55); }
+.breaker-banner-reset:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.kill-switch-bar {
+    display: flex; justify-content: flex-end; align-items: center;
+    gap: 10px; padding: 8px 20px 0 20px;
+}
+.kill-switch-btn {
+    padding: 10px 18px;
+    background: linear-gradient(90deg, #e74c3c, #c0392b);
+    color: #fff;
+    border: 1px solid #ff6b5c;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 600; font-size: 13px;
+    letter-spacing: 0.6px;
+    box-shadow: 0 0 12px rgba(231, 76, 60, 0.45);
+    animation: kill-switch-pulse 2.2s ease-in-out infinite;
+}
+.kill-switch-btn:hover:not(:disabled) {
+    box-shadow: 0 0 22px rgba(231, 76, 60, 0.75);
+    transform: translateY(-1px);
+}
+.kill-switch-btn:disabled { opacity: 0.5; cursor: not-allowed; animation: none; }
+
+@keyframes kill-switch-pulse {
+    0%, 100% { box-shadow: 0 0 10px rgba(231, 76, 60, 0.35); }
+    50%      { box-shadow: 0 0 22px rgba(231, 76, 60, 0.75); }
+}

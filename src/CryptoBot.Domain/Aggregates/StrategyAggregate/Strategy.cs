@@ -127,6 +127,17 @@ public sealed class Strategy : AggregateRoot<Guid>
     }
 
     /// <summary>
+    /// S45：Lab 套用優化後自動重命名（例：<c>[B46 Hybrid] SOL-15m (Optimized)</c>）。
+    /// 允許 Running 中改名 — 名稱純顯示欄位，不影響 executor 綁定。
+    /// </summary>
+    public void Rename(string newName)
+    {
+        if (string.IsNullOrWhiteSpace(newName))
+            throw new DomainException("Strategy name cannot be empty.");
+        Name = newName;
+    }
+
+    /// <summary>
     /// 更新交易統計 (在 Position 關閉時呼叫)
     /// </summary>
     public void RecordTradeResult(decimal pnl)

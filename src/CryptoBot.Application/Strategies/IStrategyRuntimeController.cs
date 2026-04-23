@@ -27,6 +27,12 @@ public interface IStrategyRuntimeController
     IReadOnlyList<Guid> RunningStrategyIds { get; }
 
     /// <summary>
+    /// S42 T1：策略上一次評估完成的 UTC 時間；未掛載 / 未跑過則為 <c>null</c>。
+    /// Dashboard REST 端點把它塞進 StrategyDto，讓 UI 一開頁就能顯示當前心跳狀態。
+    /// </summary>
+    DateTime? GetLastEvaluatedAtUtc(Guid strategyId);
+
+    /// <summary>
     /// S25：把指定策略的「決策大腦」熱換成另一個類型字串（必須已註冊於 <c>IStrategyFactory</c>）。
     /// 契約：
     ///  - 若策略正在跑 → 先停 executor → 翻 DB → 重新掛載 executor → 該策略 Status 維持 Running

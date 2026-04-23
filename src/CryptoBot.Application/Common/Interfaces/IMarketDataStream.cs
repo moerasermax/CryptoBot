@@ -91,6 +91,12 @@ public interface INotificationService
     Task NotifyTradeAsync(string symbol, string action, decimal price, decimal quantity,
                           CancellationToken ct = default);
     Task NotifyErrorAsync(Exception ex, CancellationToken ct = default);
+
+    /// <summary>
+    /// S28 T1：日損熔斷觸發時的專用通道 — Discord 實作會以紫色 embed 呈現，與一般 Critical（紅）
+    /// 警報明確區分，讓值班人員在訊息串中一眼看到「風險閘門已觸發」。
+    /// </summary>
+    Task NotifyCircuitBreakerAsync(string reason, CancellationToken ct = default);
 }
 
 public enum NotificationLevel
