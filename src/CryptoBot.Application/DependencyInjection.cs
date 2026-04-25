@@ -47,6 +47,12 @@ public static class DependencyInjection
         // S66-D：本地與交易所時鐘漂移狀態（Singleton — NtpDriftMonitor 寫入、RiskManager 讀取）
         services.AddSingleton<IClockSkewState, ClockSkewState>();
 
+        // S66-E：包夾測量 service（Singleton — 無狀態 hash 計算，跨 monitor / startup-check / diagnostic 共用）
+        services.AddSingleton<ISkewMeasurementService, SkewMeasurementService>();
+
+        // S66-E：啟動 Pre-flight 健檢（Singleton — 純讀，跨 ConsoleApp 啟動程序呼叫一次）
+        services.AddSingleton<IStartupHealthCheck, StartupSkewCheck>();
+
         services.AddScoped<IRiskManager, RiskManager>();
         services.AddScoped<IOrderSizer, OrderSizer>();
 

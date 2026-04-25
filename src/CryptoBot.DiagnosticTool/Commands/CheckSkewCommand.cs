@@ -1,4 +1,5 @@
 using CryptoBot.Application.Common.Interfaces;
+using CryptoBot.Application.Synchronization;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace CryptoBot.DiagnosticTool.Commands;
@@ -37,21 +38,17 @@ public sealed class CheckSkewCommand : IDiagnosticCommand
         await using var scope = _scopeFactory.CreateAsyncScope();
         var sp = scope.ServiceProvider;
         var exchange = sp.GetRequiredService<IExchangeClient>();
+        var measurement = sp.GetRequiredService<ISkewMeasurementService>();
 
         Console.WriteLine("=== S66-D Clock Skew Inspector ===");
         Console.WriteLine($"Mode    : {exchange.CurrentMode}");
         Console.WriteLine();
 
-        // 包夾測量 — 與 NtpDriftMonitor 演算法一致
-        DateTime localBefore;
-        DateTime serverTime;
-        DateTime localAfter;
-
+        // S66-E：演算法統一從 ISkewMeasurementService 取，不重複實作中點計算
+        SkewMeasurement m;
         try
         {
-            localBefore = DateTime.UtcNow;
-            serverTime = await exchange.GetServerTimeAsync(ct).ConfigureAwait(false);
-            localAfter = DateTime.UtcNow;
+            m = await measurement.MeasureAsync(ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -59,16 +56,12 @@ public sealed class CheckSkewCommand : IDiagnosticCommand
             return 5;
         }
 
-        var localMidTicks = localBefore.Ticks + (localAfter.Ticks - localBefore.Ticks) / 2;
-        var localMid = new DateTime(localMidTicks, DateTimeKind.Utc);
-        var offset = serverTime - localMid;
-        var roundTrip = localAfter - localBefore;
-        var skewMs = (long)offset.TotalMilliseconds;
+        var skewMs = (long)m.Offset.TotalMilliseconds;
         var absMs = Math.Abs(skewMs);
 
-        Console.WriteLine($"Local UTC (mid) : {localMid:yyyy-MM-dd HH:mm:ss.fff}");
-        Console.WriteLine($"Server UTC      : {serverTime:yyyy-MM-dd HH:mm:ss.fff}");
-        Console.WriteLine($"Round-trip      : {roundTrip.TotalMilliseconds:F0}ms");
+        Console.WriteLine($"Local UTC (mid) : {m.LocalMidUtc:yyyy-MM-dd HH:mm:ss.fff}");
+        Console.WriteLine($"Server UTC      : {m.ServerTimeUtc:yyyy-MM-dd HH:mm:ss.fff}");
+        Console.WriteLine($"Round-trip      : {m.RoundTrip.TotalMilliseconds:F0}ms");
         Console.WriteLine();
         Console.WriteLine($"Offset (server − local mid) : {skewMs:+0;-0;0}ms");
         Console.WriteLine($"  Direction : {(skewMs > 0 ? "Server is AHEAD of local" : skewMs < 0 ? "Server is BEHIND local" : "Perfectly aligned")}");

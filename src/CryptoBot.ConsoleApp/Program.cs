@@ -65,6 +65,15 @@ public static class Program
             var app = BuildApp(args, isBacktest);
             await ApplyMigrationsIfConfiguredAsync(app.Services).ConfigureAwait(false);
 
+            // S66-E：啟動 Pre-flight Check — 量測時鐘漂移並印 banner。
+            // 若 appsettings:Startup:AbortIfSkewExceedsMs 設定且偏差超過該值，立即 Exit(1)。
+            // 不在 backtest 路徑執行（回測用本地時間，不需與真實交易所對時）。
+            if (!isBacktest)
+            {
+                var abortCode = await RunStartupPreflightAsync(app).ConfigureAwait(false);
+                if (abortCode is int code) return code;
+            }
+
             if (isBacktest)
             {
                 Log.Information("偵測到 backtest 子命令 — 進入回測模式（不啟動 Web host）。");
@@ -109,6 +118,10 @@ public static class Program
         // IP 白名單由 IpWhitelistMiddleware 擋在最前面，杜絕非授權來源。
         builder.Services.Configure<IpWhitelistOptions>(
             builder.Configuration.GetSection(IpWhitelistOptions.SectionName));
+
+        // S66-E：啟動 Pre-flight 檢查設定（AbortIfSkewExceedsMs nullable）
+        builder.Services.Configure<StartupOptions>(
+            builder.Configuration.GetSection(StartupOptions.SectionName));
 
         // S27-NGROK T1：ngrok 會把真正的客戶端 IP 放進 X-Forwarded-For，socket 上的 RemoteIpAddress
         // 只會是 127.0.0.1 / ngrok 代理的內部 IP。UseForwardedHeaders 會把 context.Connection.RemoteIpAddress
@@ -211,6 +224,47 @@ public static class Program
         }
 
         return app;
+    }
+
+    /// <summary>
+    /// S66-E：啟動 Pre-flight 健檢 + ASCII banner + Abort 攔截。
+    ///
+    /// 回傳 <c>null</c> = 通過、可繼續啟動；回傳 <c>int</c> = 立即 return 該 exit code。
+    /// </summary>
+    private static async Task<int?> RunStartupPreflightAsync(WebApplication app)
+    {
+        using var scope = app.Services.CreateScope();
+        var sp = scope.ServiceProvider;
+        var check = sp.GetRequiredService<IStartupHealthCheck>();
+        var options = sp.GetRequiredService<IOptions<StartupOptions>>().Value;
+
+        StartupCheckResult result;
+        try
+        {
+            result = await check.RunAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Pre-flight check 自身拋例外（罕見）—— 跳過 banner，繼續啟動。");
+            return null;
+        }
+
+        // 渲染 banner（在啟動 log 開頭就顯眼）
+        StartupBannerRenderer.Render(result);
+
+        // 偵測 abort 條件
+        if (options.AbortIfSkewExceedsMs is int threshold
+            && result.AbsoluteOffsetMs is long absMs
+            && absMs > threshold)
+        {
+            Log.Fatal(
+                "啟動中止：時鐘偏差 {SkewMs}ms 超過設定的 AbortIfSkewExceedsMs={Threshold}ms。" +
+                "請執行系統校時（管理員 PowerShell: w32tm /resync /force）後重啟。",
+                result.OffsetMs, threshold);
+            return 1;
+        }
+
+        return null;
     }
 
     private static async Task ApplyMigrationsIfConfiguredAsync(IServiceProvider services)

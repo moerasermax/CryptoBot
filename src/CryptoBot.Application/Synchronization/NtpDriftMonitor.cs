@@ -1,5 +1,4 @@
 using CryptoBot.Application.Common;
-using CryptoBot.Application.Common.Interfaces;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -26,16 +25,16 @@ public sealed class NtpDriftMonitor : BackgroundService
     /// <summary>偏差超過此值即打 Warning log（但不攔截，攔截由 RiskManager 1000ms 條款處理）。</summary>
     internal static readonly TimeSpan WarningThreshold = TimeSpan.FromMilliseconds(500);
 
-    private readonly IExchangeClient _exchange;
+    private readonly ISkewMeasurementService _measurement;
     private readonly IClockSkewState _skewState;
     private readonly ILogger<NtpDriftMonitor> _logger;
 
     public NtpDriftMonitor(
-        IExchangeClient exchange,
+        ISkewMeasurementService measurement,
         IClockSkewState skewState,
         ILogger<NtpDriftMonitor> logger)
     {
-        _exchange = exchange;
+        _measurement = measurement;
         _skewState = skewState;
         _logger = logger;
     }
@@ -68,18 +67,10 @@ public sealed class NtpDriftMonitor : BackgroundService
     /// <summary>單次同步邏輯。<c>internal</c> 暴露給單元測試與 DiagnosticTool 直接呼叫。</summary>
     internal async Task SyncOnceAsync(CancellationToken ct)
     {
-        DateTime serverTime;
-        DateTime localBefore;
-        DateTime localAfter;
-
+        SkewMeasurement m;
         try
         {
-            // 包夾測量：算出 round-trip + 估計 offset
-            // 真實 offset ≈ serverTime − (localBefore + localAfter) / 2
-            // 這比直接用 serverTime - localAfter 準確（扣掉半個 round-trip 估誤差）
-            localBefore = DateTime.UtcNow;
-            serverTime = await _exchange.GetServerTimeAsync(ct).ConfigureAwait(false);
-            localAfter = DateTime.UtcNow;
+            m = await _measurement.MeasureAsync(ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -90,14 +81,9 @@ public sealed class NtpDriftMonitor : BackgroundService
             return;
         }
 
-        // 中點本地時間 = (before + after) / 2
-        var localMidTicks = localBefore.Ticks + (localAfter.Ticks - localBefore.Ticks) / 2;
-        var localMid = new DateTime(localMidTicks, DateTimeKind.Utc);
-        var offset = serverTime - localMid;
+        _skewState.Update(m.Offset, m.LocalAfterUtc);
 
-        _skewState.Update(offset, localAfter);
-
-        var skewMs = (long)offset.TotalMilliseconds;
+        var skewMs = (long)m.Offset.TotalMilliseconds;
         var absMs = Math.Abs(skewMs);
 
         if (absMs > WarningThreshold.TotalMilliseconds)
