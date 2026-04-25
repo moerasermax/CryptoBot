@@ -319,6 +319,8 @@ internal sealed class PipelineFakeExchangeClient : IExchangeClient
     public Task RefreshOrderStatusAsync(Order order, CancellationToken ct = default) => Task.CompletedTask;
     public Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ExchangePositionInfo>>(Array.Empty<ExchangePositionInfo>());
+    public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
 }
 
 internal sealed class PipelineInMemoryOrderRepo : IOrderRepository

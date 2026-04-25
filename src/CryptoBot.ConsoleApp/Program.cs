@@ -155,6 +155,9 @@ public static class Program
             builder.Services.AddSingleton<StrategyCatalog>();
             builder.Services.AddSingleton<LabStateContainer>();
 
+            // S57 T1：IP 白名單管理 — 單例，內部用 SemaphoreSlim 序列化檔寫入避免 race。
+            builder.Services.AddSingleton<IIpWhitelistService, IpWhitelistService>();
+
             // Lab 頁面用 HttpClientFactory 回打自己的 Minimal API（集中驗證 + 狀態碼邏輯）
             builder.Services.AddHttpClient();
 
@@ -192,6 +195,7 @@ public static class Program
             app.MapExchangeAccountEndpoints();
             app.MapAiCredentialEndpoints();
             app.MapAiAdvisorEndpoints();
+            app.MapAdminEndpoints();            // S57
         }
 
         return app;

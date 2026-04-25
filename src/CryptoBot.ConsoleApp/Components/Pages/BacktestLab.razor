@@ -139,14 +139,14 @@
                最後一個「Manual」選項點下去會顯示手動輸入框給自訂 symbol。 *@
             <div class="field">
                 <span>Symbol</span>
-                <select @bind="_symbolSelect" @bind:after="OnSymbolSelectChangedAsync"
-                        disabled="@State.IsRunning">
-                    @foreach (var s in _topSymbols)
-                    {
-                        <option value="@s">@s</option>
-                    }
-                    <option value="@ManualSymbolKey">Manual…</option>
-                </select>
+                @* S56 T2 終極方案：GlassDropdown 取代原生 select。Symbol 下拉包含 10 個預設幣種
+                   + 最後一個 Manual sentinel，SymbolItems 把兩者串一起餵 Items。 *@
+                <GlassDropdown TValue="string"
+                               Value="@_symbolSelect"
+                               ValueChanged="@OnSymbolSelectedAsync"
+                               Items="@SymbolItems"
+                               Label="@(s => s == ManualSymbolKey ? "Manual…" : s)"
+                               Disabled="@State.IsRunning" />
             </div>
             @if (_isManualSymbol)
             {
@@ -158,13 +158,14 @@
             }
             <div class="field">
                 <span>Interval</span>
-                <select @bind="_intervalInput" @bind:after="OnMarketChangedAsync"
-                        disabled="@State.IsRunning">
-                    @foreach (var i in _allowedIntervals)
-                    {
-                        <option value="@i">@IntervalLabel(i)</option>
-                    }
-                </select>
+                @* S56 T2 終極方案：GlassDropdown<KlineInterval> — 泛型吃 enum 直接用，Label 餵
+                   IntervalLabel 把 KlineInterval.OneHour 轉成 "1h"。 *@
+                <GlassDropdown TValue="KlineInterval"
+                               Value="@_intervalInput"
+                               ValueChanged="@OnIntervalSelectedAsync"
+                               Items="@_allowedIntervals"
+                               Label="@(i => IntervalLabel(i))"
+                               Disabled="@State.IsRunning" />
             </div>
             <div class="field">
                 <span>Slippage (bp)</span>
@@ -558,14 +559,14 @@
         if (selectionChanged) _ = LoadCachedSettingsAsync();
     });
 
-    // S47：等新策略 form 渲染完再灌快取網格的旗標（只在 OnAfterRenderAsync 用一次，然後清空）。
-    private string? _pendingGridRestoreKey;
-
     private void SyncFormToSelectedModel()
     {
         if (_lastSelectedKey == State.SelectedModel.Key) return;
 
-        // S47：切換前先保存舊 form 的網格 — 使用者改到一半切 tab 也不會丟資料。
+        // S55 T3：切換前的「舊 form CurrentGrid → cache」保險網 — 實際上每次使用者動 Min/Max/Step
+        // 都會經 OnFormGridChanged 存過 cache，這裡是備份策略（防萬一 @bind:after 在極端時序下漏觸發）。
+        // 新的領取式設計下，新 form 的 OnInitializedAsync 會自行從 cache 拉回自己的網格 — 父頁面不再
+        // 經手 _pendingGridRestoreKey / OnAfterRenderAsync 時序。
         if (_lastSelectedKey is not null
             && _dynamicRef?.Instance is StrategyParameterFormBase priorForm)
         {
@@ -579,30 +580,28 @@
         {
             [nameof(StrategyParameterFormBase.Disabled)]         = State.IsRunning,
             [nameof(StrategyParameterFormBase.ParameterChanged)] = EventCallback.Factory.Create<int>(this, OnFormGridChanged),
+            // S55 T3：把策略 key 傳進 form — form 用它向 LabStateContainer 精準領取自己的網格快照。
+            [nameof(StrategyParameterFormBase.StrategyKey)]      = _lastSelectedKey,
         };
-
-        // DynamicComponent 的新 form 實例要等下一次 render 才會建出來 — 在 OnAfterRenderAsync 回填快取。
-        _pendingGridRestoreKey = _lastSelectedKey;
     }
 
-    // S47 / S45-S48 VCP-Solid-Memory：切策略 / 回到頁面時的快取回填點 —
-    // OnAfterRenderAsync 是 form 實例可用的最早時機。但 Blazor 在一次切換流程中可能觸發多次
-    // OnAfterRenderAsync（先重渲父層、再實例化子 DynamicComponent），所以這裡只有在「表單確實
-    // 可用且回填成功」時才 consume flag，否則留到下一輪重試 — 保證 100% 恢復。
-    protected override async Task OnAfterRenderAsync(bool firstRender)
+    // S56 T2：GlassDropdown 的 Items 清單 — 預設 10 幣 + Manual sentinel。
+    // 延遲計算（每次 render 都串一次）成本忽略不計；10+1 個 string。
+    private IEnumerable<string> SymbolItems
+        => _topSymbols.Concat(new[] { ManualSymbolKey });
+
+    // S56 T2：GlassDropdown<string> ValueChanged wrapper — bind + after-callback 二合一。
+    private async Task OnSymbolSelectedAsync(string newValue)
     {
-        if (_pendingGridRestoreKey is null) return;
-        if (_dynamicRef?.Instance is not StrategyParameterFormBase form) return; // 下次再試
+        _symbolSelect = newValue;
+        await OnSymbolSelectChangedAsync();
+    }
 
-        var key = _pendingGridRestoreKey;
-        _pendingGridRestoreKey = null; // form 已就緒 — 不管有無快取都只嘗試一次
-
-        var cached = State.TryGetGridSettings(key);
-        if (cached is null) return;
-
-        await form.ApplyGridParametersAsync(cached);
-        // ApplyGridParametersAsync 內部會 NotifyChangedAsync → OnFormGridChanged → StateHasChanged，
-        // 無需在此額外刷新。
+    // S56 T2：GlassDropdown<KlineInterval> ValueChanged wrapper — 同上邏輯。
+    private async Task OnIntervalSelectedAsync(KlineInterval newInterval)
+    {
+        _intervalInput = newInterval;
+        await OnMarketChangedAsync();
     }
 
     private Task OnMarketChangedAsync()
@@ -697,23 +696,40 @@
     {
         _currentGridSize = gridSize;
 
-        // FS-V2 T2 VCP-Memory-Solid：切策略 / 回頁面時，新 form 實例的 OnInitializedAsync 會
-        // 先吐一次 NotifyChangedAsync（初始化事件，不是使用者輸入）。若 LabStateContainer 已有
-        // 該 key 的網格快照，這個「預設值事件」絕不能把快取蓋掉 — 等 OnAfterRenderAsync 的
-        // ApplyGridParametersAsync 套用快取後再持久化才對。
-        // 識別條件：「_pendingGridRestoreKey 還沒被 consume」且「快取存在」，兩者同時成立即 skip。
-        if (_pendingGridRestoreKey is not null
-            && State.TryGetGridSettings(State.SelectedModel.Key) is not null)
-        {
-            StateHasChanged();
-            return;
-        }
-
-        // S47：每次使用者改 Min/Max/Step 就把 snapshot 推進快取，
-        // 離開頁面再回來也能回填最新輸入（不必按 Start 才算數）。
+        // S55 T3：領取式設計下，form 的 OnInitializedAsync 會「先自拉 cache → 再 Notify」，
+        // 所以初始化時這個 callback 收到的 CurrentGrid 若 cache 存在就已經是 cache 值本身
+        // （套完 ApplyGridParametersAsync 再 Notify）— 回寫 cache = 寫進一模一樣的值，冪等無害。
+        // 真正的初始化噪音場景：「cache 沒命中（首次進頁 / 未記錄 key）」且 form 吐預設值 —
+        // 這時寫進 cache 當 baseline 是正確的，不該跳過。
+        // 因此這裡不再需要 _pendingGridRestoreKey 旗標 — 時序判斷下放到 form 自己。
+        // 唯一保留的小優化：若 cache 與 form 的 CurrentGrid 完全相等，跳過重複寫入減少噪音。
         if (_dynamicRef?.Instance is StrategyParameterFormBase form)
-            State.SaveGridSettings(State.SelectedModel.Key, form.CurrentGrid);
+        {
+            var key = State.SelectedModel.Key;
+            var current = form.CurrentGrid;
+            var cached = State.TryGetGridSettings(key);
+            if (cached is null || !GridEquals(cached, current))
+                State.SaveGridSettings(key, current);
+        }
         StateHasChanged();
+    }
+
+    /// <summary>
+    /// S55 T3：冪等寫入優化用的結構相等比對 — 避免 form 初始化的 Notify 事件在快取已經是相同值時
+    /// 反覆把同樣內容寫進 ConcurrentDictionary（單純降低噪音，不影響正確性）。
+    /// </summary>
+    private static bool GridEquals(
+        IReadOnlyDictionary<string, ParameterGridRange> a,
+        IReadOnlyDictionary<string, ParameterGridRange> b)
+    {
+        if (a.Count != b.Count) return false;
+        foreach (var kv in a)
+        {
+            if (!b.TryGetValue(kv.Key, out var other)) return false;
+            if (other.Min != kv.Value.Min || other.Max != kv.Value.Max || other.Step != kv.Value.Step)
+                return false;
+        }
+        return true;
     }
 
     private async Task LoadActiveStrategyAsync()

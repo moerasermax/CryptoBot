@@ -207,9 +207,23 @@ public sealed class StrategyExecutor : IStrategyExecutor
                 .ConfigureAwait(false);
 
             // 4) 執行策略
-            var signal = await _strategyImpl
-                .AnalyzeAsync(cfg, klinesSnapshot, snapshot, openPositions, CancellationToken.None)
-                .ConfigureAwait(false);
+            // S63 Phase 3：若實作 IMultiTimeframeStrategy，並行抓額外週期、切除進行中尾根，
+            // 走多週期入口；否則原路單週期呼叫 — 舊策略零影響。
+            TradingSignal signal;
+            if (_strategyImpl is IMultiTimeframeStrategy mtfImpl && mtfImpl.RequiredIntervals.Count > 0)
+            {
+                var additional = await FetchAdditionalFramesAsync(
+                    mtfImpl.RequiredIntervals, cfg, CancellationToken.None).ConfigureAwait(false);
+                signal = await mtfImpl
+                    .AnalyzeMultiTimeframeAsync(cfg, klinesSnapshot, additional, snapshot, openPositions, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                signal = await _strategyImpl
+                    .AnalyzeAsync(cfg, klinesSnapshot, snapshot, openPositions, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
 
             // S42 T1 / S44 T1：每次評估完就廣播心跳 — 不管 Signal 是不是 None。
             // Dashboard 靠這個事件證明「策略大腦還在跑」而不是卡在某處；
@@ -295,7 +309,40 @@ public sealed class StrategyExecutor : IStrategyExecutor
         var qty = await sizer.ComputeAsync(_strategy, signal, CancellationToken.None).ConfigureAwait(false);
         if (qty.Value <= 0)
         {
-            _logger.LogWarning("Sizer returned zero quantity for {Signal} — skipping.", signal);
+            // S59 T1：過去這裡只 log 就 return，使用者面板看不到任何跡象 —「有信號、無下單、無報錯」的
+            // 靜默失敗就是這樣來的。比照 S56 風控攔截雙軌：Warning 通知 + [SIZE] 前綴廣播，Dashboard
+            // 滾動日誌會以橘色標註；策略維持 Running 不走 ReportError（與 [RISK] 同理）。
+            const string sizeReason = "餘額不足以支付最小下單量（或未達交易所 stepSize/minNotional）";
+            _logger.LogWarning("Sizer returned zero quantity for {Signal} — {Reason}", signal, sizeReason);
+
+            try
+            {
+                await _notifications.NotifyAsync(
+                    "Order sized to zero",
+                    sizeReason,
+                    NotificationLevel.Warning,
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception notifyEx)
+            {
+                _logger.LogWarning(notifyEx,
+                    "Failed to notify zero-size event for {Name}.", _strategy.Name);
+            }
+
+            try
+            {
+                await _broadcaster.BroadcastStrategyEvaluationFailedAsync(new StrategyEvaluationFailedUpdate(
+                    StrategyId: _strategy.Id,
+                    StrategyName: _strategy.Name,
+                    OccurredAtUtc: DateTime.UtcNow,
+                    Symbol: _strategy.Configuration.Symbol.BingXFormat,
+                    ErrorMessage: $"[SIZE] {sizeReason}"), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception broadcastEx)
+            {
+                _logger.LogWarning(broadcastEx,
+                    "Failed to broadcast zero-size event for {Name}.", _strategy.Name);
+            }
             return;
         }
 
@@ -304,7 +351,44 @@ public sealed class StrategyExecutor : IStrategyExecutor
             .ConfigureAwait(false);
         if (!check.IsApproved)
         {
-            _logger.LogWarning("Order rejected by RiskManager: {Reason}", check.Reason);
+            var reason = check.Reason ?? "(未提供原因)";
+            _logger.LogWarning("Order rejected by RiskManager: {Reason}", reason);
+
+            // S56 T1：執行層決策透明化 — 過去風控攔截只在 server log 留痕，使用者面板無任何跡象，
+            // 排錯時只能猜「為什麼沒下單」。雙管齊下：
+            // (a) Warning 等級系統通知（Discord / Dashboard toast）— 現場立刻知道被擋
+            // (b) 決策日誌事件推播，ErrorMessage 前加 [RISK] prefix — Dashboard 的滾動日誌會以橘色標註
+            // 注意：刻意不呼叫 _strategy.ReportError(reason) —— domain 該方法會把 Status 改為 Error
+            // 並停掉策略，相當於單一持倉衝突就把整個策略關機，破壞金融安全底線。PM 膠囊的 VCP-1
+            // 只要求「Dashboard 跳警告」，本實作走廣播 + 通知雙軌達成同樣顯性化，策略維持 Running。
+            try
+            {
+                await _notifications.NotifyAsync(
+                    "Trade rejected",
+                    reason,
+                    NotificationLevel.Warning,
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception notifyEx)
+            {
+                _logger.LogWarning(notifyEx,
+                    "Failed to notify risk rejection for {Name}.", _strategy.Name);
+            }
+
+            try
+            {
+                await _broadcaster.BroadcastStrategyEvaluationFailedAsync(new StrategyEvaluationFailedUpdate(
+                    StrategyId: _strategy.Id,
+                    StrategyName: _strategy.Name,
+                    OccurredAtUtc: DateTime.UtcNow,
+                    Symbol: _strategy.Configuration.Symbol.BingXFormat,
+                    ErrorMessage: $"[RISK] {reason}"), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception broadcastEx)
+            {
+                _logger.LogWarning(broadcastEx,
+                    "Failed to broadcast risk-rejection event for {Name}.", _strategy.Name);
+            }
             return;
         }
 
@@ -490,5 +574,76 @@ public sealed class StrategyExecutor : IStrategyExecutor
         try { await StopAsync(CancellationToken.None).ConfigureAwait(false); }
         catch { /* swallow during dispose */ }
         _processLock.Dispose();
+    }
+
+    // ========== S63 Phase 3：多週期額外週期拉取 ==========
+
+    private static readonly IReadOnlyDictionary<KlineInterval, IReadOnlyList<Kline>> EmptyFrames =
+        new Dictionary<KlineInterval, IReadOnlyList<Kline>>();
+
+    /// <summary>
+    /// 並行 REST 拉取策略宣告的額外週期 K 線。
+    /// 已自動：(1) 去除與主週期相同的條目；(2) 去重；(3) 若尾根「進行中」則切除（防未來函數）。
+    /// 個別週期 REST 失敗不會連累其他週期 — 成功的仍會回傳，失敗者缺鍵讓策略自行決定降級。
+    /// </summary>
+    private async Task<IReadOnlyDictionary<KlineInterval, IReadOnlyList<Kline>>> FetchAdditionalFramesAsync(
+        IReadOnlyList<KlineInterval> requiredIntervals,
+        StrategyConfiguration cfg,
+        CancellationToken ct)
+    {
+        var unique = requiredIntervals
+            .Where(iv => iv != cfg.Interval)
+            .Distinct()
+            .ToArray();
+
+        if (unique.Length == 0) return EmptyFrames;
+
+        var tasks = unique.Select(iv => FetchOneTimeframeAsync(iv, cfg, ct)).ToArray();
+        var results = await Task.WhenAll(tasks).ConfigureAwait(false);
+
+        var map = new Dictionary<KlineInterval, IReadOnlyList<Kline>>(unique.Length);
+        for (int i = 0; i < unique.Length; i++)
+        {
+            if (results[i] is not null)
+                map[unique[i]] = results[i]!;
+        }
+        return map;
+    }
+
+    private async Task<IReadOnlyList<Kline>?> FetchOneTimeframeAsync(
+        KlineInterval interval, StrategyConfiguration cfg, CancellationToken ct)
+    {
+        try
+        {
+            var klines = await _exchange
+                .GetKlinesAsync(cfg.Symbol, interval, limit: cfg.MaxKlineWindow, ct: ct)
+                .ConfigureAwait(false);
+            return TrimInProgressTail(klines);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Fetch additional timeframe {Interval} for {Symbol} failed — strategy will see no data for this frame.",
+                interval, cfg.Symbol);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 若最末根 CloseTime > now，視為「進行中」並切除，避免 MTF 策略取到含未來函數的值。
+    /// 若末根已收盤則完整保留（既有 live 場景）。
+    /// </summary>
+    private static IReadOnlyList<Kline> TrimInProgressTail(IReadOnlyList<Kline> klines)
+    {
+        if (klines.Count == 0) return klines;
+        var last = klines[^1];
+        if (last.CloseTime > DateTime.UtcNow)
+        {
+            if (klines.Count == 1) return Array.Empty<Kline>();
+            var list = new List<Kline>(klines.Count - 1);
+            for (int i = 0; i < klines.Count - 1; i++) list.Add(klines[i]);
+            return list;
+        }
+        return klines;
     }
 }

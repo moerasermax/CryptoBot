@@ -26,7 +26,12 @@
     private int SlowCount => Count(_slowMin, _slowMax, _slowStep);
     public override int CurrentGridSize => Math.Max(0, FastCount) * Math.Max(0, SlowCount);
 
-    protected override Task OnInitializedAsync() => NotifyChangedAsync();
+    // S55 T2：領取式持久化 — StrategyKey="sma"，自 LabStateContainer 拉回網格快照。
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await RestoreGridFromCacheAsync())
+            await NotifyChangedAsync();
+    }
 
     private Task OnChanged() => NotifyChangedAsync();
 

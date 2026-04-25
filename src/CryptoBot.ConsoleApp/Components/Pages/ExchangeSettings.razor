@@ -36,12 +36,11 @@
             <div class="glass-row">
                 <label class="glass-label">Exchange</label>
                 <div class="glass-cell" style="flex:2">
-                    <select @bind="_newExchange" class="glass-select">
-                        @foreach (var ex in _allExchanges)
-                        {
-                            <option value="@ex">@ex</option>
-                        }
-                    </select>
+                    @* S56 T2 終極方案：改用 GlassDropdown 保證跨瀏覽器深色一致。 *@
+                    <GlassDropdown TValue="string"
+                                   Value="@_newExchange"
+                                   ValueChanged="@(v => { _newExchange = v; StateHasChanged(); })"
+                                   Items="@_allExchanges" />
                 </div>
             </div>
             <div class="glass-row">

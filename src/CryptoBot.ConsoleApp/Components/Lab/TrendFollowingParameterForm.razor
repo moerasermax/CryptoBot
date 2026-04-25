@@ -48,7 +48,12 @@
         * Math.Max(0, Count(_rsiPeriodMin, _rsiPeriodMax, _rsiPeriodStep))
         * Math.Max(0, Count(_rsiMidMin, _rsiMidMax, _rsiMidStep));
 
-    protected override Task OnInitializedAsync() => NotifyChangedAsync();
+    // S55 T2：領取式持久化 — StrategyKey="trend"，自 LabStateContainer 拉回網格快照。
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await RestoreGridFromCacheAsync())
+            await NotifyChangedAsync();
+    }
 
     private Task OnChanged() => NotifyChangedAsync();
 

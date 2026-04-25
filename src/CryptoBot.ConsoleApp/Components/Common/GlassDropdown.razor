@@ -1,0 +1,138 @@
+@*
+    S56 T2 真·根治：自製深色下拉元件。
+
+    原生 <select> 在 Chrome/Edge Windows 下的展開面板是 OS 級控件，
+    CSS（含 color-scheme: dark）吃不到——這是 Chromium 長期 bug。
+    本元件用 <button> + <ul> 模擬，popup 100% 走 HTML/CSS，徹底掌控深色外觀。
+
+    用法（泛型）：
+    <GlassDropdown TValue="string"
+                   Value="@_val"
+                   ValueChanged="@(v => _val = v)"
+                   Items="@_options"
+                   Label="@(x => x.ToUpper())"
+                   Disabled="@_busy" />
+
+    click-outside 關閉由 wwwroot/glass-dropdown.js 的 document listener 處理；
+    選中 option / 按 ESC（由 browser button focus behavior 提供）都會關閉。
+*@
+@typeparam TValue
+@implements IAsyncDisposable
+
+<div class="glass-dropdown @(_open ? "open" : string.Empty) @(Disabled ? "disabled" : string.Empty)"
+     data-dropdown-id="@_id">
+    <button type="button" class="glass-dropdown-trigger"
+            disabled="@Disabled"
+            @onclick="ToggleAsync"
+            @onclick:stopPropagation="true">
+        <span class="glass-dropdown-label">@LabelFor(Value)</span>
+        <span class="glass-dropdown-chevron" aria-hidden="true">▾</span>
+    </button>
+    @if (_open)
+    {
+        <ul class="glass-dropdown-panel" role="listbox">
+            @foreach (var item in Items)
+            {
+                var selected = EqualityComparer<TValue>.Default.Equals(item, Value);
+                <li class="glass-dropdown-option @(selected ? "selected" : string.Empty)"
+                    role="option"
+                    aria-selected="@(selected ? "true" : "false")"
+                    @onclick="() => SelectAsync(item)"
+                    @onclick:stopPropagation="true">
+                    @LabelFor(item)
+                </li>
+            }
+        </ul>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public TValue Value { get; set; } = default!;
+    [Parameter] public EventCallback<TValue> ValueChanged { get; set; }
+    [Parameter, EditorRequired] public IEnumerable<TValue> Items { get; set; } = Array.Empty<TValue>();
+
+    /// <summary>選填：把 TValue 轉成顯示字串；不傳時用 ToString()。enum / record / string 都能直接塞。</summary>
+    [Parameter] public Func<TValue, string>? Label { get; set; }
+
+    [Parameter] public bool Disabled { get; set; }
+
+    [Inject] private IJSRuntime JS { get; set; } = default!;
+
+    private bool _open;
+    // 每個 instance 用唯一 id 綁定 JS listener，避免 document-level handler 找錯 host。
+    private readonly string _id = "dd-" + Guid.NewGuid().ToString("N")[..8];
+    private DotNetObjectReference<GlassDropdown<TValue>>? _selfRef;
+    private IJSObjectReference? _outsideClickHandler;
+
+    private string LabelFor(TValue v)
+        => Label is not null ? Label(v) : (v?.ToString() ?? string.Empty);
+
+    private async Task ToggleAsync()
+    {
+        if (Disabled) return;
+        if (_open)
+        {
+            await CloseAsync();
+        }
+        else
+        {
+            _open = true;
+            StateHasChanged();
+            await RegisterOutsideClickAsync();
+        }
+    }
+
+    private async Task SelectAsync(TValue value)
+    {
+        // 先關再通知，ValueChanged handler 若被 await 也不會看到 _open=true 的殘留狀態。
+        await CloseAsync();
+        if (!EqualityComparer<TValue>.Default.Equals(value, Value))
+            await ValueChanged.InvokeAsync(value);
+    }
+
+    private async Task RegisterOutsideClickAsync()
+    {
+        _selfRef ??= DotNetObjectReference.Create(this);
+        try
+        {
+            _outsideClickHandler = await JS.InvokeAsync<IJSObjectReference>(
+                "glassDropdown.register", _id, _selfRef);
+        }
+        catch (JSException)
+        {
+            // 例如 prerender 階段或 JS 尚未載入 — 安靜吞掉，click-outside 暫時不生效
+            // 但元件本身仍可正常選項、選項後 close 的自動關閉路徑。
+        }
+    }
+
+    [JSInvokable]
+    public async Task CloseFromOutside()
+    {
+        if (!_open) return;
+        _open = false;
+        await InvokeAsync(StateHasChanged);
+        await DisposeHandlerAsync();
+    }
+
+    private async Task CloseAsync()
+    {
+        if (!_open) return;
+        _open = false;
+        StateHasChanged();
+        await DisposeHandlerAsync();
+    }
+
+    private async Task DisposeHandlerAsync()
+    {
+        if (_outsideClickHandler is null) return;
+        try { await _outsideClickHandler.InvokeVoidAsync("dispose"); } catch { /* ignore */ }
+        try { await _outsideClickHandler.DisposeAsync(); } catch { /* ignore */ }
+        _outsideClickHandler = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await DisposeHandlerAsync();
+        _selfRef?.Dispose();
+    }
+}

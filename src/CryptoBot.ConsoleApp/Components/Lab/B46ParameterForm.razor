@@ -56,7 +56,14 @@
         * Math.Max(0, Count(_bbPeriodMin, _bbPeriodMax, _bbPeriodStep))
         * Math.Max(0, Count(_bbStdDevMin, _bbStdDevMax, _bbStdDevStep));
 
-    protected override Task OnInitializedAsync() => NotifyChangedAsync();
+    // S55 T2：領取式持久化 — 先嘗試從 LabStateContainer 拉回 StrategyKey="rsi-bb" 的網格快照。
+    // 命中時 ApplyGridParametersAsync 內部已 Notify 一次；沒命中才用預設值 Notify 回報 Grid size。
+    // 時序：OnInitializedAsync 在第一次渲染前執行 → UI 直接綁到快取值，絕不露出預設值中間態。
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await RestoreGridFromCacheAsync())
+            await NotifyChangedAsync();
+    }
 
     private Task OnChanged() => NotifyChangedAsync();
 

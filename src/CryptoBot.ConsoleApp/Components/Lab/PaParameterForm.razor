@@ -60,7 +60,12 @@
         * Math.Max(0, Count(_engulfMin, _engulfMax, _engulfStep))
         * Math.Max(0, Count(_confidenceMin, _confidenceMax, _confidenceStep));
 
-    protected override Task OnInitializedAsync() => NotifyChangedAsync();
+    // S55 T2：領取式持久化 — StrategyKey="pa"，自 LabStateContainer 拉回網格快照。
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await RestoreGridFromCacheAsync())
+            await NotifyChangedAsync();
+    }
 
     private Task OnChanged() => NotifyChangedAsync();
 

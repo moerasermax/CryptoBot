@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>CryptoBot.DiagnosticTool</RootNamespace>
+    <AssemblyName>CryptoBot.DiagnosticTool</AssemblyName>
+    <!--
+      S59 T2：PM (Gemini) 專用的環境透視 & 下單模擬器。獨立 Console App 刻意不掛任何 HostedService，
+      避免意外啟動 ConsoleApp 的 StrategyRuntime / AccountSynchronizer 等長壽命背景服務。
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CryptoBot.Application\CryptoBot.Application.csproj" />
+    <ProjectReference Include="..\CryptoBot.Infrastructure\CryptoBot.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <!--
+    共用 ConsoleApp 的 appsettings.json — 金鑰走 DB (DbExchangeCredentialProvider)、這裡只承擔模式/埠等靜態設定。
+    Link + CopyToOutputDirectory 讓 build 輸出目錄也能找到同一份。
+  -->
+  <ItemGroup>
+    <Content Include="..\CryptoBot.ConsoleApp\appsettings.json" Link="appsettings.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>

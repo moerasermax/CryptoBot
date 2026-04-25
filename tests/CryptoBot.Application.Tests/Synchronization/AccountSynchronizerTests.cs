@@ -477,6 +477,9 @@ internal sealed class SyncFakeExchangeClient : IExchangeClient
 
     public Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default) =>
         Task.FromResult(OpenPositions);
+
+    public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
 }
 
 internal sealed class StatefulOrderRepo : IOrderRepository

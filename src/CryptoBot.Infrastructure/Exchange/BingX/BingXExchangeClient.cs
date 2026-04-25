@@ -306,11 +306,20 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
 
         result.Check(nameof(GetKlinesAsync));
 
+        // S63-HOTFIX：用 interval 動態推算 CloseTime。
+        // 舊代碼寫死 openTime+1s，導致兩個嚴重後果：
+        //   (1) MTF 對齊自檢永遠 MISALIGNED — 15m CloseTime 才比 OpenTime 多 1 秒，
+        //       根本不可能包覆後續 15m/1H 區間。
+        //   (2) StrategyExecutor.TrimInProgressTail 的「CloseTime > UtcNow」判定永遠為 false，
+        //       防未來函數機制完全失效，MTF 策略可能偷看進行中 K 線。
+        // WebSocket 路徑（BingXMarketDataStream.HandleKlineUpdate）已正確用 ToTimeSpan，
+        // 只有 REST 這裡寫錯，本次修復對齊兩邊。
+        var span = interval.ToTimeSpan();
         var klines = new List<Kline>();
         foreach (var k in result.Data.OrderBy(x => x.Timestamp))
         {
             var openTime = k.Timestamp;
-            var closeTime = openTime.AddSeconds(1);
+            var closeTime = openTime + span;
 
             klines.Add(Kline.Create(
                 openTime: openTime,
@@ -414,20 +423,30 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
         try { minQty = (decimal?)dc.MinOrderQuantity ?? 0m; }
         catch { try { minQty = (decimal?)dc.MinQuantity ?? 0m; } catch { } }
 
-        decimal stepSize = 0m;
-        try { stepSize = (decimal?)dc.QuantityStep ?? 0m; }
-        catch
+        // S62：SDK 的 QuantityPrecision / PricePrecision 是「小數位數」(int)，
+        // 不是步進值 — 直接塞 StepSize 會讓 OrderSizer 把所有 <1 的量 Floor 成 0
+        // (precision=4 → stepSize=4 → qty=0.5 / 4 = 0 → floor → 0)。
+        // 修法：先試真正的步進屬性；都拿不到才讀 precision 並以 10^(-n) 轉換。
+        decimal stepSize = TryReadDecimal(() => (decimal?)dc.QuantityStep)
+                        ?? TryReadDecimal(() => (decimal?)dc.StepSize)
+                        ?? 0m;
+        if (stepSize <= 0m)
         {
-            try { stepSize = (decimal?)dc.StepSize ?? 0m; }
-            catch { try { stepSize = (decimal?)dc.QuantityPrecision ?? 0m; } catch { } }
+            var qPrecision = TryReadInt(() => (int?)dc.QuantityPrecision)
+                          ?? TryReadInt(() => (int?)(decimal?)dc.QuantityPrecision);
+            if (qPrecision is int qp && qp >= 0)
+                stepSize = PrecisionToStep(qp);
         }
 
-        decimal tickSize = 0m;
-        try { tickSize = (decimal?)dc.PriceStep ?? 0m; }
-        catch
+        decimal tickSize = TryReadDecimal(() => (decimal?)dc.PriceStep)
+                        ?? TryReadDecimal(() => (decimal?)dc.TickSize)
+                        ?? 0m;
+        if (tickSize <= 0m)
         {
-            try { tickSize = (decimal?)dc.TickSize ?? 0m; }
-            catch { try { tickSize = (decimal?)dc.PricePrecision ?? 0m; } catch { } }
+            var pPrecision = TryReadInt(() => (int?)dc.PricePrecision)
+                          ?? TryReadInt(() => (int?)(decimal?)dc.PricePrecision);
+            if (pPrecision is int pp && pp >= 0)
+                tickSize = PrecisionToStep(pp);
         }
 
         decimal minNotional = 0m;
@@ -660,6 +679,87 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
         }
 
         return list;
+    }
+
+    // ========== S61：交易所側活躍掛單 ==========
+
+    /// <summary>
+    /// S61-HOTFIX：改為**靜態型別**呼叫。原 dynamic 版在實機跑出 RuntimeBinderException —
+    /// JK.BingX.Net v3.10.0 的 Trading 具體實作類別為 <c>internal</c>，DLR runtime binder
+    /// 從 caller 視角看不到 internal 成員，即使方法存在也找不到。
+    ///
+    /// 路徑與 <see cref="CancelOrderAsync"/> / <see cref="RefreshOrderStatusAsync"/> 對齊：
+    /// <c>_client.PerpetualFuturesApi.Trading.GetOpenOrdersAsync(...)</c>。
+    /// 回傳僅含 <see cref="OrderStatus.New"/> / <see cref="OrderStatus.PartiallyFilled"/>。
+    /// </summary>
+    public async Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(
+        Symbol symbol, CancellationToken ct = default)
+    {
+        var result = await _client.PerpetualFuturesApi.Trading
+            .GetOpenOrdersAsync(symbol: symbol.BingXFormat, ct: ct)
+            .ConfigureAwait(false);
+
+        result.Check(nameof(GetOpenOrdersAsync));
+
+        var list = new List<ExchangeOpenOrderInfo>();
+        foreach (var o in result.Data)
+        {
+            var status = o.Status.ToDomain();
+            if (status != OrderStatus.New && status != OrderStatus.PartiallyFilled) continue;
+
+            Symbol parsedSymbol;
+            try { parsedSymbol = Symbol.Parse(o.Symbol); }
+            catch { continue; }
+
+            // 再次保險過濾（SDK symbol filter 某些版本會忽略）
+            if (!parsedSymbol.Equals(symbol)) continue;
+
+            // o.PositionSide 是 nullable 枚舉；o.UpdateTime 是 non-nullable DateTime
+            var posSide = (o.PositionSide ?? global::BingX.Net.Enums.PositionSide.Long).ToDomain();
+
+            list.Add(new ExchangeOpenOrderInfo(
+                ExchangeOrderId: o.OrderId.ToString(),
+                Symbol: parsedSymbol,
+                Side: o.Side.ToDomain(),
+                PositionSide: posSide,
+                Status: status,
+                Quantity: o.Quantity ?? 0m,
+                QuantityFilled: o.QuantityFilled ?? 0m,
+                Price: o.Price,
+                UpdateTime: o.UpdateTime));
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// S62：把 SDK 給的「小數位數精度」(int) 轉為實際步進值。
+    /// precision=0 → 1；precision=4 → 0.0001；&lt;0 → 0（代表沒解析到）。
+    /// 用 decimal 逐次除 10 避免 Math.Pow(double) 的浮點漂移。
+    /// </summary>
+    internal static decimal PrecisionToStep(int precision)
+    {
+        if (precision < 0) return 0m;
+        if (precision == 0) return 1m;
+        decimal step = 1m;
+        for (int i = 0; i < precision; i++) step /= 10m;
+        return step;
+    }
+
+    private static decimal? TryReadDecimal(Func<decimal?> reader)
+    {
+        try
+        {
+            var v = reader();
+            return v is > 0m ? v : null;
+        }
+        catch { return null; }
+    }
+
+    private static int? TryReadInt(Func<int?> reader)
+    {
+        try { return reader(); }
+        catch { return null; }
     }
 }
 

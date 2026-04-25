@@ -143,15 +143,12 @@
 
             <div class="control-cell">
                 <label class="control-label">決策大腦</label>
-                <select class="glass-select"
-                        disabled="@(_ctrlBusy || _availableTypes.Count == 0)"
-                        @bind="_selectedStrategyType"
-                        @bind:after="OnStrategyTypeChangedAsync">
-                    @foreach (var t in _availableTypes)
-                    {
-                        <option value="@t">@t</option>
-                    }
-                </select>
+                @* S56 T2 終極方案：原生 select 的 popup 吃不到深色 CSS，換成自製 GlassDropdown。 *@
+                <GlassDropdown TValue="string"
+                               Value="@_selectedStrategyType"
+                               ValueChanged="@OnStrategyTypeSelectedAsync"
+                               Items="@_availableTypes"
+                               Disabled="@(_ctrlBusy || _availableTypes.Count == 0)" />
             </div>
 
             <div class="control-cell">
@@ -527,13 +524,25 @@
     private void OnStrategyEvaluationFailed(StrategyEvaluationFailedUpdate update)
     {
         _nowUtc = DateTime.UtcNow;
+
+        // S56 T4：風控攔截事件用 [RISK] prefix 區別於策略評估崩潰 —
+        // 兩者的顯性化程度不同：評估崩潰是系統壞掉（紅橘），風控攔截是正常保護機制（琥珀金）。
+        // 使用者看到琥珀色能立即知道「策略還活著，只是這一筆被風控擋下」，而不是誤判為系統故障。
+        var isRiskReject = update.ErrorMessage.StartsWith("[RISK]", StringComparison.Ordinal);
+        var tag = isRiskReject ? "RISK" : "ERROR";
+        var cssClass = isRiskReject ? "risk-rejected" : "error";
+        // Tag 已經標 RISK，Note 內重複 prefix 沒意義 — 去頭
+        var note = isRiskReject
+            ? update.ErrorMessage["[RISK]".Length..].TrimStart()
+            : update.ErrorMessage;
+
         PushLogEntry(new EvaluationEntry(
             TimestampLocal: update.OccurredAtUtc.ToLocalTime(),
-            Tag: "ERROR",
-            CssClass: "error",
+            Tag: tag,
+            CssClass: cssClass,
             StrategyName: update.StrategyName,
             Symbol: update.Symbol,
-            Note: update.ErrorMessage));
+            Note: note));
         InvokeAsync(StateHasChanged);
     }
 
@@ -691,6 +700,13 @@
         {
             _ctrlError = $"載入策略控制台失敗：{ex.Message}";
         }
+    }
+
+    // S56 T2：GlassDropdown 的 ValueChanged 回傳新選的值，由這裡兼任 bind 與 after-callback。
+    private async Task OnStrategyTypeSelectedAsync(string newType)
+    {
+        _selectedStrategyType = newType;
+        await OnStrategyTypeChangedAsync();
     }
 
     private async Task OnStrategyTypeChangedAsync()

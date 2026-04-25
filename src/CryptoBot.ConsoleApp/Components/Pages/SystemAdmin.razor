@@ -1,0 +1,471 @@
+@page "/admin"
+@using System.Globalization
+@using System.Net.Http.Json
+@using CryptoBot.ConsoleApp.Api.Dtos
+@inject IHttpClientFactory HttpFactory
+@inject NavigationManager Nav
+@rendermode InteractiveServer
+
+<PageTitle>CryptoBot · Admin</PageTitle>
+
+@*
+    S57 系統管理中心。
+    風格：沿用 S56 的 glass-form 玻璃擬態 + 琥珀金（行動提示 / 待補）/ 亮白（可讀性優先）。
+    三個 section：
+      1. IP 白名單 — 顯示呼叫者真實 IP、一鍵加入、現有名單逐條刪除
+      2. 深度交易回溯 — 歷史持倉配「開倉時的模型 + 當時鎖定的網格參數」
+      3. DB 健康 — 檔案大小 / 筆數 + VACUUM 按鈕
+*@
+
+<section class="lab-banner">
+    <h1>系統管理中心</h1>
+    <span class="banner-tag">ADMIN · Security · Deep Insight · DB Ops</span>
+</section>
+
+<div class="admin-grid fade-in">
+
+    @* ─────────── T1：IP 白名單 ─────────── *@
+    <section class="panel glass">
+        <header class="panel-header">
+            <h2>🛡 IP 白名單管理</h2>
+            <span class="panel-sub">appsettings.json · Security.AllowedIPs · 熱載生效</span>
+        </header>
+
+        <div class="admin-row">
+            <div class="admin-caller-card">
+                <span class="admin-caller-label">你目前的真實 IP</span>
+                <strong class="admin-caller-ip">
+                    @(_callerIp?.Ip ?? "—")
+                </strong>
+                @if (_callerIp is not null)
+                {
+                    @if (_callerIp.InWhitelist)
+                    {
+                        <span class="admin-caller-badge ok">✓ 已在白名單</span>
+                    }
+                    else
+                    {
+                        <span class="admin-caller-badge warn">⚠ 尚未加入白名單</span>
+                    }
+                }
+            </div>
+            <div class="admin-caller-actions">
+                <button class="btn-primary"
+                        disabled="@(_busy || _callerIp is null || _callerIp.InWhitelist)"
+                        @onclick="AddMyIpAsync">
+                    一鍵加入我的 IP
+                </button>
+            </div>
+        </div>
+
+        <div class="admin-add-row">
+            <label>手動新增 IP：</label>
+            <input type="text" class="admin-input" placeholder="例：203.0.113.42"
+                   @bind="_manualIp" disabled="@_busy" />
+            <button class="btn-apply" disabled="@(_busy || string.IsNullOrWhiteSpace(_manualIp))"
+                    @onclick="AddManualIpAsync">
+                新增
+            </button>
+        </div>
+
+        @if (!string.IsNullOrEmpty(_whitelistToast))
+        {
+            <div class="@(_whitelistToastIsError ? "settings-error" : "settings-info")">
+                @_whitelistToast
+            </div>
+        }
+
+        <h3 class="admin-sub-title">目前白名單（@(_whitelist?.AllowedIps.Count ?? 0) 筆）</h3>
+        @if (_whitelist is null)
+        {
+            <div class="empty">載入中…</div>
+        }
+        else if (_whitelist.AllowedIps.Count == 0)
+        {
+            <div class="empty admin-empty-warn">
+                ⚠ 空白名單：Middleware 目前是 fail-open（全域放行）。正式部署請至少加一筆。
+            </div>
+        }
+        else
+        {
+            <ul class="admin-ip-list">
+                @foreach (var ip in _whitelist.AllowedIps)
+                {
+                    <li class="admin-ip-item">
+                        <code>@ip</code>
+                        @if (_callerIp is not null &&
+                             string.Equals(ip, _callerIp.Ip, StringComparison.OrdinalIgnoreCase))
+                        {
+                            <span class="admin-ip-self">(你)</span>
+                        }
+                        <button class="btn-danger"
+                                disabled="@_busy"
+                                @onclick="() => RemoveIpAsync(ip)">
+                            移除
+                        </button>
+                    </li>
+                }
+            </ul>
+        }
+    </section>
+
+    @* ─────────── T3：DB 健康 ─────────── *@
+    <section class="panel glass">
+        <header class="panel-header">
+            <h2>💾 資料庫健康</h2>
+            <span class="panel-sub">cryptobot.db · SQLite · VACUUM 可隨時執行</span>
+        </header>
+
+        @if (_dbHealth is null)
+        {
+            <div class="empty">載入中…</div>
+        }
+        else
+        {
+            <div class="admin-db-grid">
+                <div class="admin-db-cell">
+                    <span class="admin-db-label">Data Source</span>
+                    <code class="admin-db-path" title="@_dbHealth.DataSourcePath">@TruncatePath(_dbHealth.DataSourcePath)</code>
+                </div>
+                <div class="admin-db-cell">
+                    <span class="admin-db-label">主檔大小</span>
+                    <strong>@FormatBytes(_dbHealth.MainFileBytes)</strong>
+                </div>
+                <div class="admin-db-cell">
+                    <span class="admin-db-label">合計 (主 + WAL + SHM)</span>
+                    <strong>@FormatBytes(_dbHealth.TotalBytes)</strong>
+                </div>
+                <div class="admin-db-cell">
+                    <span class="admin-db-label">Positions</span>
+                    <strong>@_dbHealth.PositionCount.ToString("N0")</strong>
+                </div>
+                <div class="admin-db-cell">
+                    <span class="admin-db-label">Orders</span>
+                    <strong>@_dbHealth.OrderCount.ToString("N0")</strong>
+                </div>
+                <div class="admin-db-cell">
+                    <span class="admin-db-label">Strategies</span>
+                    <strong>@_dbHealth.StrategyCount.ToString("N0")</strong>
+                </div>
+                <div class="admin-db-cell">
+                    <span class="admin-db-label">Log 檔</span>
+                    <strong>@_dbHealth.LogFileCount 個 · @FormatBytes(_dbHealth.LogTotalBytes)</strong>
+                </div>
+            </div>
+
+            <div class="admin-db-actions">
+                <button class="btn-primary" disabled="@(_busy || _vacuumBusy)" @onclick="RunVacuumAsync">
+                    @(_vacuumBusy ? "執行中…" : "🧹 VACUUM (整理碎片)")
+                </button>
+                <button class="btn-apply" disabled="@_busy" @onclick="ReloadDbHealthAsync">
+                    ↻ 重新量測
+                </button>
+                @if (_vacuumResult is not null)
+                {
+                    <span class="admin-vacuum-result">
+                        回收 <strong>@FormatBytes(_vacuumResult.BytesReclaimed)</strong>
+                        · 耗時 @_vacuumResult.ElapsedMs ms
+                    </span>
+                }
+            </div>
+        }
+    </section>
+
+</div>
+
+@* ─────────── T2：深度交易回溯 ─────────── *@
+<section class="panel glass fade-in" style="margin-top:20px">
+    <header class="panel-header">
+        <h2>🔎 深度交易回溯</h2>
+        <span class="panel-sub">
+            S39 ParametersSnapshot · 顯示每筆歷史持倉當下的「決策模型」＋「鎖定的網格參數」
+        </span>
+    </header>
+
+    @if (_deepPositions is null)
+    {
+        <div class="empty">載入中…</div>
+    }
+    else if (_deepPositions.Count == 0)
+    {
+        <div class="empty">尚無已平倉持倉紀錄 — 等策略跑出第一筆交易再回來。</div>
+    }
+    else
+    {
+        <table class="data-table admin-deep-table">
+            <thead>
+                <tr>
+                    <th>平倉時間</th>
+                    <th>Symbol</th>
+                    <th>Side · Qty</th>
+                    <th>Entry → Close</th>
+                    <th>PnL</th>
+                    <th>模型 (開倉時)</th>
+                    <th>網格參數快照</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var p in _deepPositions)
+                {
+                    <tr>
+                        <td class="admin-deep-time">
+                            @(p.ClosedAtUtc?.ToLocalTime().ToString("MM-dd HH:mm") ?? "—")
+                        </td>
+                        <td><strong>@p.Symbol</strong></td>
+                        <td class="@(p.Side == "Long" ? "pos" : "neg")">
+                            @p.Side · @p.Quantity.ToString("N4")
+                        </td>
+                        <td>
+                            @p.EntryPrice.ToString("N2") → @(p.ExitPrice?.ToString("N2") ?? "—")
+                        </td>
+                        <td class="@(p.RealizedPnL >= 0 ? "pos" : "neg")">
+                            @p.RealizedPnL.ToString("N4")
+                        </td>
+                        <td>
+                            @if (!string.IsNullOrWhiteSpace(p.StrategyType))
+                            {
+                                <span class="admin-model-tag">@p.StrategyType</span>
+                            }
+                            else
+                            {
+                                <span class="panel-sub">—</span>
+                            }
+                        </td>
+                        <td>
+                            @if (p.Snapshot.Count == 0)
+                            {
+                                <span class="panel-sub">（無快照）</span>
+                            }
+                            else
+                            {
+                                <div class="admin-snapshot-grid">
+                                    @foreach (var kv in p.Snapshot)
+                                    {
+                                        <span class="admin-snapshot-kv">
+                                            <span class="admin-snapshot-k">@kv.Key</span>
+                                            <span class="admin-snapshot-v">@kv.Value</span>
+                                        </span>
+                                    }
+                                </div>
+                            }
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+@code {
+    private CallerIpDto? _callerIp;
+    private WhitelistDto? _whitelist;
+    private DbHealthDto? _dbHealth;
+    private DbVacuumResponse? _vacuumResult;
+    private IReadOnlyList<DeepPositionDto>? _deepPositions;
+
+    private string _manualIp = string.Empty;
+    private string? _whitelistToast;
+    private bool _whitelistToastIsError;
+
+    private bool _busy;
+    private bool _vacuumBusy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await Task.WhenAll(
+            ReloadCallerIpAsync(),
+            ReloadWhitelistAsync(),
+            ReloadDbHealthAsync(),
+            ReloadDeepPositionsAsync());
+    }
+
+    private HttpClient CreateClient()
+    {
+        var http = HttpFactory.CreateClient();
+        http.BaseAddress = new Uri(Nav.BaseUri);
+        return http;
+    }
+
+    // ─────────────── T1：IP 白名單 ───────────────
+
+    private async Task ReloadCallerIpAsync()
+    {
+        try
+        {
+            using var http = CreateClient();
+            _callerIp = await http.GetFromJsonAsync<CallerIpDto>("/api/admin/caller-ip");
+        }
+        catch { _callerIp = new CallerIpDto("(fetch failed)", false); }
+    }
+
+    private async Task ReloadWhitelistAsync()
+    {
+        try
+        {
+            using var http = CreateClient();
+            _whitelist = await http.GetFromJsonAsync<WhitelistDto>("/api/admin/whitelist");
+        }
+        catch { _whitelist = new WhitelistDto(Array.Empty<string>()); }
+    }
+
+    private Task AddMyIpAsync()
+    {
+        if (_callerIp is null || string.IsNullOrWhiteSpace(_callerIp.Ip)) return Task.CompletedTask;
+        return AddIpInternalAsync(_callerIp.Ip);
+    }
+
+    private Task AddManualIpAsync()
+    {
+        var ip = _manualIp?.Trim();
+        if (string.IsNullOrWhiteSpace(ip)) return Task.CompletedTask;
+        return AddIpInternalAsync(ip);
+    }
+
+    private async Task AddIpInternalAsync(string ip)
+    {
+        _busy = true;
+        _whitelistToast = null;
+        try
+        {
+            using var http = CreateClient();
+            var resp = await http.PostAsJsonAsync("/api/admin/whitelist", new AddWhitelistRequest(ip));
+            var body = await resp.Content.ReadFromJsonAsync<WhitelistMutationResponse>();
+
+            if (resp.IsSuccessStatusCode && body?.Outcome == "Added")
+            {
+                _whitelistToast = $"✓ 已加入 {ip}（現有 {body.TotalCount} 筆，appsettings.json 已更新）";
+                _whitelistToastIsError = false;
+                _manualIp = string.Empty;
+            }
+            else if (body?.Outcome == "AlreadyExists")
+            {
+                _whitelistToast = $"ℹ {ip} 已在白名單。";
+                _whitelistToastIsError = false;
+            }
+            else if (body?.Outcome == "InvalidFormat")
+            {
+                _whitelistToast = $"✗ 格式錯誤：{ip} 不是合法的 IPv4 / IPv6。";
+                _whitelistToastIsError = true;
+            }
+            else
+            {
+                _whitelistToast = $"✗ 新增失敗：HTTP {(int)resp.StatusCode}";
+                _whitelistToastIsError = true;
+            }
+
+            await Task.WhenAll(ReloadCallerIpAsync(), ReloadWhitelistAsync());
+        }
+        catch (Exception ex)
+        {
+            _whitelistToast = $"✗ 例外：{ex.Message}";
+            _whitelistToastIsError = true;
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task RemoveIpAsync(string ip)
+    {
+        _busy = true;
+        _whitelistToast = null;
+        try
+        {
+            using var http = CreateClient();
+            var resp = await http.DeleteAsync($"/api/admin/whitelist/{Uri.EscapeDataString(ip)}");
+            var body = await resp.Content.ReadFromJsonAsync<WhitelistMutationResponse>();
+
+            if (resp.IsSuccessStatusCode && body?.Outcome == "Removed")
+            {
+                _whitelistToast = $"✓ 已移除 {ip}（剩 {body.TotalCount} 筆）";
+                _whitelistToastIsError = false;
+            }
+            else if (body?.Outcome == "NotFound")
+            {
+                _whitelistToast = $"ℹ {ip} 已不在名單內。";
+                _whitelistToastIsError = false;
+            }
+            else
+            {
+                _whitelistToast = $"✗ 移除失敗：HTTP {(int)resp.StatusCode}";
+                _whitelistToastIsError = true;
+            }
+
+            await Task.WhenAll(ReloadCallerIpAsync(), ReloadWhitelistAsync());
+        }
+        catch (Exception ex)
+        {
+            _whitelistToast = $"✗ 例外：{ex.Message}";
+            _whitelistToastIsError = true;
+        }
+        finally { _busy = false; }
+    }
+
+    // ─────────────── T3：DB 健康 / VACUUM ───────────────
+
+    private async Task ReloadDbHealthAsync()
+    {
+        try
+        {
+            using var http = CreateClient();
+            _dbHealth = await http.GetFromJsonAsync<DbHealthDto>("/api/admin/db-health");
+        }
+        catch
+        {
+            _dbHealth = new DbHealthDto("(fetch failed)", 0, 0, 0, 0, 0, 0, 0);
+        }
+    }
+
+    private async Task RunVacuumAsync()
+    {
+        _vacuumBusy = true;
+        _vacuumResult = null;
+        try
+        {
+            using var http = CreateClient();
+            var resp = await http.PostAsync("/api/admin/db-vacuum", content: null);
+            if (resp.IsSuccessStatusCode)
+            {
+                _vacuumResult = await resp.Content.ReadFromJsonAsync<DbVacuumResponse>();
+            }
+            await ReloadDbHealthAsync();
+        }
+        finally { _vacuumBusy = false; }
+    }
+
+    // ─────────────── T2：深度交易回溯 ───────────────
+
+    private async Task ReloadDeepPositionsAsync()
+    {
+        try
+        {
+            using var http = CreateClient();
+            var rows = await http.GetFromJsonAsync<List<DeepPositionDto>>("/api/admin/positions-deep?limit=50");
+            _deepPositions = rows ?? new();
+        }
+        catch { _deepPositions = new List<DeepPositionDto>(); }
+    }
+
+    // ─────────────── helpers ───────────────
+
+    /// <summary>
+    /// 把 bytes 格式化成 KB / MB / GB — 1024 進位，閾值取整避免 "0.9 KB" 這種尷尬分段。
+    /// </summary>
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        double kb = bytes / 1024.0;
+        if (kb < 1024) return kb.ToString("0.0", CultureInfo.InvariantCulture) + " KB";
+        double mb = kb / 1024.0;
+        if (mb < 1024) return mb.ToString("0.00", CultureInfo.InvariantCulture) + " MB";
+        double gb = mb / 1024.0;
+        return gb.ToString("0.00", CultureInfo.InvariantCulture) + " GB";
+    }
+
+    /// <summary>DB 路徑可能很長，UI 上只顯示最後三段（避免撐爆 cell）。</summary>
+    private static string TruncatePath(string full)
+    {
+        if (string.IsNullOrEmpty(full)) return "—";
+        var segs = full.Replace('\\', '/').Split('/');
+        if (segs.Length <= 3) return full;
+        return "…/" + string.Join("/", segs[^3..]);
+    }
+}

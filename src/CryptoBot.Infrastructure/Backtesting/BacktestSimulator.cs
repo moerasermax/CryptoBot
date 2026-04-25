@@ -204,6 +204,11 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
     public Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<ExchangePositionInfo>>(Array.Empty<ExchangePositionInfo>());
 
+    // 回測不模擬限價掛單佇列（市價成交後立即結算），對帳命令在回測情境下一律回空集合。
+    public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(
+        Symbol symbol, CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
+
     private Kline RequireCurrent() => _currentKline
         ?? throw new InvalidOperationException(
             "BacktestSimulator has no current kline; BacktestEngine must call AdvanceTo() before any price / order call.");

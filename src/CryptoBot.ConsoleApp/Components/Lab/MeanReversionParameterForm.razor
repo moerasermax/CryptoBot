@@ -56,7 +56,12 @@
         * Math.Max(0, Count(_oversoldMin, _oversoldMax, _oversoldStep))
         * Math.Max(0, Count(_overboughtMin, _overboughtMax, _overboughtStep));
 
-    protected override Task OnInitializedAsync() => NotifyChangedAsync();
+    // S55 T2：領取式持久化 — StrategyKey="mean-reversion"，自 LabStateContainer 拉回網格快照。
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await RestoreGridFromCacheAsync())
+            await NotifyChangedAsync();
+    }
 
     private Task OnChanged() => NotifyChangedAsync();
 

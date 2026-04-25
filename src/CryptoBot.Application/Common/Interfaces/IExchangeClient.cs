@@ -82,6 +82,13 @@ public interface IExchangeClient
     /// <summary>查詢訂單狀態 (成交進度)</summary>
     Task RefreshOrderStatusAsync(Order order, CancellationToken ct = default);
 
+    /// <summary>
+    /// S61：查詢交易所上當前**活躍**（未完全成交 / 未取消）的掛單，用於本地 vs 雲端對帳、
+    /// 偵測幽靈訂單（雲端有、本地無）或本地殭屍訂單（本地有、雲端無）。
+    /// 回傳僅含 <see cref="OrderStatus.New"/> / <see cref="OrderStatus.PartiallyFilled"/> 的條目。
+    /// </summary>
+    Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default);
+
     // ===== 持倉 =====
 
     /// <summary>取得交易所側的所有持倉 (用於對帳)</summary>
@@ -112,3 +119,18 @@ public sealed record ExchangePositionInfo(
     decimal UnrealizedPnL,
     decimal LiquidationPrice,
     int Leverage);
+
+/// <summary>
+/// S61：交易所側的活躍訂單資訊 — 用於 Ghost Order Inspector 的本地 vs 雲端對帳。
+/// ExchangeOrderId 是雙方共通的主鍵。
+/// </summary>
+public sealed record ExchangeOpenOrderInfo(
+    string ExchangeOrderId,
+    Symbol Symbol,
+    OrderSide Side,
+    PositionSide PositionSide,
+    OrderStatus Status,
+    decimal Quantity,
+    decimal QuantityFilled,
+    decimal? Price,
+    DateTime UpdateTime);
