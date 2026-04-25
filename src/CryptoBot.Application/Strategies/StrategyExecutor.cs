@@ -1,7 +1,9 @@
 using System.Text.Json;
+using CryptoBot.Application.Common.Exceptions;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Realtime;
 using CryptoBot.Application.RiskManagement;
+using CryptoBot.Application.Trading;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
 using CryptoBot.Domain.Aggregates.PositionAggregate;
@@ -45,6 +47,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly INotificationService _notifications;
     private readonly IRealtimeBroadcaster _broadcaster;
+    private readonly IClientOrderIdGenerator _clientOrderIdGenerator;
     private readonly ILogger<StrategyExecutor> _logger;
 
     private readonly SemaphoreSlim _processLock = new(1, 1);
@@ -65,6 +68,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
         IServiceScopeFactory scopeFactory,
         INotificationService notifications,
         IRealtimeBroadcaster broadcaster,
+        IClientOrderIdGenerator clientOrderIdGenerator,
         ILogger<StrategyExecutor> logger)
     {
         _strategy = strategy;
@@ -75,6 +79,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
         _scopeFactory = scopeFactory;
         _notifications = notifications;
         _broadcaster = broadcaster;
+        _clientOrderIdGenerator = clientOrderIdGenerator;
         _logger = logger;
     }
 
@@ -168,9 +173,19 @@ public sealed class StrategyExecutor : IStrategyExecutor
             return;
         }
 
+        // S66-C：在「真正開始處理」最早處生成 TraceId（前面早退路徑屬「不關我事」，不需追蹤）。
+        // 用 12 字短 hash 平衡可讀性與唯一性（4.7e14 命名空間，單一策略終生不可能撞）。
+        // BeginScope 是 MS.Logging 框架抽象 — UseSerilog 會自動把它橋接到 Serilog LogContext，
+        // 讓 Enrich.FromLogContext() 取到 TraceId，避免 Application 直接相依 Serilog（IRON ⑥）。
+        var traceId = Guid.NewGuid().ToString("N").Substring(0, 12);
+        using var traceScope = _logger.BeginScope(new Dictionary<string, object>
+        {
+            ["TraceId"] = traceId
+        });
+
         try
         {
-            await ProcessKlineAsync(kline).ConfigureAwait(false);
+            await ProcessKlineAsync(kline, traceId).ConfigureAwait(false);
         }
         finally
         {
@@ -178,7 +193,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
         }
     }
 
-    private async Task ProcessKlineAsync(Kline kline)
+    private async Task ProcessKlineAsync(Kline kline, string traceId)
     {
         try
         {
@@ -243,7 +258,8 @@ public sealed class StrategyExecutor : IStrategyExecutor
                     SignalType: signal.Type.ToString(),
                     Note: signal.Reason,
                     // S45：Dashboard 靠這欄位即時同步卡片的模型標籤，不必重拉 /api/strategies
-                    StrategyType: _strategy.StrategyType), CancellationToken.None).ConfigureAwait(false);
+                    StrategyType: _strategy.StrategyType,
+                    TraceId: traceId), CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -260,7 +276,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
                 "Strategy {Name} signal: {Signal}",
                 _strategy.Name, signal);
 
-            await HandleSignalAsync(sp, signal).ConfigureAwait(false);
+            await HandleSignalAsync(sp, signal, kline.CloseTime, traceId).ConfigureAwait(false);
             _consecutiveErrors = 0;
         }
         catch (Exception ex)
@@ -279,7 +295,8 @@ public sealed class StrategyExecutor : IStrategyExecutor
                     StrategyName: _strategy.Name,
                     OccurredAtUtc: DateTime.UtcNow,
                     Symbol: _strategy.Configuration.Symbol.BingXFormat,
-                    ErrorMessage: ex.Message), CancellationToken.None).ConfigureAwait(false);
+                    ErrorMessage: ex.Message,
+                    TraceId: traceId), CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception broadcastEx)
             {
@@ -297,7 +314,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
         }
     }
 
-    private async Task HandleSignalAsync(IServiceProvider sp, TradingSignal signal)
+    private async Task HandleSignalAsync(IServiceProvider sp, TradingSignal signal, DateTime signalCloseTimeUtc, string traceId)
     {
         var sizer = sp.GetRequiredService<IOrderSizer>();
         var risk = sp.GetRequiredService<IRiskManager>();
@@ -336,7 +353,8 @@ public sealed class StrategyExecutor : IStrategyExecutor
                     StrategyName: _strategy.Name,
                     OccurredAtUtc: DateTime.UtcNow,
                     Symbol: _strategy.Configuration.Symbol.BingXFormat,
-                    ErrorMessage: $"[SIZE] {sizeReason}"), CancellationToken.None).ConfigureAwait(false);
+                    ErrorMessage: $"[SIZE] {sizeReason}",
+                    TraceId: traceId), CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception broadcastEx)
             {
@@ -382,7 +400,8 @@ public sealed class StrategyExecutor : IStrategyExecutor
                     StrategyName: _strategy.Name,
                     OccurredAtUtc: DateTime.UtcNow,
                     Symbol: _strategy.Configuration.Symbol.BingXFormat,
-                    ErrorMessage: $"[RISK] {reason}"), CancellationToken.None).ConfigureAwait(false);
+                    ErrorMessage: $"[RISK] {reason}",
+                    TraceId: traceId), CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception broadcastEx)
             {
@@ -392,18 +411,57 @@ public sealed class StrategyExecutor : IStrategyExecutor
             return;
         }
 
-        // 3) 建 Order aggregate
+        // 3) 建 Order aggregate — S66-A：採決定性 ClientOrderId。同一根 K 線 + 同策略 + 同方向
+        //    永遠產出同樣的 ID；網路逾時或 SDK 自動重試時，BingX 以 clientOrderId 去重，本地 DB
+        //    以 Unique 索引攔截，雙層防線確保「交易所最多一筆真實訂單」。
         var (orderSide, positionSide) = MapSignalToOrderSides(signal.Type);
+        var clientOrderId = _clientOrderIdGenerator.Generate(
+            strategyId: _strategy.Id,
+            symbol: signal.Symbol,
+            side: orderSide,
+            positionSide: positionSide,
+            signalCloseTimeUtc: signalCloseTimeUtc);
         var order = Order.CreateMarketOrder(
             symbol: signal.Symbol,
             side: orderSide,
             positionSide: positionSide,
             quantity: qty,
-            strategyId: _strategy.Id);
+            strategyId: _strategy.Id,
+            clientOrderId: clientOrderId,
+            traceId: traceId);
 
-        // 4) 下單
-        await _exchange.PlaceOrderAsync(order, CancellationToken.None).ConfigureAwait(false);
+        // 4) 下單 — S66-A T1.5：先持久化 Pending，再呼叫交易所。
+        //    原流程「先 PlaceOrder 後 AddAsync」有鬼單風險：呼叫成功後若 process crash，
+        //    本地零紀錄但交易所已有倉位；下次啟動後會以「幽靈單」形式出現（S61 診斷過的場景）。
+        //    改為：
+        //      a. AddAsync → SaveChanges（DB 端 Unique 索引若命中代表重複訊號，直接自癒）
+        //      b. 呼叫交易所；SDK 端若回 duplicate，查交易所端實際狀態對齊本地
         await orderRepo.AddAsync(order, CancellationToken.None).ConfigureAwait(false);
+
+        try
+        {
+            await uow.SaveChangesAsync(CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (DuplicateClientOrderIdException dupEx)
+        {
+            await HandleDuplicateClientOrderIdAsync(sp, order, signal, orderSide, positionSide, dupEx.Message, traceId)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            await _exchange.PlaceOrderAsync(order, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (DuplicateClientOrderIdException dupEx)
+        {
+            // 交易所端撞到 clientOrderId（極罕見：本地剛寫入但交易所紀錄仍在、或多節點競爭）
+            // 策略維持 Running，走自癒分支對齊狀態
+            await HandleDuplicateClientOrderIdAsync(sp, order, signal, orderSide, positionSide, dupEx.Message, traceId)
+                .ConfigureAwait(false);
+            return;
+        }
+
         _cooldownTracker.RecordOrderPlaced(_strategy.Id);
 
         // 5) S99-S43 T4：開單後必須「立刻建立本地 Position」— 否則 Dashboard 的
@@ -494,7 +552,8 @@ public sealed class StrategyExecutor : IStrategyExecutor
                 PositionSide: positionSide.ToString(),
                 Quantity: qty.Value,
                 Price: order.AverageFillPrice?.Value ?? signal.SuggestedPrice.Value,
-                StrategyName: _strategy.Name), CancellationToken.None).ConfigureAwait(false);
+                StrategyName: _strategy.Name,
+                TraceId: traceId), CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -543,6 +602,79 @@ public sealed class StrategyExecutor : IStrategyExecutor
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error during self-stop of {Name}.", _strategy.Name);
+        }
+    }
+
+    /// <summary>
+    /// S66-A：冪等自癒分支。當 DB 或交易所端回報 clientOrderId 衝突時，走這個流程：
+    ///   1. 以 clientOrderId 查交易所端真實狀態（可能已成交 / 已取消）
+    ///   2. 記 log + 廣播 <c>[ORDER]</c> 前綴事件（呼應 IRON ⑤：不靜默失敗）
+    ///   3. 通知使用者
+    ///   4. 策略維持 Running — 絕不呼叫 <c>_strategy.ReportError</c>（memory: feedback_risk_reject_no_autostop）
+    /// </summary>
+    private async Task HandleDuplicateClientOrderIdAsync(
+        IServiceProvider sp,
+        Order order,
+        TradingSignal signal,
+        OrderSide orderSide,
+        PositionSide positionSide,
+        string duplicateReason,
+        string traceId)
+    {
+        var clientOrderId = order.ClientOrderId ?? "(unknown)";
+
+        _logger.LogWarning(
+            "S66-A idempotent hit: ClientOrderId {Cid} already placed. Reason={Reason}. Querying exchange state…",
+            clientOrderId, duplicateReason);
+
+        ExchangeOrderSnapshot? remote = null;
+        try
+        {
+            remote = await _exchange
+                .GetOrderByClientOrderIdAsync(signal.Symbol, clientOrderId, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "S66-A: GetOrderByClientOrderIdAsync failed for Cid {Cid}; local DB keeps original record.",
+                clientOrderId);
+        }
+
+        var remoteSummary = remote is null
+            ? "exchange had no record"
+            : $"exchange status={remote.Status}, filled={remote.QuantityFilled}/{remote.Quantity}";
+
+        // 通知 + 廣播雙軌 — [ORDER] 前綴沿用 S56/S59 模式
+        try
+        {
+            await _notifications.NotifyAsync(
+                "Duplicate order suppressed",
+                $"{clientOrderId} — {remoteSummary}",
+                NotificationLevel.Warning,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception notifyEx)
+        {
+            _logger.LogWarning(notifyEx,
+                "Failed to notify idempotent-hit for {Name}.", _strategy.Name);
+        }
+
+        try
+        {
+            await _broadcaster.BroadcastStrategyEvaluationFailedAsync(new StrategyEvaluationFailedUpdate(
+                StrategyId: _strategy.Id,
+                StrategyName: _strategy.Name,
+                OccurredAtUtc: DateTime.UtcNow,
+                Symbol: signal.Symbol.BingXFormat,
+                ErrorMessage: $"[ORDER] Duplicate clientOrderId {clientOrderId} — {remoteSummary}",
+                TraceId: traceId),
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception broadcastEx)
+        {
+            _logger.LogWarning(broadcastEx,
+                "Failed to broadcast idempotent-hit for {Name}.", _strategy.Name);
         }
     }
 

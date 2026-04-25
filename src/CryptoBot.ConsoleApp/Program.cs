@@ -2,6 +2,7 @@ using CryptoBot.Application;
 using CryptoBot.Application.Realtime;
 using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Strategies;
+using CryptoBot.Application.Synchronization;
 using CryptoBot.ConsoleApp.Api;
 using CryptoBot.ConsoleApp.Components;
 using CryptoBot.ConsoleApp.Lab;
@@ -42,11 +43,16 @@ public static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        // S66-C：Enrich.FromLogContext() 把 ILogger.BeginScope 推進來的 properties（含 TraceId）
+        // 提到 log event 層級；outputTemplate 加 [TraceId:{TraceId}] 後綴讓終端機可一眼看到。
+        // 沒有 TraceId 的 log（例如啟動期）會印 [TraceId:] 留白 — 非 K 線 tick 路徑的訊息不需追蹤。
         Log.Logger = new LoggerConfiguration()
             .MinimumLevel.Information()
             .MinimumLevel.Override("Microsoft.Hosting.Lifetime", Serilog.Events.LogEventLevel.Information)
             .MinimumLevel.Override("Microsoft.AspNetCore", Serilog.Events.LogEventLevel.Warning)
-            .WriteTo.Console()
+            .Enrich.FromLogContext()
+            .WriteTo.Console(outputTemplate:
+                "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} [TraceId: {TraceId}]{NewLine}{Exception}")
             .CreateLogger();
 
         try
@@ -141,6 +147,12 @@ public static class Program
 
             // S27：交易所 REST 延遲探測（每 15s → DashboardEventBus → GlobalStatusBar）
             builder.Services.AddHostedService<ExchangeHealthCheckService>();
+
+            // S66-B：訂單對帳服務（每 1 min 巡檢 Pending / 殭屍訂單，與 AccountSynchronizer 互補的兜底機制）
+            builder.Services.AddHostedService<OrderReconciliationService>();
+
+            // S66-D：NTP 時鐘漂移監控（啟動立即 sync 一次 + 每 5 min tick；偏差 > 1000ms 由 RiskManager 攔截）
+            builder.Services.AddHostedService<NtpDriftMonitor>();
 
             // S28 T1：日損熔斷監控（每 1 分鐘巡檢 → StopAll + 紫色 Discord 通知）
             builder.Services.AddHostedService<SafetyBreakerMonitor>();

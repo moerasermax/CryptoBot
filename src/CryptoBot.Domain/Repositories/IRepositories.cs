@@ -16,6 +16,13 @@ public interface IOrderRepository
 {
     Task<Order?> GetByIdAsync(Guid id, CancellationToken ct = default);
     Task<Order?> GetByExchangeOrderIdAsync(string exchangeOrderId, CancellationToken ct = default);
+
+    /// <summary>
+    /// S66-A：依本地決定性產生的 <see cref="Order.ClientOrderId"/> 取單。
+    /// 用於 DiagnosticTool <c>s66a_check-order</c> 與冪等性對帳。
+    /// </summary>
+    Task<Order?> GetByClientOrderIdAsync(string clientOrderId, CancellationToken ct = default);
+
     Task<IReadOnlyList<Order>> GetActiveOrdersAsync(CancellationToken ct = default);
     Task<IReadOnlyList<Order>> GetBySymbolAsync(Symbol symbol, CancellationToken ct = default);
     Task<IReadOnlyList<Order>> GetByStrategyIdAsync(Guid strategyId, CancellationToken ct = default);

@@ -21,6 +21,9 @@ public sealed class OrderRepository : IOrderRepository
     public Task<Order?> GetByExchangeOrderIdAsync(string exchangeOrderId, CancellationToken ct = default) =>
         _ctx.Orders.FirstOrDefaultAsync(o => o.ExchangeOrderId == exchangeOrderId, ct);
 
+    public Task<Order?> GetByClientOrderIdAsync(string clientOrderId, CancellationToken ct = default) =>
+        _ctx.Orders.FirstOrDefaultAsync(o => o.ClientOrderId == clientOrderId, ct);
+
     public async Task<IReadOnlyList<Order>> GetActiveOrdersAsync(CancellationToken ct = default)
     {
         var list = await _ctx.Orders
@@ -75,6 +78,10 @@ public sealed class OrderRepository : IOrderRepository
     /// order tick UPDATE 搶鎖窗口會被放大。改讓 EF 自己的 change tracker 偵測
     /// 只 UPDATE 實際變動的欄位（Status / FilledQuantity / AverageFillPrice 等）。
     /// Detached 時仍 reattach 一次。
+    ///
+    /// 註：S66-B 第二輪 hotfix 一度加過「Tracked+Unchanged → 強制 Modified」分支，
+    /// 後來實證根因是 PM 注入測試 SQL 用了小寫 Guid（與 EF 大寫儲存格式不符），
+    /// 不是 ChangeTracker 漏抓 —— 已回退。
     /// </summary>
     public Task UpdateAsync(Order order, CancellationToken ct = default)
     {

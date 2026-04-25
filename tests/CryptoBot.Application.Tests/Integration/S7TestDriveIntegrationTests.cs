@@ -6,6 +6,7 @@ using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Strategies;
 using CryptoBot.Application.Strategies.SmaCrossover;
 using CryptoBot.Application.Synchronization;
+using CryptoBot.Application.Trading;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
 using CryptoBot.Domain.Aggregates.PositionAggregate;
@@ -156,6 +157,7 @@ public class S7TestDriveIntegrationTests
             services.AddScoped<IOrderSizer, OrderSizer>();
             services.AddSingleton<IStrategy, SmaCrossoverStrategy>();
             services.AddSingleton<IStrategyFactory, StrategyFactory>();
+            services.AddSingleton<IClientOrderIdGenerator, DeterministicClientOrderIdGenerator>();
             services.AddSingleton<IStrategyExecutorFactory, StrategyExecutorFactory>();
             services.AddSingleton<IAccountSynchronizer, AccountSynchronizer>();
             services.AddSingleton<INotificationService, NoOpNotificationService>();
@@ -321,6 +323,13 @@ internal sealed class PipelineFakeExchangeClient : IExchangeClient
         Task.FromResult<IReadOnlyList<ExchangePositionInfo>>(Array.Empty<ExchangePositionInfo>());
     public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
+
+    public Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default) =>
+        Task.FromResult<ExchangeOrderSnapshot?>(null);
+
+    public Task<DateTime> GetServerTimeAsync(CancellationToken ct = default) =>
+        Task.FromResult(DateTime.UtcNow);
 }
 
 internal sealed class PipelineInMemoryOrderRepo : IOrderRepository
@@ -332,6 +341,9 @@ internal sealed class PipelineInMemoryOrderRepo : IOrderRepository
 
     public Task<Order?> GetByExchangeOrderIdAsync(string exchangeOrderId, CancellationToken ct = default) =>
         Task.FromResult(Store.Values.FirstOrDefault(o => o.ExchangeOrderId == exchangeOrderId));
+
+    public Task<Order?> GetByClientOrderIdAsync(string clientOrderId, CancellationToken ct = default) =>
+        Task.FromResult(Store.Values.FirstOrDefault(o => o.ClientOrderId == clientOrderId));
 
     public Task<IReadOnlyList<Order>> GetActiveOrdersAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Order>>(Store.Values.Where(o => o.IsActive).ToList());

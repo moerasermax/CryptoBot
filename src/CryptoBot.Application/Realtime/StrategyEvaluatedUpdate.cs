@@ -22,4 +22,5 @@ public sealed record StrategyEvaluatedUpdate(
     decimal LastClosePrice,
     string SignalType,
     string? Note,
-    string StrategyType);
+    string StrategyType,
+    string? TraceId = null);

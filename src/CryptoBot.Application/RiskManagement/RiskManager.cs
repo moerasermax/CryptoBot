@@ -1,3 +1,4 @@
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Aggregates.PositionAggregate;
 using CryptoBot.Domain.Aggregates.StrategyAggregate;
@@ -40,21 +41,27 @@ public interface IRiskManager
 
 public sealed class RiskManager : IRiskManager
 {
+    /// <summary>S66-D：時鐘漂移攔截閾值。超過此值即拒下單，防止 BingX 簽章因時間不對齊而失敗。</summary>
+    internal const double ClockSkewRejectThresholdMs = 1000d;
+
     private readonly IExchangeClient _exchange;
     private readonly IPositionRepository _positionRepository;
     private readonly IStrategyCooldownTracker _cooldownTracker;
     private readonly RiskLimits _limits;
+    private readonly IClockSkewState? _skewState;
 
     public RiskManager(
         IExchangeClient exchange,
         IPositionRepository positionRepository,
         IStrategyCooldownTracker cooldownTracker,
-        RiskLimits limits)
+        RiskLimits limits,
+        IClockSkewState? skewState = null)
     {
         _exchange = exchange;
         _positionRepository = positionRepository;
         _cooldownTracker = cooldownTracker;
         _limits = limits;
+        _skewState = skewState;
     }
 
     public async Task<RiskCheckResult> CheckBeforeOpenAsync(
@@ -63,6 +70,17 @@ public sealed class RiskManager : IRiskManager
         Quantity plannedQuantity,
         CancellationToken ct = default)
     {
+        // S66-D：時鐘漂移檢查 — 比 cooldown 更早做（最便宜，純記憶體讀）。
+        // 若已同步過至少一次且偏差 > 1000ms 則攔截，防止 BingX 簽章因時間不對齊而失敗。
+        // 「未同步過」的早期啟動窗口不擋（不該因 NTP 監控還沒跑就誤殺下單）。
+        if (_skewState is not null && _skewState.IsSynced)
+        {
+            var skewMs = _skewState.CurrentOffset.TotalMilliseconds;
+            if (Math.Abs(skewMs) > ClockSkewRejectThresholdMs)
+                return RiskCheckResult.Rejected(
+                    $"NTP Drift detected (Skew: {(long)skewMs}ms). Order rejected for safety.");
+        }
+
         // 0. 冷卻時間 — 最便宜的檢查，先做。
         if (_cooldownTracker.IsInCooldown(strategy.Id, strategy.Configuration.CooldownPeriod))
             return RiskCheckResult.Rejected(

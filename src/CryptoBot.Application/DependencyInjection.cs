@@ -13,6 +13,7 @@ using CryptoBot.Application.Strategies.PriceAction;
 using CryptoBot.Application.Strategies.SmaCrossover;
 using CryptoBot.Application.Strategies.TrendFollowing;
 using CryptoBot.Application.Synchronization;
+using CryptoBot.Application.Trading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -43,8 +44,14 @@ public static class DependencyInjection
         // S28 T1：日損熔斷共享狀態（Singleton — 跨 API / Monitor / Host 同步）
         services.AddSingleton<ISafetyBreakerState, SafetyBreakerState>();
 
+        // S66-D：本地與交易所時鐘漂移狀態（Singleton — NtpDriftMonitor 寫入、RiskManager 讀取）
+        services.AddSingleton<IClockSkewState, ClockSkewState>();
+
         services.AddScoped<IRiskManager, RiskManager>();
         services.AddScoped<IOrderSizer, OrderSizer>();
+
+        // S66-A：決定性 ClientOrderId 生成器 — 無狀態 hash 計算，Singleton 合適。
+        services.AddSingleton<IClientOrderIdGenerator, DeterministicClientOrderIdGenerator>();
 
         services.AddSingleton<IStrategyExecutorFactory, StrategyExecutorFactory>();
 

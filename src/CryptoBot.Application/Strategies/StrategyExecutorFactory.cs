@@ -1,6 +1,7 @@
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Realtime;
 using CryptoBot.Application.RiskManagement;
+using CryptoBot.Application.Trading;
 using CryptoBot.Domain.Aggregates.StrategyAggregate;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -21,6 +22,7 @@ public sealed class StrategyExecutorFactory : IStrategyExecutorFactory
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly INotificationService _notifications;
     private readonly IRealtimeBroadcaster _broadcaster;
+    private readonly IClientOrderIdGenerator _clientOrderIdGenerator;
     private readonly ILoggerFactory _loggerFactory;
 
     public StrategyExecutorFactory(
@@ -30,6 +32,7 @@ public sealed class StrategyExecutorFactory : IStrategyExecutorFactory
         IServiceScopeFactory scopeFactory,
         INotificationService notifications,
         IRealtimeBroadcaster broadcaster,
+        IClientOrderIdGenerator clientOrderIdGenerator,
         ILoggerFactory loggerFactory)
     {
         _marketData = marketData;
@@ -38,6 +41,7 @@ public sealed class StrategyExecutorFactory : IStrategyExecutorFactory
         _scopeFactory = scopeFactory;
         _notifications = notifications;
         _broadcaster = broadcaster;
+        _clientOrderIdGenerator = clientOrderIdGenerator;
         _loggerFactory = loggerFactory;
     }
 
@@ -55,6 +59,7 @@ public sealed class StrategyExecutorFactory : IStrategyExecutorFactory
             _scopeFactory,
             _notifications,
             _broadcaster,
+            _clientOrderIdGenerator,
             _loggerFactory.CreateLogger<StrategyExecutor>());
     }
 }

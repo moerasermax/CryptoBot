@@ -1,4 +1,7 @@
+using CryptoBot.Application.Common.Exceptions;
+using CryptoBot.Domain.Aggregates.OrderAggregate;
 using CryptoBot.Domain.Repositories;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
@@ -24,8 +27,17 @@ public sealed class UnitOfWork : IUnitOfWork, IAsyncDisposable
         _logger = logger;
     }
 
-    public Task<int> SaveChangesAsync(CancellationToken ct = default) =>
-        _ctx.SaveChangesAsync(ct);
+    public async Task<int> SaveChangesAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            return await _ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        catch (DbUpdateException ex) when (TryExtractDuplicateClientOrderId(ex, out var clientOrderId))
+        {
+            throw new DuplicateClientOrderIdException(clientOrderId, ex);
+        }
+    }
 
     /// <summary>
     /// S53 T1：樂觀併發重試。短暫的 DbUpdateConcurrencyException 通常源自「同一列被
@@ -53,6 +65,13 @@ public sealed class UnitOfWork : IUnitOfWork, IAsyncDisposable
             try
             {
                 return await _ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+            }
+            catch (DbUpdateException ex) when (TryExtractDuplicateClientOrderId(ex, out var clientOrderId))
+            {
+                // S66-A：唯一索引衝突屬「業務可預期狀態」，不重試也不再拋 EF 例外，
+                // 改丟 DuplicateClientOrderIdException 讓 Application 層走自癒分支
+                // （查交易所端狀態 → 對齊本地）。
+                throw new DuplicateClientOrderIdException(clientOrderId, ex);
             }
             catch (DbUpdateConcurrencyException ex) when (attempt < maxAttempts)
             {
@@ -113,6 +132,35 @@ public sealed class UnitOfWork : IUnitOfWork, IAsyncDisposable
         {
             await DisposeCurrentTxAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// S66-A：在 SaveChanges 噴出的 <see cref="DbUpdateException"/> 中嗅探「ClientOrderId
+    /// 唯一索引衝突」。命中時回 <c>true</c> 並回填 <paramref name="clientOrderId"/>，
+    /// 由呼叫端轉拋 <see cref="DuplicateClientOrderIdException"/>。
+    ///
+    /// 偵測順序：
+    ///   1. 先看 <c>SqliteException.SqliteErrorCode == 19</c>（SQLITE_CONSTRAINT），訊息含 "ClientOrderId"
+    ///   2. 再看 <see cref="DbUpdateException.Entries"/> 中是否為 <see cref="Order"/> 且其
+    ///      <see cref="Order.ClientOrderId"/> 已被其他列佔用
+    /// </summary>
+    private bool TryExtractDuplicateClientOrderId(DbUpdateException ex, out string clientOrderId)
+    {
+        clientOrderId = string.Empty;
+
+        if (ex.InnerException is SqliteException sqliteEx
+            && sqliteEx.SqliteErrorCode == 19
+            && sqliteEx.Message.Contains("ClientOrderId", StringComparison.OrdinalIgnoreCase))
+        {
+            var orderEntry = ex.Entries.FirstOrDefault(e => e.Entity is Order);
+            if (orderEntry?.Entity is Order order && !string.IsNullOrEmpty(order.ClientOrderId))
+            {
+                clientOrderId = order.ClientOrderId;
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private async Task DisposeCurrentTxAsync()

@@ -12,4 +12,5 @@ public sealed record StrategyEvaluationFailedUpdate(
     string StrategyName,
     DateTime OccurredAtUtc,
     string Symbol,
-    string ErrorMessage);
+    string ErrorMessage,
+    string? TraceId = null);

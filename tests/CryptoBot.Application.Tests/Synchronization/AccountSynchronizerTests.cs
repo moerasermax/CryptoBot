@@ -480,6 +480,13 @@ internal sealed class SyncFakeExchangeClient : IExchangeClient
 
     public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
+
+    public Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default) =>
+        Task.FromResult<ExchangeOrderSnapshot?>(null);
+
+    public Task<DateTime> GetServerTimeAsync(CancellationToken ct = default) =>
+        Task.FromResult(DateTime.UtcNow);
 }
 
 internal sealed class StatefulOrderRepo : IOrderRepository
@@ -498,6 +505,9 @@ internal sealed class StatefulOrderRepo : IOrderRepository
 
     public Task<Order?> GetByExchangeOrderIdAsync(string exchangeOrderId, CancellationToken ct = default) =>
         Task.FromResult(_byExchangeId.TryGetValue(exchangeOrderId, out var o) ? o : null);
+
+    public Task<Order?> GetByClientOrderIdAsync(string clientOrderId, CancellationToken ct = default) =>
+        Task.FromResult<Order?>(_byExchangeId.Values.FirstOrDefault(o => o.ClientOrderId == clientOrderId));
 
     public Task<IReadOnlyList<Order>> GetActiveOrdersAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Order>>(_byExchangeId.Values.Where(o => o.IsActive).ToList());
@@ -528,6 +538,7 @@ internal sealed class ThrowingOrderRepo : IOrderRepository
 {
     public Task<Order?> GetByIdAsync(Guid id, CancellationToken ct = default) => throw new InvalidOperationException("boom");
     public Task<Order?> GetByExchangeOrderIdAsync(string exchangeOrderId, CancellationToken ct = default) => throw new InvalidOperationException("boom");
+    public Task<Order?> GetByClientOrderIdAsync(string clientOrderId, CancellationToken ct = default) => throw new InvalidOperationException("boom");
     public Task<IReadOnlyList<Order>> GetActiveOrdersAsync(CancellationToken ct = default) => throw new InvalidOperationException("boom");
     public Task<IReadOnlyList<Order>> GetBySymbolAsync(Symbol symbol, CancellationToken ct = default) => throw new InvalidOperationException("boom");
     public Task<IReadOnlyList<Order>> GetByStrategyIdAsync(Guid strategyId, CancellationToken ct = default) => throw new InvalidOperationException("boom");

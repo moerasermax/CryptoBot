@@ -201,6 +201,16 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
     public Task RefreshOrderStatusAsync(Order order, CancellationToken ct = default)
         => Task.CompletedTask;
 
+    // S66-A：回測不會碰到「網路逾時 → retry → 重複 clientOrderId」的場景，永遠回 null
+    // 表示該 ID 在交易所端不存在；上層自癒分支不會被觸發。
+    public Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default)
+        => Task.FromResult<ExchangeOrderSnapshot?>(null);
+
+    // S66-D：回測本身不會發生時鐘漂移，永遠回 UtcNow（模擬伺服器與本地完全同步）
+    public Task<DateTime> GetServerTimeAsync(CancellationToken ct = default)
+        => Task.FromResult(DateTime.UtcNow);
+
     public Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<ExchangePositionInfo>>(Array.Empty<ExchangePositionInfo>());
 

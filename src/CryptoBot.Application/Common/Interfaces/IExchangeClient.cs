@@ -69,6 +69,13 @@ public interface IExchangeClient
     /// <summary>取得合約交易規格 (最小下單量、精度等)</summary>
     Task<SymbolTradingRules> GetTradingRulesAsync(Symbol symbol, CancellationToken ct = default);
 
+    /// <summary>
+    /// S66-D：查詢交易所伺服器目前 UTC 時間，用於偵測本地時鐘漂移。
+    /// 由 <c>NtpDriftMonitor</c> 每 5 分鐘呼叫一次計算 <c>Offset = ServerTime − LocalTime</c>。
+    /// 偏差超過 1000ms 將觸發 <c>RiskManager</c> 攔截，防止簽章失效或行情數據污染。
+    /// </summary>
+    Task<DateTime> GetServerTimeAsync(CancellationToken ct = default);
+
     // ===== 下單 =====
 
     /// <summary>
@@ -81,6 +88,18 @@ public interface IExchangeClient
 
     /// <summary>查詢訂單狀態 (成交進度)</summary>
     Task RefreshOrderStatusAsync(Order order, CancellationToken ct = default);
+
+    /// <summary>
+    /// S66-A：以 <paramref name="clientOrderId"/> 查詢交易所端對應訂單的當前狀態，主用於
+    /// 兩個情境：
+    ///   * Live 下單時 SDK 回 <c>duplicate clientOrderId</c> — 必須查交易所實際狀態回寫本地，
+    ///     避免「呼叫過交易所、但本地 process crash 沒落 DB」的鬼單。
+    ///   * DiagnosticTool <c>s66a_check-order</c> 一鍵比對本地 vs 交易所。
+    ///
+    /// 找不到訂單時回 <c>null</c>，呼叫端自行決定是否視為錯誤。
+    /// </summary>
+    Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default);
 
     /// <summary>
     /// S61：查詢交易所上當前**活躍**（未完全成交 / 未取消）的掛單，用於本地 vs 雲端對帳、
@@ -133,4 +152,21 @@ public sealed record ExchangeOpenOrderInfo(
     decimal Quantity,
     decimal QuantityFilled,
     decimal? Price,
+    DateTime UpdateTime);
+
+/// <summary>
+/// S66-A：交易所端任意狀態（包含已成交/已取消）的訂單快照，由
+/// <see cref="IExchangeClient.GetOrderByClientOrderIdAsync"/> 回傳。
+/// 與 <see cref="ExchangeOpenOrderInfo"/> 不同：後者只列「活躍」掛單；本記錄涵蓋所有狀態。
+/// </summary>
+public sealed record ExchangeOrderSnapshot(
+    string ExchangeOrderId,
+    string ClientOrderId,
+    Symbol Symbol,
+    OrderSide Side,
+    PositionSide PositionSide,
+    OrderStatus Status,
+    decimal Quantity,
+    decimal QuantityFilled,
+    decimal? AveragePrice,
     DateTime UpdateTime);

@@ -1,6 +1,7 @@
 using BingX.Net;
 using BingX.Net.Clients;
 using CryptoBot.Application.Common;
+using CryptoBot.Application.Common.Exceptions;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
@@ -487,8 +488,24 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
             if (!result.Success)
             {
                 var errMsg = result.Error?.Message ?? "unknown";
-                _logger.LogError("PlaceOrder rejected: {Symbol} err={Err}",
-                    order.Symbol.BingXFormat, errMsg);
+                var errCode = result.Error?.Code;
+
+                // S66-A：errorCode + message 雙保險偵測。errorCode 為主、message 嗅探為備援。
+                // 命中時改拋 DuplicateClientOrderIdException（不 Reject 訂單實體 — 呼叫端
+                // 仍要拿 order 查 remote 狀態對齊），讓 Application 層走自癒分支。
+                if (IsDuplicateClientOrderIdError(errCode, errMsg))
+                {
+                    _logger.LogWarning(
+                        "PlaceOrder hit duplicate clientOrderId on exchange: {Symbol} cid={Cid} code={Code} msg={Msg}",
+                        order.Symbol.BingXFormat, order.ClientOrderId, errCode?.ToString() ?? "(null)", errMsg);
+                    throw new DuplicateClientOrderIdException(
+                        clientOrderId: order.ClientOrderId ?? string.Empty,
+                        rawErrorCode: errCode?.ToString(),
+                        rawErrorMessage: errMsg);
+                }
+
+                _logger.LogError("PlaceOrder rejected: {Symbol} code={Code} err={Err}",
+                    order.Symbol.BingXFormat, errCode?.ToString() ?? "(null)", errMsg);
                 order.Reject(errMsg);
                 return;
             }
@@ -500,12 +517,63 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
                 order.Quantity.Value, result.Data.OrderId);
         }
         catch (OperationCanceledException) { throw; }
+        catch (DuplicateClientOrderIdException) { throw; }  // S66-A：保留語意原樣傳遞
         catch (Exception ex)
         {
+            // S66-A：例外路徑沒有 errorCode（SDK 直接 throw 而非走 result.Error），只能依賴 message 備援嗅探
+            if (IsDuplicateClientOrderIdError(errorCode: null, message: ex.Message))
+            {
+                _logger.LogWarning(ex,
+                    "PlaceOrder threw duplicate-clientOrderId for {Symbol} cid={Cid} msg={Msg}",
+                    order.Symbol.BingXFormat, order.ClientOrderId, ex.Message);
+                throw new DuplicateClientOrderIdException(
+                    clientOrderId: order.ClientOrderId ?? string.Empty,
+                    rawErrorCode: null,
+                    rawErrorMessage: ex.Message,
+                    innerException: ex);
+            }
+
             _logger.LogError(ex, "Exception placing order for {Symbol}", order.Symbol.BingXFormat);
             if (order.IsActive) order.Reject($"Exception: {ex.Message}");
             throw;
         }
+    }
+
+    /// <summary>
+    /// S66-A：BingX 對 ClientOrderId 重複的官方 errorCode（T0 探針 2026-04-25 確診）。
+    /// 修改前必須重跑 <c>probe-bingx</c> 並更新 <c>Institutional_Memory.md §S66-A</c>。
+    /// </summary>
+    internal const int BingxDuplicateClientOrderIdErrorCode = 101400;
+
+    /// <summary>
+    /// S66-A 雙保險偵測：errorCode 主檢 + message 嗅探備援。
+    ///
+    /// **2026-04-25 T0 探針確診**（VST Demo 環境，<c>BTC-USDT</c>）：
+    /// BingX 對 duplicate ClientOrderId 回 <c>errorCode=101400</c>，
+    /// 訊息為 <c>"clientOrderID unique check failed"</c>。
+    /// 完整探針紀錄於 <c>Institutional_Memory.md §S66-A</c>。
+    ///
+    /// 雙層判定（任一命中即視為冪等衝突）：
+    ///   1. **errorCode 主防線**：<c>errorCode == 101400</c> — 精確、language-independent
+    ///   2. **message 備援防線**：含 "client" + (unique / duplicate / exists / already) 任一者 —
+    ///      用於防 BingX 之後改 errorCode 但訊息仍穩定的情境，或 SDK 未暴露 errorCode 的少數路徑。
+    ///
+    /// 偽陽性風險極低；偽陰性會降級為 Reject 流程（不會燒錢，僅錯失一次自癒機會）。
+    /// 升級 SDK 後第一件事必須跑 <c>probe-bingx</c> 確認 code 與訊息仍與 T0 紀錄一致。
+    /// </summary>
+    internal static bool IsDuplicateClientOrderIdError(int? errorCode, string? message)
+    {
+        // 主防線：errorCode 精確比對
+        if (errorCode == BingxDuplicateClientOrderIdErrorCode) return true;
+
+        // 備援防線：訊息嗅探
+        if (string.IsNullOrEmpty(message)) return false;
+        var lower = message.ToLowerInvariant();
+        if (!lower.Contains("client")) return false;
+        return lower.Contains("unique")
+            || lower.Contains("duplicate")
+            || lower.Contains("exists")
+            || lower.Contains("already");
     }
 
     public async Task CancelOrderAsync(Order order, CancellationToken ct = default)
@@ -570,6 +638,79 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
             order.Reject("Rejected on exchange");
         else if (remoteStatus == OrderStatus.Expired && order.IsActive)
             order.Expire();
+    }
+
+    /// <summary>
+    /// S66-A：以 clientOrderId 查詢 BingX 端任意狀態（非僅活躍）的訂單快照。
+    /// 用於 PlaceOrder 觸發 DuplicateClientOrderId 後的自癒對齊，以及 DiagnosticTool 對帳。
+    /// 找不到回 null（BingX 對未知 clientOrderId 通常回 110416 或類似 not-found 錯碼）。
+    /// </summary>
+    public async Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(clientOrderId))
+            throw new DomainException("clientOrderId must not be empty.");
+
+        try
+        {
+            var result = await _client.PerpetualFuturesApi.Trading
+                .GetOrderAsync(
+                    symbol: symbol.BingXFormat,
+                    orderId: (long?)null,
+                    clientOrderId: clientOrderId,
+                    ct: ct)
+                .ConfigureAwait(false);
+
+            if (!result.Success)
+            {
+                var errMsg = result.Error?.Message?.ToLowerInvariant() ?? string.Empty;
+                if (errMsg.Contains("not exist") || errMsg.Contains("not found") || errMsg.Contains("110416"))
+                    return null;
+                result.Check(nameof(GetOrderByClientOrderIdAsync));
+                return null;  // unreachable，Check 會 throw
+            }
+
+            var remote = result.Data;
+            if (remote is null) return null;
+
+            Symbol parsedSymbol;
+            try { parsedSymbol = Symbol.Parse(remote.Symbol); }
+            catch { parsedSymbol = symbol; }
+
+            var posSide = (remote.PositionSide ?? global::BingX.Net.Enums.PositionSide.Long).ToDomain();
+
+            return new ExchangeOrderSnapshot(
+                ExchangeOrderId: remote.OrderId.ToString(),
+                ClientOrderId: clientOrderId,
+                Symbol: parsedSymbol,
+                Side: remote.Side.ToDomain(),
+                PositionSide: posSide,
+                Status: remote.Status.ToDomain(),
+                Quantity: remote.Quantity ?? 0m,
+                QuantityFilled: remote.QuantityFilled ?? 0m,
+                AveragePrice: remote.AveragePrice,
+                UpdateTime: remote.UpdateTime);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            var msg = ex.Message?.ToLowerInvariant() ?? string.Empty;
+            if (msg.Contains("not exist") || msg.Contains("not found") || msg.Contains("110416"))
+                return null;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// S66-D：透過 BingX Perpetual Futures ExchangeData.GetServerTimeAsync 查詢伺服器時間。
+    /// SDK 回傳的就是 UTC DateTime — 直接傳出去由 NtpDriftMonitor 計算偏差。
+    /// </summary>
+    public async Task<DateTime> GetServerTimeAsync(CancellationToken ct = default)
+    {
+        var result = await _client.PerpetualFuturesApi.ExchangeData
+            .GetServerTimeAsync(ct).ConfigureAwait(false);
+        result.Check(nameof(GetServerTimeAsync));
+        return result.Data;
     }
 
     // ========== ListenKey (User Data WS lifecycle) ==========
