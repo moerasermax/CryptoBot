@@ -225,6 +225,10 @@ body::before {
         rgba(255, 255, 255, 0.015) 100%),
         var(--panel);
     border: 1px solid var(--panel-edge-strong);
+    /* 真因修復：父 .panel 的 overflow:hidden 會把 GlassDropdown panel 剪裁掉（dropdown 是 position:absolute
+       後代但仍受祖先 clipping）。.panel.glass 是 Lab 頁專用變體，覆寫為 visible 讓 dropdown 可懸浮溢出。
+       border-radius 仍由 .panel 提供的 12px 套用；本變體場景內容都填滿邊緣，視覺差異可忽略。 */
+    overflow: visible;
 }
 
 .panel-header {
@@ -1338,9 +1342,12 @@ body::before {
     border: 1px solid var(--panel-edge-strong, rgba(255,255,255,0.18));
     border-radius: 6px;
     box-shadow: 0 12px 28px rgba(0, 0, 0, 0.6);
+    /* 最小寬度避免「Bayesian (AI)」等較長選項被父 grid 列擠成換行；max-height 預留可滾動。 */
+    min-width: 160px;
     max-height: 300px;
     overflow-y: auto;
-    z-index: 100;
+    /* 拉高 z-index 防意外的祖先 stacking context；真正遮擋主因（.panel 的 overflow:hidden）由 .panel.glass 覆寫處理。 */
+    z-index: 1000;
     animation: glassDropdownFadeIn 0.14s ease-out;
 }
 

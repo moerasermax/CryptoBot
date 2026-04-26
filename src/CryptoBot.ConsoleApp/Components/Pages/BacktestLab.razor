@@ -24,7 +24,7 @@
 @inject Microsoft.JSInterop.IJSRuntime JS
 @implements IAsyncDisposable
 
-<PageTitle>CryptoBot · Backtest Lab</PageTitle>
+<PageTitle>[V21] Backtest Lab</PageTitle>
 
 @*
     回測實驗室主頁。資料層全部從 LabStateContainer 拿 — 切 tab、refresh、跨 tab 都不會丟資料。
@@ -1137,5 +1137,11 @@
             try { await JS.InvokeVoidAsync("cryptoBotChart.dispose", ChartElementId); }
             catch { /* ignore */ }
         }
+    }
+}
+
+    }
+}
+
     }
 }
