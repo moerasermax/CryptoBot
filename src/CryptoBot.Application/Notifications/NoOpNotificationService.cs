@@ -18,4 +18,6 @@ public sealed class NoOpNotificationService : INotificationService
         CancellationToken ct = default) => Task.CompletedTask;
 
     public Task NotifyErrorAsync(Exception ex, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task NotifyCircuitBreakerAsync(string reason, CancellationToken ct = default) => Task.CompletedTask;
 }

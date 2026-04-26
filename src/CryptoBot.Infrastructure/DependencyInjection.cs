@@ -1,10 +1,13 @@
+using CryptoBot.Application.Ai;
 using CryptoBot.Application.Backtesting;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Repositories;
+using CryptoBot.Infrastructure.Ai;
 using CryptoBot.Infrastructure.Backtesting;
 using CryptoBot.Infrastructure.Backtesting.Persistence;
 using CryptoBot.Infrastructure.Configuration;
 using CryptoBot.Infrastructure.Exchange.BingX;
+using CryptoBot.Infrastructure.ExchangeAccounts;
 using CryptoBot.Infrastructure.Notifications;
 using CryptoBot.Infrastructure.Persistence;
 using CryptoBot.Infrastructure.Persistence.Repositories;
@@ -34,6 +37,7 @@ public static class DependencyInjection
         IConfiguration configuration)
     {
         services.AddPersistence(configuration);
+        services.AddSingleton<IExchangeCredentialProvider, DbExchangeCredentialProvider>();
         services.AddBingXExchange(configuration);
 
         services.Configure<StrategySeedOptions>(
@@ -42,6 +46,35 @@ public static class DependencyInjection
 
         services.AddNotifications(configuration);
         services.AddBacktesting();
+        services.AddAiAdvisor(configuration);
+        return services;
+    }
+
+    /// <summary>
+    /// S30：註冊 AI Advisor（Gemini）服務與金鑰 Provider。
+    ///
+    /// 啟動時即 Replace 掉 Application 層的 NoOp — 我們允許使用者在「沒設金鑰」狀態下啟動，
+    /// Gemini service 在每次請求時從 SQLite 讀金鑰；找不到就回 Success=false 的友善訊息。
+    /// 這樣 UI 改完金鑰下一次按鈕點擊就生效，不必重啟 host。
+    /// </summary>
+    public static IServiceCollection AddAiAdvisor(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        services.Configure<GeminiOptions>(configuration.GetSection(GeminiOptions.SectionName));
+
+        services.AddSingleton<IAiCredentialProvider, DbAiCredentialProvider>();
+
+        // 單一 Singleton HttpClient — Gemini endpoint 固定、呼叫頻率低（UI 按鈕觸發），
+        // 不需要 HttpClientFactory 的池化。與 DiscordNotificationService 同模式。
+        services.Replace(ServiceDescriptor.Singleton<IAiAdvisorService>(sp =>
+            new GeminiAiAdvisorService(
+                new HttpClient(),
+                sp.GetRequiredService<IAiCredentialProvider>(),
+                sp.GetRequiredService<IAiAdviceTraceLog>(),
+                sp.GetRequiredService<IOptions<GeminiOptions>>(),
+                sp.GetRequiredService<ILogger<GeminiAiAdvisorService>>())));
+
         return services;
     }
 
@@ -131,6 +164,9 @@ public static class DependencyInjection
         services.AddScoped<IOrderRepository, OrderRepository>();
         services.AddScoped<IPositionRepository, PositionRepository>();
         services.AddScoped<IStrategyRepository, StrategyRepository>();
+        services.AddScoped<IExchangeAccountRepository, ExchangeAccountRepository>();
+        services.AddScoped<IStrategyOptimizationSettingsRepository, StrategyOptimizationSettingsRepository>();
+        services.AddScoped<IAiCredentialRepository, AiCredentialRepository>();
         services.AddScoped<IUnitOfWork, UnitOfWork>();
 
         return services;

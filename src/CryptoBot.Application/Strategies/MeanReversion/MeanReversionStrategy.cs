@@ -33,11 +33,12 @@ public sealed class MeanReversionStrategy : IStrategy
         IReadOnlyList<Position> openPositions,
         CancellationToken ct = default)
     {
-        var bbPeriod = (int)config.GetParameter("BollingerPeriod", 20);
-        var bbStdDev = config.GetParameter("BollingerStdDev", 2);
+        // S24：參數 key 與 B46RsiBb 策略對齊 — BbPeriod / BbStdDev（舊 BollingerPeriod / BollingerStdDev 已淘汰）。
+        var bbPeriod = (int)config.GetParameter("BbPeriod", 20);
+        var bbStdDev = config.GetParameter("BbStdDev", 2m);
         var rsiPeriod = (int)config.GetParameter("RsiPeriod", 14);
-        var oversoldLevel = config.GetParameter("RsiOversold", 30);
-        var overboughtLevel = config.GetParameter("RsiOverbought", 70);
+        var oversoldLevel = config.GetParameter("RsiOversold", 30m);
+        var overboughtLevel = config.GetParameter("RsiOverbought", 70m);
 
         if (klines.Count < bbPeriod + 5)
             return Task.FromResult(TradingSignal.None(config.Symbol, snapshot.FuturesMarkPrice));

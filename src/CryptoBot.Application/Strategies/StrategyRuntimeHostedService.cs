@@ -1,4 +1,5 @@
 using CryptoBot.Application.Common.Interfaces;
+using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Synchronization;
 using CryptoBot.Domain.Enums;
 using CryptoBot.Domain.Repositories;
@@ -34,6 +35,7 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
     private readonly IStrategyExecutorFactory _executorFactory;
     private readonly IStrategyFactory _strategyFactory;
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ISafetyBreakerState _breaker;
     private readonly ILogger<StrategyRuntimeHostedService> _logger;
 
     private readonly Dictionary<Guid, IStrategyExecutor> _executors = new();
@@ -46,6 +48,7 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         IStrategyExecutorFactory executorFactory,
         IStrategyFactory strategyFactory,
         IServiceScopeFactory scopeFactory,
+        ISafetyBreakerState breaker,
         ILogger<StrategyRuntimeHostedService> logger)
     {
         _marketData = marketData;
@@ -53,6 +56,7 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         _executorFactory = executorFactory;
         _strategyFactory = strategyFactory;
         _scopeFactory = scopeFactory;
+        _breaker = breaker;
         _logger = logger;
     }
 
@@ -163,8 +167,87 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         lock (_executors) return _executors.ContainsKey(strategyId);
     }
 
+    public IReadOnlyList<Guid> RunningStrategyIds
+    {
+        get { lock (_executors) return _executors.Keys.ToArray(); }
+    }
+
+    public DateTime? GetLastEvaluatedAtUtc(Guid strategyId)
+    {
+        lock (_executors)
+        {
+            return _executors.TryGetValue(strategyId, out var exec)
+                ? exec.LastEvaluatedAtUtc
+                : null;
+        }
+    }
+
+    public async Task<IReadOnlyList<Guid>> StopAllAsync(string reason, CancellationToken ct = default)
+    {
+        await _mutateLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_executors.Count == 0) return Array.Empty<Guid>();
+
+            var stopped = new List<Guid>(_executors.Count);
+
+            // 先關 executor（停 tick 迴圈、讓 in-flight 動作 drain），再處理 DB 狀態
+            foreach (var (id, executor) in _executors.ToArray())
+            {
+                try { await executor.StopAsync(ct).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Executor stop threw for {Id} during StopAll — continuing.", id);
+                }
+                stopped.Add(id);
+            }
+            _executors.Clear();
+
+            // DB 狀態翻為 Stopped（帶原因）
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IStrategyRepository>();
+            var uow = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+
+            foreach (var id in stopped)
+            {
+                try
+                {
+                    var strategy = await repo.GetByIdAsync(id, ct).ConfigureAwait(false);
+                    if (strategy is null) continue;
+                    strategy.Stop(reason);
+                    await repo.UpdateAsync(strategy, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Failed to flip DB status to Stopped for {Id} during StopAll — continuing.", id);
+                }
+            }
+            await uow.SaveChangesAsync(ct).ConfigureAwait(false);
+
+            _logger.LogWarning("⏹ StopAll: {Count} strategies stopped. Reason: {Reason}",
+                stopped.Count, reason);
+
+            return stopped;
+        }
+        finally
+        {
+            _mutateLock.Release();
+        }
+    }
+
     public async Task<bool> StartAsync(Guid strategyId, CancellationToken ct = default)
     {
+        // S28 T1：熔斷期間禁止啟動 — 在取鎖前先短路，省下 scope 建立與 DB 讀取的成本
+        if (_breaker.IsTripped)
+        {
+            _logger.LogWarning(
+                "Start rejected for {Id}: safety breaker is TRIPPED (reason: {Reason}).",
+                strategyId, _breaker.Reason ?? "unknown");
+            return false;
+        }
+
         await _mutateLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -243,6 +326,109 @@ public sealed class StrategyRuntimeHostedService : IHostedService, IStrategyRunt
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to stop strategy {Id} via API.", strategyId);
+            return false;
+        }
+        finally
+        {
+            _mutateLock.Release();
+        }
+    }
+
+    public async Task<bool> ChangeStrategyTypeAsync(Guid strategyId, string newStrategyType, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(newStrategyType))
+        {
+            _logger.LogWarning("ChangeStrategyType rejected for {Id}: empty type.", strategyId);
+            return false;
+        }
+
+        // 類型必須先存在於 IStrategyFactory；找不到就直接拒絕 — 不動 DB、不動 executor。
+        try
+        {
+            _ = _strategyFactory.Get(newStrategyType);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "ChangeStrategyType rejected for {Id}: unknown type '{Type}'.",
+                strategyId, newStrategyType);
+            return false;
+        }
+
+        await _mutateLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IStrategyRepository>();
+            var uow = scope.ServiceProvider.GetRequiredService<IUnitOfWork>();
+
+            var strategy = await repo.GetByIdAsync(strategyId, ct).ConfigureAwait(false);
+            if (strategy is null)
+            {
+                _logger.LogWarning("ChangeStrategyType: unknown strategy {Id}.", strategyId);
+                return false;
+            }
+
+            // 1) 如果在跑 → 先停 executor（避免熱換期間還在跑舊腦 tick）
+            var wasRunning = _executors.TryGetValue(strategyId, out var runningExecutor);
+            if (wasRunning && runningExecutor is not null)
+            {
+                try { await runningExecutor.StopAsync(ct).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Executor stop threw during ChangeStrategyType for {Id} — removing anyway.",
+                        strategyId);
+                }
+                _executors.Remove(strategyId);
+            }
+
+            // 2) 翻 DB：先把 Status 退回 Stopped（否則 ChangeType 會拒絕），再換 Type
+            var originalStatus = strategy.Status;
+            if (strategy.Status == StrategyStatus.Running)
+                strategy.Stop("Type change in progress");
+
+            try
+            {
+                strategy.ChangeType(newStrategyType);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Domain refused ChangeType for {Id} to '{Type}'.", strategyId, newStrategyType);
+                return false;
+            }
+
+            // 3) 如果之前在跑，立刻把 Status 拉回 Running 並重建 executor
+            if (wasRunning || originalStatus == StrategyStatus.Running)
+                strategy.Start();
+
+            await repo.UpdateAsync(strategy, ct).ConfigureAwait(false);
+            await uow.SaveChangesAsync(ct).ConfigureAwait(false);
+
+            if (wasRunning || originalStatus == StrategyStatus.Running)
+            {
+                var impl = _strategyFactory.Get(newStrategyType);
+                var executor = _executorFactory.Create(strategy, impl);
+                await executor.StartAsync(ct).ConfigureAwait(false);
+                _executors[strategy.Id] = executor;
+
+                _logger.LogInformation(
+                    "⇆ Strategy {Name} ({Id}) type hot-swapped to {Type} (resumed Running).",
+                    strategy.Name, strategy.Id, newStrategyType);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "⇆ Strategy {Name} ({Id}) type changed to {Type} (stays Stopped).",
+                    strategy.Name, strategy.Id, newStrategyType);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "ChangeStrategyType failed for {Id}.", strategyId);
             return false;
         }
         finally

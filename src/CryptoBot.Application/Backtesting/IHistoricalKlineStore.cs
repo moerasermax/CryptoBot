@@ -46,10 +46,12 @@ public interface IHistoricalKlineStore
         CancellationToken ct = default);
 
     /// <summary>
-    /// 取得已存的最新一根 K 線時間（區間未指定）— 用於增量下載：只補齊缺失段。
-    /// 若該交易對/週期尚無資料，回傳 null。
+    /// 取得已存 (symbol, interval) 的最早 / 最新 OpenTime。若該組合尚無資料，兩者皆為 null。
+    ///
+    /// 用於 <c>OptimizationOrchestrator.EnsureHistoricalAsync</c> 的 gap-fill：
+    /// 下載前先判斷本地庫存已覆蓋哪一段，只補缺的前段 / 後段。
     /// </summary>
-    Task<DateTime?> GetLatestOpenTimeAsync(
+    Task<(DateTime? Earliest, DateTime? Latest)> GetStoredRangeAsync(
         Symbol symbol,
         KlineInterval interval,
         CancellationToken ct = default);

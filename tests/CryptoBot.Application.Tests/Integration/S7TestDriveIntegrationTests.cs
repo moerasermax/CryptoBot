@@ -1,3 +1,4 @@
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Notifications;
 using CryptoBot.Application.Realtime;
@@ -5,6 +6,7 @@ using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Strategies;
 using CryptoBot.Application.Strategies.SmaCrossover;
 using CryptoBot.Application.Synchronization;
+using CryptoBot.Application.Trading;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
 using CryptoBot.Domain.Aggregates.PositionAggregate;
@@ -150,10 +152,12 @@ public class S7TestDriveIntegrationTests
             // Application 層實際組件（不走 AddApplication 因為只要 SMA 一支策略）
             services.AddSingleton(RiskLimits.Moderate);
             services.AddSingleton<IStrategyCooldownTracker, StrategyCooldownTracker>();
+            services.AddSingleton<ISafetyBreakerState, SafetyBreakerState>();
             services.AddScoped<IRiskManager, RiskManager>();
             services.AddScoped<IOrderSizer, OrderSizer>();
             services.AddSingleton<IStrategy, SmaCrossoverStrategy>();
             services.AddSingleton<IStrategyFactory, StrategyFactory>();
+            services.AddSingleton<IClientOrderIdGenerator, DeterministicClientOrderIdGenerator>();
             services.AddSingleton<IStrategyExecutorFactory, StrategyExecutorFactory>();
             services.AddSingleton<IAccountSynchronizer, AccountSynchronizer>();
             services.AddSingleton<INotificationService, NoOpNotificationService>();
@@ -184,6 +188,7 @@ public class S7TestDriveIntegrationTests
                 sp.GetRequiredService<IStrategyExecutorFactory>(),
                 sp.GetRequiredService<IStrategyFactory>(),
                 sp.GetRequiredService<IServiceScopeFactory>(),
+                sp.GetRequiredService<ISafetyBreakerState>(),
                 NullLogger<StrategyRuntimeHostedService>.Instance);
 
             await host.StartAsync(CancellationToken.None);
@@ -253,6 +258,7 @@ internal sealed class PipelineFakeMarketDataStream : IMarketDataStream
 
     public Task StartAsync(CancellationToken ct = default) { StartCalls++; return Task.CompletedTask; }
     public Task StopAsync(CancellationToken ct = default) { StopCalls++; return Task.CompletedTask; }
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeKlinesAsync(Symbol s, KlineInterval i, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeMarkPriceAsync(Symbol s, CancellationToken ct = default) => Task.CompletedTask;
     public Task UnsubscribeAsync(Symbol s, CancellationToken ct = default) => Task.CompletedTask;
@@ -273,11 +279,14 @@ internal sealed class PipelineFakeMarketDataStream : IMarketDataStream
 internal sealed class PipelineFakeExchangeClient : IExchangeClient
 {
     public string ExchangeName => "PIPELINE-FAKE";
+    public string QuoteAsset => "USDT";
+    public TradingMode CurrentMode => TradingMode.Demo;
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
     public decimal Balance { get; set; } = 100_000m;
     public IReadOnlyList<Kline> PreloadedKlines { get; set; } = Array.Empty<Kline>();
     public int PlaceOrderCalls { get; private set; }
 
-    public Task<decimal> GetFuturesBalanceAsync(string asset = "USDT", CancellationToken ct = default) =>
+    public Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default) =>
         Task.FromResult(Balance);
     public Task<decimal> GetSpotBalanceAsync(string asset, CancellationToken ct = default) =>
         Task.FromResult(Balance);
@@ -312,6 +321,15 @@ internal sealed class PipelineFakeExchangeClient : IExchangeClient
     public Task RefreshOrderStatusAsync(Order order, CancellationToken ct = default) => Task.CompletedTask;
     public Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ExchangePositionInfo>>(Array.Empty<ExchangePositionInfo>());
+    public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
+
+    public Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default) =>
+        Task.FromResult<ExchangeOrderSnapshot?>(null);
+
+    public Task<DateTime> GetServerTimeAsync(CancellationToken ct = default) =>
+        Task.FromResult(DateTime.UtcNow);
 }
 
 internal sealed class PipelineInMemoryOrderRepo : IOrderRepository
@@ -323,6 +341,9 @@ internal sealed class PipelineInMemoryOrderRepo : IOrderRepository
 
     public Task<Order?> GetByExchangeOrderIdAsync(string exchangeOrderId, CancellationToken ct = default) =>
         Task.FromResult(Store.Values.FirstOrDefault(o => o.ExchangeOrderId == exchangeOrderId));
+
+    public Task<Order?> GetByClientOrderIdAsync(string clientOrderId, CancellationToken ct = default) =>
+        Task.FromResult(Store.Values.FirstOrDefault(o => o.ClientOrderId == clientOrderId));
 
     public Task<IReadOnlyList<Order>> GetActiveOrdersAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Order>>(Store.Values.Where(o => o.IsActive).ToList());
@@ -363,6 +384,10 @@ internal sealed class PipelineInMemoryPositionRepo : IPositionRepository
     public Task<IReadOnlyList<Position>> GetClosedPositionsInRangeAsync(DateTime from, DateTime to, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Position>>(Store.Where(p => p.IsClosed).ToList());
 
+    public Task<IReadOnlyList<Position>> GetRecentClosedAsync(int limit, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Position>>(
+            Store.Where(p => p.IsClosed).OrderByDescending(p => p.ClosedAt).Take(limit).ToList());
+
     public Task AddAsync(Position position, CancellationToken ct = default) { Store.Add(position); return Task.CompletedTask; }
     public Task UpdateAsync(Position position, CancellationToken ct = default) => Task.CompletedTask;
 }
@@ -392,6 +417,8 @@ internal sealed class PipelineInMemoryUnitOfWork : IUnitOfWork
 {
     public int SaveChangesCalls { get; private set; }
     public Task<int> SaveChangesAsync(CancellationToken ct = default) { SaveChangesCalls++; return Task.FromResult(1); }
+    public Task<int> SaveChangesWithRetryAsync(int maxAttempts = 3, CancellationToken ct = default)
+        => SaveChangesAsync(ct);
     public Task BeginTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task CommitTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task RollbackTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;

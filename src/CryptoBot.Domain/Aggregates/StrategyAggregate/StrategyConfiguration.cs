@@ -55,7 +55,10 @@ public sealed class StrategyConfiguration : ValueObject
         decimal stopLossPercent = 0.02m,        // 預設 2%
         decimal takeProfitPercent = 0.04m,      // 預設 4% (風報比 2:1)
         decimal? trailingStopPercent = null,
-        int maxConcurrentPositions = 1,
+        // S56 T3：預設由 1 調整為 2 — 單一策略只容一個持倉時，單幣種一開倉就鎖死整個系統，
+        // 多幣種實戰根本跑不起來（例：同策略分別吃 BTC 與 ETH 都不行）。2 是「同時容忍兩個
+        // 獨立方向/幣種的入場」，仍維持風控不過度發散；要重度 portfolio 策略可在建立時顯式指定。
+        int maxConcurrentPositions = 2,
         TimeSpan? cooldownPeriod = null,
         int maxKlineWindow = 200,
         IReadOnlyDictionary<string, decimal>? parameters = null)

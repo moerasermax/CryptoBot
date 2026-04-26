@@ -1,0 +1,314 @@
+@* S39 · 交易歷史表格
+   - 顯示最近 N 筆已平倉紀錄（預設 50）
+   - 模型欄位使用「業界術語 DisplayName」 — 與 Dashboard 上方 Active Strategies 的 Model 標籤一致
+   - PnL 紅綠雙色（正數綠、負數紅、零中性灰）
+   - 每列「複製複盤數據」按鈕 → 產生複盤 Prompt + 寫入剪貼簿（含 execCommand fallback）
+*@
+@using System.Collections.Generic
+@using System.Globalization
+@using System.Linq
+@using System.Net.Http
+@using System.Net.Http.Json
+@using System.Text
+@using CryptoBot.Application.Realtime
+@using CryptoBot.ConsoleApp.Api.Dtos
+@using CryptoBot.ConsoleApp.Realtime
+@using Microsoft.JSInterop
+@implements IDisposable
+@inject IHttpClientFactory HttpFactory
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+@inject DashboardEventBus Bus
+
+<section class="panel">
+    <header class="panel-header">
+        <h2>交易歷史</h2>
+        <span class="panel-sub">
+            @if (_loading)
+            {
+                <text>載入中…</text>
+            }
+            else if (_error is not null)
+            {
+                <text>@_error</text>
+            }
+            else
+            {
+                <text>last @_rows.Count · closed positions</text>
+            }
+        </span>
+        <button type="button" class="btn-apply" style="margin-left:auto;"
+                disabled="@_loading" @onclick="LoadAsync">
+            🔄 重新整理
+        </button>
+    </header>
+
+    @if (_rows.Count == 0 && !_loading)
+    {
+        <div class="empty">尚無已平倉紀錄 — 等待第一筆完整開/平倉發生。</div>
+    }
+    else if (_rows.Count > 0)
+    {
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>平倉時間</th>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Model</th>
+                    <th>Qty</th>
+                    <th>Entry</th>
+                    <th>Exit</th>
+                    <th>PnL</th>
+                    <th>手續費</th>
+                    <th>持倉時長</th>
+                    <th>AI 複盤</th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var t in _rows)
+                {
+                    <tr>
+                        <td>@(t.ExitTimeUtc?.ToLocalTime().ToString("MM-dd HH:mm:ss") ?? "—")</td>
+                        <td>@t.Symbol</td>
+                        <td class="@(t.Side == "Long" ? "pos" : "neg")">@t.Side</td>
+                        <td>
+                            <span class="model-tag @ModelTagClass(t.StrategyType)"
+                                  title="@ModelTooltip(t.StrategyType)">
+                                @ModelDisplayName(t.StrategyType)
+                            </span>
+                        </td>
+                        <td>@t.Quantity.ToString("N4", CultureInfo.InvariantCulture)</td>
+                        <td>@t.EntryPrice.ToString("N2", CultureInfo.InvariantCulture)</td>
+                        <td>@(t.ExitPrice?.ToString("N2", CultureInfo.InvariantCulture) ?? "—")</td>
+                        <td class="@PnLClass(t.RealizedPnL)">
+                            @FormatSignedMoney(t.RealizedPnL)
+                        </td>
+                        <td>@t.TotalCommission.ToString("N4", CultureInfo.InvariantCulture)</td>
+                        <td>@FormatDuration(t.EntryTimeUtc, t.ExitTimeUtc)</td>
+                        <td>
+                            <button type="button" class="btn-apply"
+                                    title="產生 Gemini 複盤 Prompt 並寫入剪貼簿"
+                                    @onclick="() => CopyReplayPromptAsync(t)">
+                                @(IsLastCopied(t.PositionId) ? "✅ 已複製" : "📋 複製複盤數據")
+                            </button>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+
+        @if (!string.IsNullOrEmpty(_copyNote))
+        {
+            <div class="settings-info">@_copyNote</div>
+        }
+    }
+</section>
+
+@code {
+    [Parameter] public int Limit { get; set; } = 50;
+
+    private List<ClosedTradeDto> _rows = new();
+    private bool _loading;
+    private string? _error;
+    private string? _copyNote;
+    private Guid? _lastCopiedId;
+
+    // S31：即時刷新 — 收到 PositionClosed 事件（由 AccountSynchronizer 平倉後 fire）就重拉一次。
+    private Action<PositionClosedUpdate>? _closedHandler;
+
+    private HttpClient CreateClient()
+    {
+        var http = HttpFactory.CreateClient();
+        http.BaseAddress = new Uri(Nav.BaseUri);
+        return http;
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        _closedHandler = OnPositionClosed;
+        Bus.PositionClosed += _closedHandler;
+        await LoadAsync();
+    }
+
+    private void OnPositionClosed(PositionClosedUpdate update)
+    {
+        // 事件抵達時 DB 已寫入（AccountSynchronizer 在 SaveChangesAsync 之後才 broadcast），
+        // 直接重拉即可；不要在 handler thread 內阻塞，切回 UI thread 後再 StateHasChanged。
+        _ = InvokeAsync(async () =>
+        {
+            await LoadAsync();
+            StateHasChanged();
+        });
+    }
+
+    public void Dispose()
+    {
+        if (_closedHandler is not null)
+        {
+            Bus.PositionClosed -= _closedHandler;
+            _closedHandler = null;
+        }
+    }
+
+    private async Task LoadAsync()
+    {
+        _loading = true; _error = null;
+        try
+        {
+            using var http = CreateClient();
+            var data = await http.GetFromJsonAsync<List<ClosedTradeDto>>(
+                $"/api/dashboard/trade-history?limit={Limit}");
+            _rows = data ?? new List<ClosedTradeDto>();
+        }
+        catch (Exception ex)
+        {
+            _error = $"載入交易歷史失敗：{ex.Message}";
+        }
+        finally { _loading = false; }
+    }
+
+    private bool IsLastCopied(Guid id) => _lastCopiedId == id;
+
+    private async Task CopyReplayPromptAsync(ClosedTradeDto t)
+    {
+        var prompt = BuildReplayPrompt(t);
+        _lastCopiedId = t.PositionId;
+        try
+        {
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", prompt);
+            _copyNote = "✅ Prompt 已寫入剪貼簿 — 可貼給 Gemini 做深度複盤。";
+        }
+        catch
+        {
+            // fallback：navigator.clipboard 在非 HTTPS / 舊瀏覽器不可用 — 改走 chart_interop.js 裡的 execCommand helper。
+            try
+            {
+                var ok = await JS.InvokeAsync<bool>("cryptoBotClipboard.copy", prompt);
+                _copyNote = ok
+                    ? "✅ Prompt 已寫入剪貼簿（fallback）。"
+                    : "⚠️ 無法自動複製 — 請手動從 ParametersSnapshot 欄位讀取。";
+            }
+            catch (Exception ex)
+            {
+                _copyNote = $"⚠️ 複製失敗：{ex.Message}";
+            }
+        }
+    }
+
+    // S39-T3：複盤 Prompt — 膠囊指定的「開/平倉 → 與其他模型對比建議」
+    // 把 Position 上的原始資料 + ParametersSnapshot 原封不動嵌入，讓 Gemini 有完整上下文。
+    private static string BuildReplayPrompt(ClosedTradeDto t)
+    {
+        var otherModels = GetOtherModelsFor(t.StrategyType);
+        var modelLabel = ModelDisplayName(t.StrategyType);
+        var sb = new StringBuilder();
+
+        sb.AppendLine("我是 CryptoBot。這是一筆交易紀錄：");
+        sb.AppendLine();
+        sb.Append("- Symbol：").AppendLine(t.Symbol);
+        sb.Append("- 方向：").AppendLine(t.Side);
+        sb.Append("- 數量：").AppendLine(
+            t.Quantity.ToString("G", CultureInfo.InvariantCulture));
+        sb.Append("- 槓桿：").Append(t.LeverageValue).AppendLine("x");
+        sb.Append("- 入場時間 (UTC)：").AppendLine(
+            t.EntryTimeUtc.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+        sb.Append("- 入場價：").AppendLine(
+            t.EntryPrice.ToString("G", CultureInfo.InvariantCulture));
+        sb.Append("- 出場時間 (UTC)：").AppendLine(
+            t.ExitTimeUtc?.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) ?? "—");
+        sb.Append("- 出場價：").AppendLine(
+            t.ExitPrice?.ToString("G", CultureInfo.InvariantCulture) ?? "—");
+        sb.Append("- 已實現盈虧 (RealizedPnL)：").AppendLine(
+            t.RealizedPnL.ToString("G", CultureInfo.InvariantCulture));
+        sb.Append("- 累計手續費：").AppendLine(
+            t.TotalCommission.ToString("G", CultureInfo.InvariantCulture));
+        sb.Append("- 策略模型：").AppendLine(modelLabel);
+        sb.AppendLine();
+        sb.AppendLine("- 策略參數快照 (開倉當下)：");
+        sb.AppendLine("```json");
+        sb.AppendLine(string.IsNullOrWhiteSpace(t.ParametersSnapshot)
+            ? "{}"
+            : t.ParametersSnapshot);
+        sb.AppendLine("```");
+        sb.AppendLine();
+        sb.Append("請分析「").Append(modelLabel)
+          .Append("」在此時段於 ").Append(t.Symbol)
+          .AppendLine(" 的表現，並與以下其他模型進行對比建議：");
+        foreach (var m in otherModels)
+            sb.Append("- ").AppendLine(m);
+        sb.AppendLine();
+        sb.AppendLine("請從以下角度給出可執行的改進建議：");
+        sb.AppendLine("1. 進場時機是否最佳（早進 / 晚進 / 過度猶豫）？");
+        sb.AppendLine("2. 止盈止損是否合理（RR 比、波動匹配）？");
+        sb.AppendLine("3. 如果改用對比模型，預期結果會更好還是更差？具體原因是什麼？");
+        sb.AppendLine("4. 這組參數可以怎麼微調才能提升未來勝率？請直接給具體數值。");
+
+        return sb.ToString();
+    }
+
+    // 當前策略之外的其他模型 — 給 Gemini 做對比分析。
+    // 策略集合固定 5 個，去掉自己得到 4 個對手。
+    private static IReadOnlyList<string> GetOtherModelsFor(string? currentType)
+    {
+        var all = new[]
+        {
+            ("SmaCrossover",    "SMA Crossover"),
+            ("TrendFollowing",  "EMA Trend Following"),
+            ("MeanReversion",   "Bollinger Reversion"),
+            ("B46RsiBb",        "B46 Hybrid Model"),
+            ("BasisArbitrage",  "Basis Arbitrage"),
+        };
+        return all
+            .Where(x => !string.Equals(x.Item1, currentType, StringComparison.Ordinal))
+            .Select(x => x.Item2)
+            .ToList();
+    }
+
+    // 以下三個對照表與 Dashboard.razor 同 schema — 刻意各自硬編而不抽共用 util，
+    // 因為 Dashboard 收到的 StrategyType 來自 Strategy Aggregate 的即時值，
+    // TradeHistoryTable 收到的是 Position 上鎖定的歷史快照 — 雖然值相同但語意不同。
+    private static string ModelDisplayName(string? strategyType) => strategyType switch
+    {
+        "SmaCrossover"    => "SMA Crossover",
+        "TrendFollowing"  => "EMA Trend Following",
+        "MeanReversion"   => "Bollinger Reversion",
+        "B46RsiBb"        => "B46 Hybrid Model",
+        "BasisArbitrage"  => "Basis Arbitrage",
+        null or ""        => "Unknown",
+        _                 => strategyType,
+    };
+
+    private static string ModelTagClass(string? strategyType) => strategyType switch
+    {
+        "SmaCrossover" or "TrendFollowing"    => "model-tag-trend",
+        "MeanReversion" or "B46RsiBb"          => "model-tag-reversion",
+        "BasisArbitrage"                       => "model-tag-neutral",
+        _                                      => "model-tag-neutral",
+    };
+
+    private static string ModelTooltip(string? strategyType) => strategyType switch
+    {
+        "SmaCrossover"    => "順勢策略 · 雙均線金叉 / 死叉",
+        "TrendFollowing"  => "順勢策略 · EMA 黃金/死亡交叉 × RSI 動能確認",
+        "MeanReversion"   => "逆勢策略 · Bollinger 觸軌 × RSI 極端反轉",
+        "B46RsiBb"        => "混合策略 · RSI 超買超賣 × Bollinger 通道反轉",
+        "BasisArbitrage"  => "套利策略 · 現貨期貨價差",
+        _                 => strategyType ?? "",
+    };
+
+    private static string FormatSignedMoney(decimal v) =>
+        (v >= 0 ? "+" : "") + v.ToString("N4", CultureInfo.InvariantCulture);
+
+    private static string PnLClass(decimal v) => v > 0 ? "pos" : (v < 0 ? "neg" : "");
+
+    private static string FormatDuration(DateTime entry, DateTime? exit)
+    {
+        if (exit is null) return "—";
+        var d = exit.Value - entry;
+        if (d.TotalDays >= 1) return $"{(int)d.TotalDays}d {d.Hours}h";
+        if (d.TotalHours >= 1) return $"{(int)d.TotalHours}h {d.Minutes}m";
+        if (d.TotalMinutes >= 1) return $"{(int)d.TotalMinutes}m {d.Seconds}s";
+        return $"{(int)d.TotalSeconds}s";
+    }
+}

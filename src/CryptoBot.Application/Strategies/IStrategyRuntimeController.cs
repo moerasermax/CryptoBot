@@ -16,4 +16,29 @@ public interface IStrategyRuntimeController
     Task<bool> StartAsync(Guid strategyId, CancellationToken ct = default);
     Task<bool> StopAsync(Guid strategyId, CancellationToken ct = default);
     bool IsRunning(Guid strategyId);
+
+    /// <summary>
+    /// 一次停掉所有正在跑的 executor — 環境切換 / 緊急熔斷情境用。
+    /// 回傳實際停下來的 strategyId 清單；DB 狀態同步翻為 Stopped 並寫入給定原因。
+    /// </summary>
+    Task<IReadOnlyList<Guid>> StopAllAsync(string reason, CancellationToken ct = default);
+
+    /// <summary>當下所有掛載中的策略 id 快照（含 IsRunning=true 的）。</summary>
+    IReadOnlyList<Guid> RunningStrategyIds { get; }
+
+    /// <summary>
+    /// S42 T1：策略上一次評估完成的 UTC 時間；未掛載 / 未跑過則為 <c>null</c>。
+    /// Dashboard REST 端點把它塞進 StrategyDto，讓 UI 一開頁就能顯示當前心跳狀態。
+    /// </summary>
+    DateTime? GetLastEvaluatedAtUtc(Guid strategyId);
+
+    /// <summary>
+    /// S25：把指定策略的「決策大腦」熱換成另一個類型字串（必須已註冊於 <c>IStrategyFactory</c>）。
+    /// 契約：
+    ///  - 若策略正在跑 → 先停 executor → 翻 DB → 重新掛載 executor → 該策略 Status 維持 Running
+    ///  - 若策略已停 → 只翻 DB Type，不啟動
+    ///  - 新類型字串未註冊 → 回 false（DB 不變、executor 狀態不變）
+    /// 回傳：切換是否成功。
+    /// </summary>
+    Task<bool> ChangeStrategyTypeAsync(Guid strategyId, string newStrategyType, CancellationToken ct = default);
 }

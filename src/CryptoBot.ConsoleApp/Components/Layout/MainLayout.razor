@@ -9,12 +9,13 @@
         <nav class="app-nav">
             <NavLink class="nav-link" href="/" Match="NavLinkMatch.All">Dashboard</NavLink>
             <NavLink class="nav-link" href="/lab">Backtest · 回測與優化</NavLink>
+            <NavLink class="nav-link" href="/settings/exchanges">Settings · 金鑰</NavLink>
+            <NavLink class="nav-link" href="/admin">Admin · 系統管理</NavLink>
         </nav>
-        <div class="status-pill">
-            <span class="dot"></span>
-            <span>Live — BingX Demo</span>
-        </div>
     </header>
+
+    <GlobalStatusBar />
+    <KeyRequiredGate />
 
     <main class="app-main">
         @Body

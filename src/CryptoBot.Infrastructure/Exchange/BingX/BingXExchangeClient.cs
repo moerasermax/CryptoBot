@@ -1,5 +1,7 @@
 using BingX.Net;
 using BingX.Net.Clients;
+using CryptoBot.Application.Common;
+using CryptoBot.Application.Common.Exceptions;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
@@ -16,68 +18,224 @@ using AppBingXOptions = CryptoBot.Infrastructure.Configuration.BingXOptions;
 
 namespace CryptoBot.Infrastructure.Exchange.BingX;
 
-public sealed class BingXExchangeClient : IExchangeClient
+public sealed class BingXExchangeClient : IExchangeClient, IDisposable
 {
-    private readonly BingXRestClient _client;
+    // 不是 readonly — ReconfigureAsync 會原子置換成新環境的 client。
+    private BingXRestClient _client;
     private readonly AppBingXOptions _options;
+    private readonly IExchangeCredentialProvider _credentials;
     private readonly ILogger<BingXExchangeClient> _logger;
 
+    // S31：首次成功餘額取得（或模式切換後再次）以 Information 列印，作為 DemoPreflight 巡檢證據；
+    // 之後每次 2s tick 走 Debug，避免把 log 洗掉。
+    private bool _balanceProofLogged;
+    private TradingMode _balanceProofMode;
+
+    /// <summary>
+    /// 守護 <see cref="_client"/> 與 <see cref="_options"/> 的可變欄位 — 切換環境時取，公開方法
+    /// 只在 lock 內讀取 client 引用以避免半切。讀取本身極快 (拿 reference)，
+    /// 不會把網路 IO 圈在 lock 裡。
+    /// </summary>
+    private readonly object _clientGate = new();
+
     public string ExchangeName => "BingX";
+    public string QuoteAsset => _options.QuoteAsset;
+    public TradingMode CurrentMode => _options.EffectiveMode;
 
     public BingXExchangeClient(
         IOptions<AppBingXOptions> options,
+        IExchangeCredentialProvider credentials,
         ILogger<BingXExchangeClient> logger)
     {
         _options = options.Value;
+        _credentials = credentials;
         _logger = logger;
 
-        _client = new BingXRestClient(opts =>
+        // S22：IExchangeCredentialProvider 是 runtime 金鑰的唯一權威。appsettings.json 的 ApiKey/ApiSecret
+        // 僅視為 bootstrap 佔位，不會被套用到 REST client。DbContext 在 ctor 階段需要一個 scope
+        // （IExchangeCredentialProvider 內部會自建），因此 sync-over-async 只在啟動期發生一次，
+        // 之後都走事件驅動。
+        TryApplyDbCredentialsAtStartup();
+
+        _client = BuildRestClient(_options.EffectiveMode);
+
+        _credentials.CredentialsChanged += OnCredentialsChanged;
+    }
+
+    private void TryApplyDbCredentialsAtStartup()
+    {
+        try
+        {
+            var creds = _credentials
+                .GetActiveAsync(Domain.Enums.ExchangeName.BingX, CancellationToken.None)
+                .GetAwaiter().GetResult();
+
+            if (creds.IsConfigured)
+            {
+                _options.ApiKey = creds.ApiKey;
+                _options.ApiSecret = creds.ApiSecret;
+                _logger.LogInformation(
+                    "BingX credentials loaded from SQLite | account={Account}", creds.AccountName);
+            }
+            else
+            {
+                // S22：DB 無 active 帳號時清空 options，杜絕 appsettings.json fallback。
+                // BuildRestClient 會因此建出「無憑證」client；使用者須在 /settings/exchanges
+                // 建帳號並 Activate，觸發 CredentialsChanged 重建 REST client。
+                _options.ApiKey = string.Empty;
+                _options.ApiSecret = string.Empty;
+                _logger.LogWarning(
+                    "BingX has no active account in SQLite — appsettings.json credentials are ignored at runtime. " +
+                    "Configure via /settings/exchanges before trading.");
+            }
+        }
+        catch (Exception ex)
+        {
+            // S22：讀 DB 失敗也不允許回退 appsettings — 清空以維持「Provider 唯一權威」契約。
+            _options.ApiKey = string.Empty;
+            _options.ApiSecret = string.Empty;
+            _logger.LogError(ex,
+                "Failed to load BingX credentials from SQLite — runtime credentials cleared (appsettings.json fallback removed).");
+        }
+    }
+
+    private void OnCredentialsChanged(object? sender, ExchangeCredentialsChangedEventArgs e)
+    {
+        if (e.Exchange != Domain.Enums.ExchangeName.BingX) return;
+
+        BingXRestClient oldClient;
+        lock (_clientGate)
+        {
+            _options.ApiKey = e.Credentials.ApiKey;
+            _options.ApiSecret = e.Credentials.ApiSecret;
+            oldClient = _client;
+            _client = BuildRestClient(_options.EffectiveMode);
+        }
+
+        try { oldClient.Dispose(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Old BingX REST client Dispose threw on credentials swap — ignored."); }
+
+        _logger.LogWarning(
+            "🔑 BingX credentials SWAPPED (account={Account}, configured={Configured}) — SDK client rebuilt.",
+            e.Credentials.AccountName, e.Credentials.IsConfigured);
+    }
+
+    public void Dispose()
+    {
+        _credentials.CredentialsChanged -= OnCredentialsChanged;
+        try { _client.Dispose(); } catch { /* swallow — best-effort */ }
+    }
+
+    private BingXRestClient BuildRestClient(TradingMode mode)
+    {
+        var client = new BingXRestClient(opts =>
         {
             opts.RequestTimeout = TimeSpan.FromSeconds(_options.RequestTimeoutSeconds);
-
-            opts.Environment = _options.UseDemoTrading
-                ? global::BingX.Net.BingXEnvironment.Demo
-                : global::BingX.Net.BingXEnvironment.Live;
-
-            _logger.LogWarning("BingX mode: {Mode}",
-                _options.UseDemoTrading ? "DEMO" : "LIVE (REAL MONEY)");
+            opts.Environment = mode == TradingMode.Live
+                ? global::BingX.Net.BingXEnvironment.Live
+                : global::BingX.Net.BingXEnvironment.Demo;
         });
 
         if (!string.IsNullOrWhiteSpace(_options.ApiKey) &&
             !string.IsNullOrWhiteSpace(_options.ApiSecret))
         {
-
-            BingXCredentials bingXCredentials = new BingXCredentials()
+            var creds = new BingXCredentials
             {
                 Key = _options.ApiKey,
-                Secret = _options.ApiSecret
+                Secret = _options.ApiSecret,
             };
-
-            _client.PerpetualFuturesApi.SetApiCredentials(bingXCredentials);
-            _client.SpotApi.SetApiCredentials(bingXCredentials);
+            client.PerpetualFuturesApi.SetApiCredentials(creds);
+            client.SpotApi.SetApiCredentials(creds);
         }
+
+        _logger.LogWarning("BingX REST client built | mode: {Mode} | quote asset: {Asset}",
+            mode == TradingMode.Live ? "🔴 LIVE (REAL MONEY)" : "🟢 DEMO (VST)",
+            mode == TradingMode.Live ? "USDT" : "VST");
+
+        return client;
+    }
+
+    /// <summary>
+    /// 取目前的 client reference — 公開方法都應透過這個快照取用，避免在切換中拿到半態 client。
+    /// 假設：呼叫端已透過 EnvironmentSwitcher 停止所有 executor，這裡只用來保證引用 atomic。
+    /// </summary>
+    private BingXRestClient Snapshot()
+    {
+        lock (_clientGate) return _client;
+    }
+
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default)
+    {
+        // 重建是 fire-and-replace — Dispose 舊 client，然後把欄位指向新 client。
+        // 因為 BingXRestClient 沒有 IAsyncDisposable，純 Dispose 即可。
+        BingXRestClient oldClient;
+        lock (_clientGate)
+        {
+            if (_options.EffectiveMode == newMode)
+            {
+                _logger.LogInformation("BingX REST already in {Mode} — Reconfigure is a no-op.", newMode);
+                return Task.CompletedTask;
+            }
+
+            // 同步 options（讓所有派生屬性 — QuoteAsset / EffectiveMode — 立即反映）
+            _options.TradingMode = newMode;
+            _options.UseDemoTrading = newMode == TradingMode.Demo;
+
+            oldClient = _client;
+            _client = BuildRestClient(newMode);
+        }
+
+        try { oldClient.Dispose(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "BingX REST client old-instance Dispose threw — ignoring."); }
+
+        _logger.LogWarning("🔁 BingX REST client SWAPPED to {Mode} (new quote asset: {Asset})",
+            newMode, _options.QuoteAsset);
+        return Task.CompletedTask;
     }
 
     // ========== 帳戶 ==========
 
     public async Task<decimal> GetFuturesBalanceAsync(
-        string asset = "USDT", CancellationToken ct = default)
+        string? asset = null, CancellationToken ct = default)
     {
+        var queryAsset = string.IsNullOrWhiteSpace(asset) ? QuoteAsset : asset;
+
         var result = await _client.PerpetualFuturesApi.Account
             .GetBalancesAsync(ct).ConfigureAwait(false);
 
         result.Check(nameof(GetFuturesBalanceAsync));
 
         var balance = result.Data.FirstOrDefault(b =>
-            string.Equals(b.Asset, asset, StringComparison.OrdinalIgnoreCase));
+            string.Equals(b.Asset, queryAsset, StringComparison.OrdinalIgnoreCase));
 
         if (balance is null)
         {
-            _logger.LogWarning("No {Asset} balance on BingX futures account", asset);
+            _logger.LogInformation(
+                "No {Asset} balance on BingX futures account (mode={Mode}) — returning 0.",
+                queryAsset, _options.EffectiveMode);
             return 0m;
         }
 
-        return balance.Balance.GetValueOrDefault();
+        var value = balance.Balance.GetValueOrDefault();
+
+        // S31 · Demo Preflight：首次取得 / 模式切換後首次 → Info；後續 tick → Debug。
+        // 這條 log 就是 VCP-VST-Balance 的交付證據。
+        if (!_balanceProofLogged || _balanceProofMode != _options.EffectiveMode)
+        {
+            _logger.LogInformation(
+                "✅ BingX futures balance fetched | mode={Mode} | asset={Asset} | balance={Balance}",
+                _options.EffectiveMode, queryAsset, value);
+            _balanceProofLogged = true;
+            _balanceProofMode = _options.EffectiveMode;
+        }
+        else
+        {
+            _logger.LogDebug(
+                "BingX futures balance fetched | mode={Mode} | asset={Asset} | balance={Balance}",
+                _options.EffectiveMode, queryAsset, value);
+        }
+
+        return value;
     }
 
     public async Task<decimal> GetSpotBalanceAsync(
@@ -149,11 +307,20 @@ public sealed class BingXExchangeClient : IExchangeClient
 
         result.Check(nameof(GetKlinesAsync));
 
+        // S63-HOTFIX：用 interval 動態推算 CloseTime。
+        // 舊代碼寫死 openTime+1s，導致兩個嚴重後果：
+        //   (1) MTF 對齊自檢永遠 MISALIGNED — 15m CloseTime 才比 OpenTime 多 1 秒，
+        //       根本不可能包覆後續 15m/1H 區間。
+        //   (2) StrategyExecutor.TrimInProgressTail 的「CloseTime > UtcNow」判定永遠為 false，
+        //       防未來函數機制完全失效，MTF 策略可能偷看進行中 K 線。
+        // WebSocket 路徑（BingXMarketDataStream.HandleKlineUpdate）已正確用 ToTimeSpan，
+        // 只有 REST 這裡寫錯，本次修復對齊兩邊。
+        var span = interval.ToTimeSpan();
         var klines = new List<Kline>();
         foreach (var k in result.Data.OrderBy(x => x.Timestamp))
         {
             var openTime = k.Timestamp;
-            var closeTime = openTime.AddSeconds(1);
+            var closeTime = openTime + span;
 
             klines.Add(Kline.Create(
                 openTime: openTime,
@@ -257,20 +424,30 @@ public sealed class BingXExchangeClient : IExchangeClient
         try { minQty = (decimal?)dc.MinOrderQuantity ?? 0m; }
         catch { try { minQty = (decimal?)dc.MinQuantity ?? 0m; } catch { } }
 
-        decimal stepSize = 0m;
-        try { stepSize = (decimal?)dc.QuantityStep ?? 0m; }
-        catch
+        // S62：SDK 的 QuantityPrecision / PricePrecision 是「小數位數」(int)，
+        // 不是步進值 — 直接塞 StepSize 會讓 OrderSizer 把所有 <1 的量 Floor 成 0
+        // (precision=4 → stepSize=4 → qty=0.5 / 4 = 0 → floor → 0)。
+        // 修法：先試真正的步進屬性；都拿不到才讀 precision 並以 10^(-n) 轉換。
+        decimal stepSize = TryReadDecimal(() => (decimal?)dc.QuantityStep)
+                        ?? TryReadDecimal(() => (decimal?)dc.StepSize)
+                        ?? 0m;
+        if (stepSize <= 0m)
         {
-            try { stepSize = (decimal?)dc.StepSize ?? 0m; }
-            catch { try { stepSize = (decimal?)dc.QuantityPrecision ?? 0m; } catch { } }
+            var qPrecision = TryReadInt(() => (int?)dc.QuantityPrecision)
+                          ?? TryReadInt(() => (int?)(decimal?)dc.QuantityPrecision);
+            if (qPrecision is int qp && qp >= 0)
+                stepSize = PrecisionToStep(qp);
         }
 
-        decimal tickSize = 0m;
-        try { tickSize = (decimal?)dc.PriceStep ?? 0m; }
-        catch
+        decimal tickSize = TryReadDecimal(() => (decimal?)dc.PriceStep)
+                        ?? TryReadDecimal(() => (decimal?)dc.TickSize)
+                        ?? 0m;
+        if (tickSize <= 0m)
         {
-            try { tickSize = (decimal?)dc.TickSize ?? 0m; }
-            catch { try { tickSize = (decimal?)dc.PricePrecision ?? 0m; } catch { } }
+            var pPrecision = TryReadInt(() => (int?)dc.PricePrecision)
+                          ?? TryReadInt(() => (int?)(decimal?)dc.PricePrecision);
+            if (pPrecision is int pp && pp >= 0)
+                tickSize = PrecisionToStep(pp);
         }
 
         decimal minNotional = 0m;
@@ -311,8 +488,24 @@ public sealed class BingXExchangeClient : IExchangeClient
             if (!result.Success)
             {
                 var errMsg = result.Error?.Message ?? "unknown";
-                _logger.LogError("PlaceOrder rejected: {Symbol} err={Err}",
-                    order.Symbol.BingXFormat, errMsg);
+                var errCode = result.Error?.Code;
+
+                // S66-A：errorCode + message 雙保險偵測。errorCode 為主、message 嗅探為備援。
+                // 命中時改拋 DuplicateClientOrderIdException（不 Reject 訂單實體 — 呼叫端
+                // 仍要拿 order 查 remote 狀態對齊），讓 Application 層走自癒分支。
+                if (IsDuplicateClientOrderIdError(errCode, errMsg))
+                {
+                    _logger.LogWarning(
+                        "PlaceOrder hit duplicate clientOrderId on exchange: {Symbol} cid={Cid} code={Code} msg={Msg}",
+                        order.Symbol.BingXFormat, order.ClientOrderId, errCode?.ToString() ?? "(null)", errMsg);
+                    throw new DuplicateClientOrderIdException(
+                        clientOrderId: order.ClientOrderId ?? string.Empty,
+                        rawErrorCode: errCode?.ToString(),
+                        rawErrorMessage: errMsg);
+                }
+
+                _logger.LogError("PlaceOrder rejected: {Symbol} code={Code} err={Err}",
+                    order.Symbol.BingXFormat, errCode?.ToString() ?? "(null)", errMsg);
                 order.Reject(errMsg);
                 return;
             }
@@ -324,12 +517,63 @@ public sealed class BingXExchangeClient : IExchangeClient
                 order.Quantity.Value, result.Data.OrderId);
         }
         catch (OperationCanceledException) { throw; }
+        catch (DuplicateClientOrderIdException) { throw; }  // S66-A：保留語意原樣傳遞
         catch (Exception ex)
         {
+            // S66-A：例外路徑沒有 errorCode（SDK 直接 throw 而非走 result.Error），只能依賴 message 備援嗅探
+            if (IsDuplicateClientOrderIdError(errorCode: null, message: ex.Message))
+            {
+                _logger.LogWarning(ex,
+                    "PlaceOrder threw duplicate-clientOrderId for {Symbol} cid={Cid} msg={Msg}",
+                    order.Symbol.BingXFormat, order.ClientOrderId, ex.Message);
+                throw new DuplicateClientOrderIdException(
+                    clientOrderId: order.ClientOrderId ?? string.Empty,
+                    rawErrorCode: null,
+                    rawErrorMessage: ex.Message,
+                    innerException: ex);
+            }
+
             _logger.LogError(ex, "Exception placing order for {Symbol}", order.Symbol.BingXFormat);
             if (order.IsActive) order.Reject($"Exception: {ex.Message}");
             throw;
         }
+    }
+
+    /// <summary>
+    /// S66-A：BingX 對 ClientOrderId 重複的官方 errorCode（T0 探針 2026-04-25 確診）。
+    /// 修改前必須重跑 <c>probe-bingx</c> 並更新 <c>Institutional_Memory.md §S66-A</c>。
+    /// </summary>
+    internal const int BingxDuplicateClientOrderIdErrorCode = 101400;
+
+    /// <summary>
+    /// S66-A 雙保險偵測：errorCode 主檢 + message 嗅探備援。
+    ///
+    /// **2026-04-25 T0 探針確診**（VST Demo 環境，<c>BTC-USDT</c>）：
+    /// BingX 對 duplicate ClientOrderId 回 <c>errorCode=101400</c>，
+    /// 訊息為 <c>"clientOrderID unique check failed"</c>。
+    /// 完整探針紀錄於 <c>Institutional_Memory.md §S66-A</c>。
+    ///
+    /// 雙層判定（任一命中即視為冪等衝突）：
+    ///   1. **errorCode 主防線**：<c>errorCode == 101400</c> — 精確、language-independent
+    ///   2. **message 備援防線**：含 "client" + (unique / duplicate / exists / already) 任一者 —
+    ///      用於防 BingX 之後改 errorCode 但訊息仍穩定的情境，或 SDK 未暴露 errorCode 的少數路徑。
+    ///
+    /// 偽陽性風險極低；偽陰性會降級為 Reject 流程（不會燒錢，僅錯失一次自癒機會）。
+    /// 升級 SDK 後第一件事必須跑 <c>probe-bingx</c> 確認 code 與訊息仍與 T0 紀錄一致。
+    /// </summary>
+    internal static bool IsDuplicateClientOrderIdError(int? errorCode, string? message)
+    {
+        // 主防線：errorCode 精確比對
+        if (errorCode == BingxDuplicateClientOrderIdErrorCode) return true;
+
+        // 備援防線：訊息嗅探
+        if (string.IsNullOrEmpty(message)) return false;
+        var lower = message.ToLowerInvariant();
+        if (!lower.Contains("client")) return false;
+        return lower.Contains("unique")
+            || lower.Contains("duplicate")
+            || lower.Contains("exists")
+            || lower.Contains("already");
     }
 
     public async Task CancelOrderAsync(Order order, CancellationToken ct = default)
@@ -394,6 +638,79 @@ public sealed class BingXExchangeClient : IExchangeClient
             order.Reject("Rejected on exchange");
         else if (remoteStatus == OrderStatus.Expired && order.IsActive)
             order.Expire();
+    }
+
+    /// <summary>
+    /// S66-A：以 clientOrderId 查詢 BingX 端任意狀態（非僅活躍）的訂單快照。
+    /// 用於 PlaceOrder 觸發 DuplicateClientOrderId 後的自癒對齊，以及 DiagnosticTool 對帳。
+    /// 找不到回 null（BingX 對未知 clientOrderId 通常回 110416 或類似 not-found 錯碼）。
+    /// </summary>
+    public async Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(clientOrderId))
+            throw new DomainException("clientOrderId must not be empty.");
+
+        try
+        {
+            var result = await _client.PerpetualFuturesApi.Trading
+                .GetOrderAsync(
+                    symbol: symbol.BingXFormat,
+                    orderId: (long?)null,
+                    clientOrderId: clientOrderId,
+                    ct: ct)
+                .ConfigureAwait(false);
+
+            if (!result.Success)
+            {
+                var errMsg = result.Error?.Message?.ToLowerInvariant() ?? string.Empty;
+                if (errMsg.Contains("not exist") || errMsg.Contains("not found") || errMsg.Contains("110416"))
+                    return null;
+                result.Check(nameof(GetOrderByClientOrderIdAsync));
+                return null;  // unreachable，Check 會 throw
+            }
+
+            var remote = result.Data;
+            if (remote is null) return null;
+
+            Symbol parsedSymbol;
+            try { parsedSymbol = Symbol.Parse(remote.Symbol); }
+            catch { parsedSymbol = symbol; }
+
+            var posSide = (remote.PositionSide ?? global::BingX.Net.Enums.PositionSide.Long).ToDomain();
+
+            return new ExchangeOrderSnapshot(
+                ExchangeOrderId: remote.OrderId.ToString(),
+                ClientOrderId: clientOrderId,
+                Symbol: parsedSymbol,
+                Side: remote.Side.ToDomain(),
+                PositionSide: posSide,
+                Status: remote.Status.ToDomain(),
+                Quantity: remote.Quantity ?? 0m,
+                QuantityFilled: remote.QuantityFilled ?? 0m,
+                AveragePrice: remote.AveragePrice,
+                UpdateTime: remote.UpdateTime);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            var msg = ex.Message?.ToLowerInvariant() ?? string.Empty;
+            if (msg.Contains("not exist") || msg.Contains("not found") || msg.Contains("110416"))
+                return null;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// S66-D：透過 BingX Perpetual Futures ExchangeData.GetServerTimeAsync 查詢伺服器時間。
+    /// SDK 回傳的就是 UTC DateTime — 直接傳出去由 NtpDriftMonitor 計算偏差。
+    /// </summary>
+    public async Task<DateTime> GetServerTimeAsync(CancellationToken ct = default)
+    {
+        var result = await _client.PerpetualFuturesApi.ExchangeData
+            .GetServerTimeAsync(ct).ConfigureAwait(false);
+        result.Check(nameof(GetServerTimeAsync));
+        return result.Data;
     }
 
     // ========== ListenKey (User Data WS lifecycle) ==========
@@ -503,6 +820,87 @@ public sealed class BingXExchangeClient : IExchangeClient
         }
 
         return list;
+    }
+
+    // ========== S61：交易所側活躍掛單 ==========
+
+    /// <summary>
+    /// S61-HOTFIX：改為**靜態型別**呼叫。原 dynamic 版在實機跑出 RuntimeBinderException —
+    /// JK.BingX.Net v3.10.0 的 Trading 具體實作類別為 <c>internal</c>，DLR runtime binder
+    /// 從 caller 視角看不到 internal 成員，即使方法存在也找不到。
+    ///
+    /// 路徑與 <see cref="CancelOrderAsync"/> / <see cref="RefreshOrderStatusAsync"/> 對齊：
+    /// <c>_client.PerpetualFuturesApi.Trading.GetOpenOrdersAsync(...)</c>。
+    /// 回傳僅含 <see cref="OrderStatus.New"/> / <see cref="OrderStatus.PartiallyFilled"/>。
+    /// </summary>
+    public async Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(
+        Symbol symbol, CancellationToken ct = default)
+    {
+        var result = await _client.PerpetualFuturesApi.Trading
+            .GetOpenOrdersAsync(symbol: symbol.BingXFormat, ct: ct)
+            .ConfigureAwait(false);
+
+        result.Check(nameof(GetOpenOrdersAsync));
+
+        var list = new List<ExchangeOpenOrderInfo>();
+        foreach (var o in result.Data)
+        {
+            var status = o.Status.ToDomain();
+            if (status != OrderStatus.New && status != OrderStatus.PartiallyFilled) continue;
+
+            Symbol parsedSymbol;
+            try { parsedSymbol = Symbol.Parse(o.Symbol); }
+            catch { continue; }
+
+            // 再次保險過濾（SDK symbol filter 某些版本會忽略）
+            if (!parsedSymbol.Equals(symbol)) continue;
+
+            // o.PositionSide 是 nullable 枚舉；o.UpdateTime 是 non-nullable DateTime
+            var posSide = (o.PositionSide ?? global::BingX.Net.Enums.PositionSide.Long).ToDomain();
+
+            list.Add(new ExchangeOpenOrderInfo(
+                ExchangeOrderId: o.OrderId.ToString(),
+                Symbol: parsedSymbol,
+                Side: o.Side.ToDomain(),
+                PositionSide: posSide,
+                Status: status,
+                Quantity: o.Quantity ?? 0m,
+                QuantityFilled: o.QuantityFilled ?? 0m,
+                Price: o.Price,
+                UpdateTime: o.UpdateTime));
+        }
+
+        return list;
+    }
+
+    /// <summary>
+    /// S62：把 SDK 給的「小數位數精度」(int) 轉為實際步進值。
+    /// precision=0 → 1；precision=4 → 0.0001；&lt;0 → 0（代表沒解析到）。
+    /// 用 decimal 逐次除 10 避免 Math.Pow(double) 的浮點漂移。
+    /// </summary>
+    internal static decimal PrecisionToStep(int precision)
+    {
+        if (precision < 0) return 0m;
+        if (precision == 0) return 1m;
+        decimal step = 1m;
+        for (int i = 0; i < precision; i++) step /= 10m;
+        return step;
+    }
+
+    private static decimal? TryReadDecimal(Func<decimal?> reader)
+    {
+        try
+        {
+            var v = reader();
+            return v is > 0m ? v : null;
+        }
+        catch { return null; }
+    }
+
+    private static int? TryReadInt(Func<int?> reader)
+    {
+        try { return reader(); }
+        catch { return null; }
     }
 }
 

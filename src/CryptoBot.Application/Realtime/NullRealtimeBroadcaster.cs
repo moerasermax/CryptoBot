@@ -11,4 +11,19 @@ public sealed class NullRealtimeBroadcaster : IRealtimeBroadcaster
 
     public Task BroadcastStatsAsync(DashboardStatsUpdate update, CancellationToken ct = default)
         => Task.CompletedTask;
+
+    public Task BroadcastPositionClosedAsync(PositionClosedUpdate update, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task BroadcastStrategyEvaluatedAsync(StrategyEvaluatedUpdate update, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task BroadcastPositionPnLAsync(PositionPnLTickUpdate update, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task BroadcastStrategyEvaluationFailedAsync(StrategyEvaluationFailedUpdate update, CancellationToken ct = default)
+        => Task.CompletedTask;
+
+    public Task BroadcastStrategyMetadataChangedAsync(StrategyMetadataChangedUpdate update, CancellationToken ct = default)
+        => Task.CompletedTask;
 }

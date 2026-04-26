@@ -1,6 +1,9 @@
 @page "/lab"
 @using System.Globalization
 @using System.Net.Http.Json
+@using CryptoBot.Application.Ai
+@using CryptoBot.Application.Backtesting.Search
+@using CryptoBot.ConsoleApp.Api
 @using CryptoBot.ConsoleApp.Api.Dtos
 @using CryptoBot.ConsoleApp.Components.Lab
 @using CryptoBot.ConsoleApp.Lab
@@ -8,7 +11,9 @@
 @using CryptoBot.ConsoleApp.Services
 @using CryptoBot.Domain.Aggregates.StrategyAggregate
 @using CryptoBot.Domain.Enums
+@using CryptoBot.Domain.Exceptions
 @using CryptoBot.Domain.Repositories
+@using CryptoBot.Domain.ValueObjects
 @using Microsoft.AspNetCore.Components
 @inject OptimizationOrchestrator Orchestrator
 @inject IServiceScopeFactory ScopeFactory
@@ -16,7 +21,8 @@
 @inject NavigationManager Nav
 @inject StrategyCatalog Catalog
 @inject LabStateContainer State
-@implements IDisposable
+@inject Microsoft.JSInterop.IJSRuntime JS
+@implements IAsyncDisposable
 
 <PageTitle>CryptoBot · Backtest Lab</PageTitle>
 
@@ -24,6 +30,43 @@
     回測實驗室主頁。資料層全部從 LabStateContainer 拿 — 切 tab、refresh、跨 tab 都不會丟資料。
     參數表單用 DynamicComponent 動態渲染 SelectedModel.FormComponent，所以新增策略不必碰這頁。
 *@
+
+@* FINAL-STABILITY T6：專業診斷 Modal —
+   取代 JS alert / toast 單行訊息，在 /apply 返回 400/500 時開啟，
+   把後端 body 原文完整顯示（S52 T3 的「參數衝突 / 缺失 / 邏輯衝突」訊息都會原樣出現）。
+   Dashboard.razor 的 env-modal-* 樣式已在全站生效，這裡直接沿用。 *@
+@if (_applyErrorDiag is not null)
+{
+    <div class="env-modal-backdrop">
+        <div class="env-modal" role="dialog" aria-modal="true" style="max-width:720px">
+            <div class="env-modal-header">
+                <span class="env-modal-icon">⚠️</span>
+                <h3>套用參數失敗 · 診斷詳情</h3>
+            </div>
+            <div class="env-modal-body">
+                <p class="env-modal-warn-line">
+                    後端回應：<strong>HTTP @_applyErrorDiag.HttpStatus</strong>
+                    @if (!string.IsNullOrWhiteSpace(_applyErrorDiag.StatusText))
+                    {
+                        <span> (@_applyErrorDiag.StatusText)</span>
+                    }
+                </p>
+                <ul class="env-modal-bullets">
+                    <li>策略 Key：<code>@_applyErrorDiag.StrategyKey</code></li>
+                    <li>目標策略：<strong>@_applyErrorDiag.TargetStrategyName</strong></li>
+                    <li>套用的參數摘要：<code>@_applyErrorDiag.RowSummary</code></li>
+                </ul>
+                <p class="env-modal-warn-line" style="margin-top:.75rem;">後端訊息：</p>
+                <pre style="max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,.35);padding:.75rem;border-radius:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.88rem;line-height:1.45;">@_applyErrorDiag.Body</pre>
+            </div>
+            <div class="env-modal-actions">
+                <button type="button" class="env-modal-btn env-modal-btn-cancel" @onclick="DismissApplyError">
+                    關閉
+                </button>
+            </div>
+        </div>
+    </div>
+}
 
 <StrategyTabsBar />
 
@@ -36,7 +79,7 @@
     <section class="panel glass">
         <header class="panel-header">
             <h2>Parameter Grid</h2>
-            <span class="panel-sub">BTC-USDT · 1h · Initial 10,000 USDT</span>
+            <span class="panel-sub">@_symbolInput · @IntervalLabel(_intervalInput) · Slippage @_slippageBpsInput bp · Initial @_initialBalanceInput.ToString("N0") USDT · Lev @_leverageInput×</span>
         </header>
 
         @if (_currentFormType is null)
@@ -50,20 +93,123 @@
                               @ref="_dynamicRef" />
         }
 
+        @* S25 T3：上次最佳結果提示卡 — 只在該 (策略, Symbol, Interval) 有快取時顯示。 *@
+        @if (_cachedSettings is not null)
+        {
+            <div class="cached-hint fade-in">
+                <span class="cached-hint-label">上次最佳結果</span>
+                <span class="cached-hint-body">
+                    Score = <strong class="@(_cachedSettings.Score >= 0 ? "pos" : "neg")">@_cachedSettings.Score.ToString("N2")%</strong>
+                    · @FormatCachedParams(_cachedSettings.Parameters)
+                    · <span class="cached-hint-time">@_cachedSettings.UpdatedAtUtc.ToString("yyyy-MM-dd HH:mm") UTC</span>
+                </span>
+                <button class="btn-apply"
+                        disabled="@State.IsRunning"
+                        @onclick="QuickFillFromCacheAsync">
+                    快速填入
+                </button>
+            </div>
+        }
+        else if (_cacheLoading)
+        {
+            <div class="cached-hint fade-in">
+                <span class="cached-hint-label">上次最佳結果</span>
+                <span class="cached-hint-body">載入中…</span>
+            </div>
+        }
+
         <div class="form-row">
             <label class="lead">Window</label>
             <div class="field">
                 <span>Start (UTC)</span>
-                <input type="date" @bind="_startDate" disabled="@State.IsRunning" />
+                <input type="date" @bind="_startDate" @bind:after="PersistFormSnapshot" disabled="@State.IsRunning" />
             </div>
             <div class="field">
                 <span>End (UTC)</span>
-                <input type="date" @bind="_endDate" disabled="@State.IsRunning" />
+                <input type="date" @bind="_endDate" @bind:after="PersistFormSnapshot" disabled="@State.IsRunning" />
             </div>
             <div class="field">
                 <span>Grid size</span>
                 <input type="text" value="@GridSizeLabel" disabled readonly />
             </div>
+        </div>
+
+        <div class="form-row">
+            <label class="lead">Market</label>
+            @* S32-S35-REVISED T2：Symbol 改 dropdown — 預置 Top 10 幣種一鍵切換，
+               最後一個「Manual」選項點下去會顯示手動輸入框給自訂 symbol。 *@
+            <div class="field">
+                <span>Symbol</span>
+                @* S56 T2 終極方案：GlassDropdown 取代原生 select。Symbol 下拉包含 10 個預設幣種
+                   + 最後一個 Manual sentinel，SymbolItems 把兩者串一起餵 Items。 *@
+                <GlassDropdown TValue="string"
+                               Value="@_symbolSelect"
+                               ValueChanged="@OnSymbolSelectedAsync"
+                               Items="@SymbolItems"
+                               Label="@(s => s == ManualSymbolKey ? "Manual…" : s)"
+                               Disabled="@State.IsRunning" />
+            </div>
+            @if (_isManualSymbol)
+            {
+                <div class="field">
+                    <span>Manual Symbol</span>
+                    <input type="text" @bind="_symbolInput" @bind:after="OnMarketChangedAsync"
+                           disabled="@State.IsRunning" placeholder="e.g. OP-USDT" />
+                </div>
+            }
+            <div class="field">
+                <span>Interval</span>
+                @* S56 T2 終極方案：GlassDropdown<KlineInterval> — 泛型吃 enum 直接用，Label 餵
+                   IntervalLabel 把 KlineInterval.OneHour 轉成 "1h"。 *@
+                <GlassDropdown TValue="KlineInterval"
+                               Value="@_intervalInput"
+                               ValueChanged="@OnIntervalSelectedAsync"
+                               Items="@_allowedIntervals"
+                               Label="@(i => IntervalLabel(i))"
+                               Disabled="@State.IsRunning" />
+            </div>
+            <div class="field">
+                <span>Slippage (bp)</span>
+                <input type="number" min="0" step="0.5" @bind="_slippageBpsInput"
+                       @bind:after="PersistFormSnapshot"
+                       disabled="@State.IsRunning" />
+            </div>
+            <div class="field">
+                <span>Initial (USDT)</span>
+                <input type="number" min="1" step="100" @bind="_initialBalanceInput"
+                       @bind:after="PersistFormSnapshot"
+                       disabled="@State.IsRunning" />
+            </div>
+            <div class="field">
+                <span>Leverage (×)</span>
+                <input type="number" min="1" max="100" step="1" @bind="_leverageInput"
+                       @bind:after="PersistFormSnapshot"
+                       disabled="@State.IsRunning" title="1..100x — 高倍數會觸發爆倉模擬" />
+            </div>
+        </div>
+
+        @* S67：搜尋演算法選擇器 — Grid（笛卡兒積）vs Random（依 budget 抽樣）。
+           Random 模式才會出現 Budget 欄位；切回 Grid 時 Budget 自動隱藏（值仍保留以利再切回）。 *@
+        <div class="form-row">
+            <label class="lead">Search</label>
+            <div class="field">
+                <span>Method</span>
+                <GlassDropdown TValue="SearchMethod"
+                               Value="@_searchMethod"
+                               ValueChanged="@OnSearchMethodChangedAsync"
+                               Items="@_searchMethodChoices"
+                               Label="@(s => SearchMethodLabel(s))"
+                               Disabled="@State.IsRunning" />
+            </div>
+            @if (_searchMethod == SearchMethod.Random)
+            {
+                <div class="field">
+                    <span>Budget</span>
+                    <input type="number" min="1" step="1" @bind="_randomBudget"
+                           disabled="@State.IsRunning"
+                           title="Random Search 取樣次數（每次從各維度獨立均勻抽一個值）" />
+                </div>
+            }
         </div>
 
         <div class="form-actions">
@@ -94,6 +240,13 @@
         }
     </section>
 
+    <AiAdvisorPanel StrategyKey="@State.SelectedModel.Key"
+                    StrategyDisplayName="@State.SelectedModel.DisplayName"
+                    ExpectedParameterKeys="@State.SelectedModel.ExpectedParameterKeys"
+                    Symbol="@_symbolInput"
+                    Interval="@_intervalInput"
+                    Disabled="@State.IsRunning" />
+
     <section class="panel glass">
         <header class="panel-header">
             <h2>Active Strategy</h2>
@@ -119,12 +272,8 @@
                     <strong class="@(_activeStrategy.Status == "Running" ? "pos" : "neg")">@_activeStrategy.Status</strong>
                 </div>
                 <div class="field">
-                    <span>Current Fast / Slow</span>
-                    <strong>
-                        @(_activeStrategy.Parameters.TryGetValue("FastSmaPeriod", out var f) ? ((int)f).ToString() : "—")
-                        /
-                        @(_activeStrategy.Parameters.TryGetValue("SlowSmaPeriod", out var s) ? ((int)s).ToString() : "—")
-                    </strong>
+                    <span>Current Parameters</span>
+                    <strong>@ActiveStrategyParameters</strong>
                 </div>
             </div>
         }
@@ -168,29 +317,52 @@
             <thead>
                 <tr>
                     <th>#</th>
-                    <th>Fast</th>
-                    <th>Slow</th>
+                    <th>Parameters</th>
                     <th>PnL (USDT)</th>
                     <th>Return</th>
                     <th>MaxDD</th>
                     <th>P/DD</th>
+                    <th>Sharpe</th>
                     <th>Fills</th>
                     <th></th>
                 </tr>
             </thead>
             <tbody>
-                @foreach (var row in State.Leaderboard.Rows)
+                @{
+                    // S36-S38 T3a：客戶端分頁 — 每頁 50 筆。切頁只改 _leaderboardPage，無 API 呼叫。
+                    var totalRows = State.Leaderboard.Rows.Count;
+                    var pageCount = Math.Max(1, (int)Math.Ceiling(totalRows / (double)LeaderboardPageSize));
+                    EnsureLeaderboardPageInBounds(pageCount);
+                    var pagedRows = State.Leaderboard.Rows
+                        .Skip(_leaderboardPage * LeaderboardPageSize)
+                        .Take(LeaderboardPageSize);
+                }
+                @foreach (var row in pagedRows)
                 {
-                    <tr class="@(row.Rank == 1 ? "rank-1" : "")">
+                    @* S32-T3：爆倉列用 row-liquidated class 整列標紅；Parameters 欄加 LIQUIDATED badge。 *@
+                    <tr class="@RowClass(row)">
                         <td>@row.Rank</td>
-                        <td>@row.Fast</td>
-                        <td>@row.Slow</td>
+                        <td>
+                            @row.ParameterSummary
+                            @if (row.IsLiquidated)
+                            {
+                                <span class="badge-liquidated" title="該組參數在回測期間爆倉（Equity ≤ 0）— 帳戶被強制歸零">LIQUIDATED</span>
+                            }
+                        </td>
                         <td class="@(row.NetPnL >= 0 ? "pos" : "neg")">@row.NetPnL.ToString("N4")</td>
                         <td class="@(row.ReturnPercent >= 0 ? "pos" : "neg")">@row.ReturnPercent.ToString("N2")%</td>
                         <td>@row.MaxDrawdownPercent.ToString("N2")%</td>
                         <td>@(row.IsInfiniteRatio ? "∞" : row.ProfitToDrawdownRatio.ToString("N2"))</td>
+                        <td class="@(row.SharpeRatio >= 0 ? "pos" : "neg")">@row.SharpeRatio.ToString("N2")</td>
                         <td>@row.Fills</td>
                         <td>
+                            @if (row.EquityCurve.Count > 0)
+                            {
+                                <button class="btn-apply"
+                                        @onclick="() => ShowChartAsync(row)">
+                                    📊 詳圖
+                                </button>
+                            }
                             <button class="btn-apply"
                                     disabled="@(_applyingFor != null || _activeStrategy is null)"
                                     @onclick="() => ApplyRowAsync(row)">
@@ -201,6 +373,29 @@
                 }
             </tbody>
         </table>
+
+        // S36-S38 T3a：分頁控制列。只在總筆數 > PageSize 時顯示。
+        var totalLbRows = State.Leaderboard.Rows.Count;
+        var lbPageCount = Math.Max(1, (int)Math.Ceiling(totalLbRows / (double)LeaderboardPageSize));
+        if (totalLbRows > LeaderboardPageSize)
+        {
+            var firstRow = _leaderboardPage * LeaderboardPageSize + 1;
+            var lastRow  = Math.Min(totalLbRows, (_leaderboardPage + 1) * LeaderboardPageSize);
+            <div class="lb-pagination">
+                <button class="btn-apply" disabled="@(_leaderboardPage == 0)"
+                        @onclick="() => GoToLeaderboardPage(0)">⏮ 第一頁</button>
+                <button class="btn-apply" disabled="@(_leaderboardPage == 0)"
+                        @onclick="() => GoToLeaderboardPage(_leaderboardPage - 1)">◀ 上一頁</button>
+                <span class="lb-pagination-info">
+                    第 <strong>@(_leaderboardPage + 1)</strong> / @lbPageCount 頁
+                    · 顯示 <strong>@firstRow–@lastRow</strong> / 共 @totalLbRows 筆
+                </span>
+                <button class="btn-apply" disabled="@(_leaderboardPage >= lbPageCount - 1)"
+                        @onclick="() => GoToLeaderboardPage(_leaderboardPage + 1)">下一頁 ▶</button>
+                <button class="btn-apply" disabled="@(_leaderboardPage >= lbPageCount - 1)"
+                        @onclick="() => GoToLeaderboardPage(lbPageCount - 1)">最後一頁 ⏭</button>
+            </div>
+        }
     }
 
     @if (!string.IsNullOrEmpty(State.LastError))
@@ -209,13 +404,82 @@
     }
 </section>
 
+@* S26 T3：權益曲線圖表面板。只在使用者點了某一 row 的「詳圖」後才顯示；
+   ApexCharts 透過 chart_interop.js 繪製，Fills 做 x 軸 annotation。 *@
+@if (_chartRow is not null)
+{
+    <section class="panel glass fade-in">
+        <header class="panel-header">
+            <h2>Equity Curve · Rank #@_chartRow.Rank</h2>
+            <span class="panel-sub">@_chartRow.ParameterSummary · Fills @_chartRow.Fills · Sharpe @_chartRow.SharpeRatio.ToString("N2")</span>
+        </header>
+        <div id="@ChartElementId" style="width: 100%; min-height: 360px;"></div>
+    </section>
+}
+
 @code {
     private DateTime _startDate = DateTime.UtcNow.Date.AddDays(-30);
     private DateTime _endDate   = DateTime.UtcNow.Date;
 
+    // S22-UI Lab Upgrade：Window 區塊的全局掃描參數。先前寫死在 Orchestrator 裡，
+    // 現在由 UI 提供，送後端前會過 Symbol.Parse + 正數檢查。
+    private string _symbolInput = "BTC-USDT";
+
+    // S32-S35-REVISED T2：Symbol 下拉選單狀態。
+    // - _topSymbols：PM 指定的 Top 10 預設幣種（一鍵切換，不必手打）
+    // - _symbolSelect：下拉目前值（若選中某個預設 → 也會同步寫進 _symbolInput；選「Manual」則顯示文字欄）
+    // - _isManualSymbol：使用者選了「Manual」要自行輸入；此時 _symbolInput 是真源
+    // - ManualSymbolKey：sentinel value，不能與任何真實 symbol 相同
+    private static readonly string[] _topSymbols = new[]
+    {
+        "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT",
+        "DOGE-USDT", "ADA-USDT", "AVAX-USDT", "DOT-USDT", "LINK-USDT",
+    };
+    private const string ManualSymbolKey = "__manual__";
+    private string _symbolSelect = "BTC-USDT";
+    private bool _isManualSymbol = false;
+
+    private KlineInterval _intervalInput = KlineInterval.OneHour;
+    private decimal _slippageBpsInput = 5m;
+    private decimal _initialBalanceInput = 10_000m;
+
+    // S32-T3：槓桿倍數（1..100x）。1x 維持向下相容（無爆倉風險），高倍數讓 BacktestSimulator
+    // 的 CheckAndApplyLiquidation 有機會觸發 — 使用者能在 Leaderboard 直接看到哪些參數組必爆倉。
+    // 預設 3x：既非 1x 無意義、也不像 50x 那樣預設就危險，讓新手第一次跑就感受到槓桿對 MaxDD 的放大。
+    private int _leverageInput = 3;
+
+    // S67：搜尋演算法（預設 Grid 維持重構前行為）。Random 模式才會啟用 _randomBudget。
+    // 不寫進 LabFormSnapshot — search method 屬於「每次優化的當下決策」，重整時讓使用者重選一次降低誤跑風險。
+    private SearchMethod _searchMethod = SearchMethod.Grid;
+    private int _randomBudget = 50;
+    private static readonly SearchMethod[] _searchMethodChoices = new[] { SearchMethod.Grid, SearchMethod.Random };
+
+    // 排除長週期（OneWeek / OneMonth）— 回測資料量 & 使用情境都不合理。
+    private static readonly KlineInterval[] _allowedIntervals = new[]
+    {
+        KlineInterval.OneMinute, KlineInterval.ThreeMinutes, KlineInterval.FiveMinutes,
+        KlineInterval.FifteenMinutes, KlineInterval.ThirtyMinutes,
+        KlineInterval.OneHour, KlineInterval.TwoHours, KlineInterval.FourHours,
+        KlineInterval.SixHours, KlineInterval.EightHours, KlineInterval.TwelveHours,
+        KlineInterval.OneDay, KlineInterval.ThreeDays,
+    };
+
     private string? _toast;
     private bool _toastIsError;
     private int? _applyingFor;
+
+    // FINAL-STABILITY T6：套用失敗的診斷 Modal 狀態。
+    // null = 不顯示；非 null = 把後端回傳的 body 原文 + 上下文（策略 key / 目標策略 / row 參數摘要）
+    // 全部攤在 Modal 裡給使用者看，不再是 alert() 只給 HTTP 數字的啞訊息。
+    private ApplyErrorDiagnostic? _applyErrorDiag;
+
+    private sealed record ApplyErrorDiagnostic(
+        int HttpStatus,
+        string StatusText,
+        string Body,
+        string RowSummary,
+        string StrategyKey,
+        string TargetStrategyName);
 
     private StrategyDto? _activeStrategy;
 
@@ -226,24 +490,119 @@
 
     private string? _lastSelectedKey;
 
+    // S25 T3：上次優化最佳結果（存在 StrategyOptimizationSettings）。
+    // null = 尚未撈 / 該組合無快取；非 null = 顯示提示卡。
+    private CachedSettingsDto? _cachedSettings;
+    private bool _cacheLoading;
+    // 併發保護：切策略/市場速度很快，只認最新一次 fetch 的結果。
+    private int _cacheFetchToken;
+
+    // S26 T3：圖表目前顯示的那一 row（使用者點「詳圖」後設定），null = 圖表面板收起。
+    private LeaderboardRowDto? _chartRow;
+    // 固定 element id 即可 — 一次只顯示一個圖，且整張 panel 隨 _chartRow 一起 render/unmount。
+    private const string ChartElementId = "lab-equity-chart";
+
+    // S36-S38 T3a：排行榜客戶端分頁。_leaderboardPage 是 0-based 頁碼；每次新優化跑完（新的
+    // LeaderboardSnapshot 物件抵達）會重設回 0。PageSize 寫死 50 — PM 指定且符合一般閱讀節奏。
+    private const int LeaderboardPageSize = 50;
+    private int _leaderboardPage;
+    private object? _lastLeaderboardRef;
+
+    private void GoToLeaderboardPage(int page)
+    {
+        _leaderboardPage = Math.Max(0, page);
+        StateHasChanged();
+    }
+
+    // 若 Leaderboard 物件換了（新優化跑完）或頁數縮小（過濾條件改變），強制把目前頁碼拉回合法範圍。
+    private void EnsureLeaderboardPageInBounds(int pageCount)
+    {
+        var currentRef = State.Leaderboard;
+        if (!ReferenceEquals(currentRef, _lastLeaderboardRef))
+        {
+            _leaderboardPage = 0;
+            _lastLeaderboardRef = currentRef;
+            return;
+        }
+        if (_leaderboardPage >= pageCount) _leaderboardPage = pageCount - 1;
+        if (_leaderboardPage < 0) _leaderboardPage = 0;
+    }
+
     protected override async Task OnInitializedAsync()
     {
         State.StateChanged += OnStateChanged;
+
+        // S47-REVISED VCP-Lab-Memory：從全域快照恢復 Symbol / Interval / Slippage /
+        // Initial / Leverage / Window — 切到 Dashboard 再回 /lab 時所有欄位原樣亮。
+        // 沒快照時（首次進頁）維持 C# 初始化器的預設值。
+        RestoreFormSnapshot();
+
         SyncFormToSelectedModel();
         await LoadActiveStrategyAsync();
+        _ = LoadCachedSettingsAsync();
+    }
+
+    /// <summary>
+    /// S47-REVISED：把 <see cref="LabStateContainer.TryGetFormSnapshot"/> 內容灌回本頁欄位。
+    /// 必須在 first render 前呼叫，確保使用者看到的就是上次離開時的狀態。
+    /// </summary>
+    private void RestoreFormSnapshot()
+    {
+        var snap = State.TryGetFormSnapshot();
+        if (snap is null) return;
+
+        _symbolInput          = snap.SymbolInput;
+        _symbolSelect         = snap.SymbolSelect;
+        _isManualSymbol       = snap.IsManualSymbol;
+        _intervalInput        = snap.Interval;
+        _slippageBpsInput     = snap.SlippageBps;
+        _initialBalanceInput  = snap.InitialBalance;
+        _leverageInput        = snap.Leverage;
+        _startDate            = snap.StartDateUtc;
+        _endDate              = snap.EndDateUtc;
+    }
+
+    /// <summary>
+    /// S47-REVISED：全域表單快照寫回點 — 掛在所有全域欄位的 <c>@bind:after</c>。
+    /// 每次使用者動了任何欄位就把目前全貌推進 LabStateContainer，不依賴按「開始掃描」。
+    /// </summary>
+    private void PersistFormSnapshot()
+    {
+        State.SaveFormSnapshot(new LabFormSnapshot(
+            SymbolInput:    _symbolInput,
+            SymbolSelect:   _symbolSelect,
+            IsManualSymbol: _isManualSymbol,
+            Interval:       _intervalInput,
+            SlippageBps:    _slippageBpsInput,
+            InitialBalance: _initialBalanceInput,
+            Leverage:       _leverageInput,
+            StartDateUtc:   _startDate,
+            EndDateUtc:     _endDate));
     }
 
     protected override void OnParametersSet() => SyncFormToSelectedModel();
 
     private void OnStateChanged() => InvokeAsync(() =>
     {
+        var selectionChanged = _lastSelectedKey != State.SelectedModel.Key;
         SyncFormToSelectedModel();
         StateHasChanged();
+        if (selectionChanged) _ = LoadCachedSettingsAsync();
     });
 
     private void SyncFormToSelectedModel()
     {
         if (_lastSelectedKey == State.SelectedModel.Key) return;
+
+        // S55 T3：切換前的「舊 form CurrentGrid → cache」保險網 — 實際上每次使用者動 Min/Max/Step
+        // 都會經 OnFormGridChanged 存過 cache，這裡是備份策略（防萬一 @bind:after 在極端時序下漏觸發）。
+        // 新的領取式設計下，新 form 的 OnInitializedAsync 會自行從 cache 拉回自己的網格 — 父頁面不再
+        // 經手 _pendingGridRestoreKey / OnAfterRenderAsync 時序。
+        if (_lastSelectedKey is not null
+            && _dynamicRef?.Instance is StrategyParameterFormBase priorForm)
+        {
+            State.SaveGridSettings(_lastSelectedKey, priorForm.CurrentGrid);
+        }
 
         _lastSelectedKey   = State.SelectedModel.Key;
         _currentFormType   = State.SelectedModel.FormComponent;
@@ -252,13 +611,170 @@
         {
             [nameof(StrategyParameterFormBase.Disabled)]         = State.IsRunning,
             [nameof(StrategyParameterFormBase.ParameterChanged)] = EventCallback.Factory.Create<int>(this, OnFormGridChanged),
+            // S55 T3：把策略 key 傳進 form — form 用它向 LabStateContainer 精準領取自己的網格快照。
+            [nameof(StrategyParameterFormBase.StrategyKey)]      = _lastSelectedKey,
         };
+    }
+
+    // S56 T2：GlassDropdown 的 Items 清單 — 預設 10 幣 + Manual sentinel。
+    // 延遲計算（每次 render 都串一次）成本忽略不計；10+1 個 string。
+    private IEnumerable<string> SymbolItems
+        => _topSymbols.Concat(new[] { ManualSymbolKey });
+
+    // S56 T2：GlassDropdown<string> ValueChanged wrapper — bind + after-callback 二合一。
+    private async Task OnSymbolSelectedAsync(string newValue)
+    {
+        _symbolSelect = newValue;
+        await OnSymbolSelectChangedAsync();
+    }
+
+    // S56 T2：GlassDropdown<KlineInterval> ValueChanged wrapper — 同上邏輯。
+    private async Task OnIntervalSelectedAsync(KlineInterval newInterval)
+    {
+        _intervalInput = newInterval;
+        await OnMarketChangedAsync();
+    }
+
+    // S67：GlassDropdown<SearchMethod> ValueChanged — 純 UI 狀態切換，不重打 cache（搜尋方法不影響 cache key）。
+    private Task OnSearchMethodChangedAsync(SearchMethod newMethod)
+    {
+        _searchMethod = newMethod;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    private static string SearchMethodLabel(SearchMethod m) => m switch
+    {
+        SearchMethod.Random => "Random Search",
+        _                   => "Grid Search",
+    };
+
+    private Task OnMarketChangedAsync()
+    {
+        PersistFormSnapshot();   // S47-REVISED：Symbol/Interval/Manual 任一動就寫回快照
+        return LoadCachedSettingsAsync();
+    }
+
+    /// <summary>
+    /// S32-S35-REVISED T2：下拉切換處理。
+    /// 選「Manual」→ 進入手動輸入模式（不改 _symbolInput，讓使用者自訂）；
+    /// 選某個預設 → 同步寫入 _symbolInput 並觸發快取提示查詢。
+    /// </summary>
+    private Task OnSymbolSelectChangedAsync()
+    {
+        if (_symbolSelect == ManualSymbolKey)
+        {
+            _isManualSymbol = true;
+            PersistFormSnapshot();              // S47-REVISED：即使還沒填 Manual 也要記住切到 Manual
+            return Task.CompletedTask;          // 等使用者填完再跑 OnMarketChangedAsync
+        }
+
+        _isManualSymbol = false;
+        _symbolInput = _symbolSelect;
+        PersistFormSnapshot();                  // S47-REVISED
+        return LoadCachedSettingsAsync();
+    }
+
+    private async Task LoadCachedSettingsAsync()
+    {
+        var myToken = ++_cacheFetchToken;
+
+        // 先清舊提示，避免留顯與目前 (strategy, symbol, interval) 不符的資料。
+        _cachedSettings = null;
+
+        // Symbol 欄位使用者可能暫時是半成品，先驗一下格式；失敗視為「無快取」不噪訊。
+        string? normalizedSymbol = null;
+        try { normalizedSymbol = Symbol.Parse(_symbolInput).BingXFormat; }
+        catch (DomainException) { _cacheLoading = false; StateHasChanged(); return; }
+
+        _cacheLoading = true;
+        StateHasChanged();
+
+        try
+        {
+            using var http = HttpFactory.CreateClient();
+            http.BaseAddress = new Uri(Nav.BaseUri);
+            var url = $"/api/lab/cached-settings/{Uri.EscapeDataString(State.SelectedModel.Key)}"
+                    + $"?symbol={Uri.EscapeDataString(normalizedSymbol)}"
+                    + $"&interval={_intervalInput}";
+            var resp = await http.GetAsync(url);
+            if (myToken != _cacheFetchToken) return; // 被更晚的 fetch 取代
+            if (resp.IsSuccessStatusCode)
+            {
+                _cachedSettings = await resp.Content.ReadFromJsonAsync<CachedSettingsDto>();
+            }
+        }
+        catch
+        {
+            // 快取查詢失敗不該擋住用戶操作 — 靜默吞掉，UI 只是不顯示提示。
+        }
+        finally
+        {
+            if (myToken == _cacheFetchToken)
+            {
+                _cacheLoading = false;
+                StateHasChanged();
+            }
+        }
+    }
+
+    private async Task QuickFillFromCacheAsync()
+    {
+        if (_cachedSettings is null) return;
+        if (_dynamicRef?.Instance is not StrategyParameterFormBase form) return;
+        await form.ApplyParametersAsync(_cachedSettings.Parameters);
+        _toast = "✓ 已填入上次最佳結果 — 按「開始優化掃描」即可回放。";
+        _toastIsError = false;
+        StateHasChanged();
+    }
+
+    private static string FormatCachedParams(IReadOnlyDictionary<string, decimal> parameters)
+    {
+        if (parameters.Count == 0) return "—";
+        return string.Join(" · ", parameters.Select(kv =>
+            kv.Value == Math.Floor(kv.Value)
+                ? $"{kv.Key}={(int)kv.Value}"
+                : $"{kv.Key}={kv.Value.ToString(CultureInfo.InvariantCulture)}"));
     }
 
     private void OnFormGridChanged(int gridSize)
     {
         _currentGridSize = gridSize;
+
+        // S55 T3：領取式設計下，form 的 OnInitializedAsync 會「先自拉 cache → 再 Notify」，
+        // 所以初始化時這個 callback 收到的 CurrentGrid 若 cache 存在就已經是 cache 值本身
+        // （套完 ApplyGridParametersAsync 再 Notify）— 回寫 cache = 寫進一模一樣的值，冪等無害。
+        // 真正的初始化噪音場景：「cache 沒命中（首次進頁 / 未記錄 key）」且 form 吐預設值 —
+        // 這時寫進 cache 當 baseline 是正確的，不該跳過。
+        // 因此這裡不再需要 _pendingGridRestoreKey 旗標 — 時序判斷下放到 form 自己。
+        // 唯一保留的小優化：若 cache 與 form 的 CurrentGrid 完全相等，跳過重複寫入減少噪音。
+        if (_dynamicRef?.Instance is StrategyParameterFormBase form)
+        {
+            var key = State.SelectedModel.Key;
+            var current = form.CurrentGrid;
+            var cached = State.TryGetGridSettings(key);
+            if (cached is null || !GridEquals(cached, current))
+                State.SaveGridSettings(key, current);
+        }
         StateHasChanged();
+    }
+
+    /// <summary>
+    /// S55 T3：冪等寫入優化用的結構相等比對 — 避免 form 初始化的 Notify 事件在快取已經是相同值時
+    /// 反覆把同樣內容寫進 ConcurrentDictionary（單純降低噪音，不影響正確性）。
+    /// </summary>
+    private static bool GridEquals(
+        IReadOnlyDictionary<string, ParameterGridRange> a,
+        IReadOnlyDictionary<string, ParameterGridRange> b)
+    {
+        if (a.Count != b.Count) return false;
+        foreach (var kv in a)
+        {
+            if (!b.TryGetValue(kv.Key, out var other)) return false;
+            if (other.Min != kv.Value.Min || other.Max != kv.Value.Max || other.Step != kv.Value.Step)
+                return false;
+        }
+        return true;
     }
 
     private async Task LoadActiveStrategyAsync()
@@ -273,6 +789,26 @@
 
     private string GridSizeLabel => _currentGridSize <= 0 ? "—" : _currentGridSize.ToString();
 
+    // S32-T3：爆倉列優先顯示紅色背景；非爆倉的 Rank 1 保留原 rank-1 樣式。
+    private static string RowClass(LeaderboardRowDto row)
+    {
+        if (row.IsLiquidated) return "row-liquidated";
+        if (row.Rank == 1) return "rank-1";
+        return string.Empty;
+    }
+
+    private string ActiveStrategyParameters
+    {
+        get
+        {
+            if (_activeStrategy is null || _activeStrategy.Parameters.Count == 0) return "—";
+            return string.Join(" · ", _activeStrategy.Parameters.Select(kv =>
+                kv.Value == Math.Floor(kv.Value)
+                    ? $"{kv.Key}={(int)kv.Value}"
+                    : $"{kv.Key}={kv.Value}"));
+        }
+    }
+
     private string PercentLabel
     {
         get
@@ -283,6 +819,26 @@
             return $"{pct}%";
         }
     }
+
+    private static string IntervalLabel(KlineInterval i) => i switch
+    {
+        KlineInterval.OneMinute      => "1m",
+        KlineInterval.ThreeMinutes   => "3m",
+        KlineInterval.FiveMinutes    => "5m",
+        KlineInterval.FifteenMinutes => "15m",
+        KlineInterval.ThirtyMinutes  => "30m",
+        KlineInterval.OneHour        => "1h",
+        KlineInterval.TwoHours       => "2h",
+        KlineInterval.FourHours      => "4h",
+        KlineInterval.SixHours       => "6h",
+        KlineInterval.EightHours     => "8h",
+        KlineInterval.TwelveHours    => "12h",
+        KlineInterval.OneDay         => "1d",
+        KlineInterval.ThreeDays      => "3d",
+        KlineInterval.OneWeek        => "1w",
+        KlineInterval.OneMonth       => "1M",
+        _                             => i.ToString(),
+    };
 
     private static string FormatTs(TimeSpan? ts)
     {
@@ -306,10 +862,53 @@
             return;
         }
 
+        // 全局參數預驗證：Symbol 格式、Slippage 非負、Initial Balance 正數。
+        // 與後端 LabEndpoints.ValidateRequest 形成兩道關，API 直呼也擋得住。
+        string normalizedSymbol;
+        try
+        {
+            normalizedSymbol = Symbol.Parse(_symbolInput).BingXFormat;
+        }
+        catch (DomainException ex)
+        {
+            _toast = $"Symbol 格式錯誤：{ex.Message}";
+            _toastIsError = true;
+            return;
+        }
+
+        if (_slippageBpsInput < 0m)
+        {
+            _toast = "Slippage 必須為非負數（0 代表無滑價模擬）。";
+            _toastIsError = true;
+            return;
+        }
+
+        if (_initialBalanceInput <= 0m)
+        {
+            _toast = "Initial Balance 必須為正數。";
+            _toastIsError = true;
+            return;
+        }
+
+        // S32-T3：Leverage 驗證與 Domain Leverage VO 的放寬上限（max=100）一致。
+        if (_leverageInput < 1 || _leverageInput > 100)
+        {
+            _toast = "Leverage 必須為 1..100 之間的整數。";
+            _toastIsError = true;
+            return;
+        }
+
         var startUtc = DateTime.SpecifyKind(_startDate, DateTimeKind.Utc);
         var endUtc   = DateTime.SpecifyKind(_endDate,   DateTimeKind.Utc);
 
-        var req = form.BuildRequest(startUtc, endUtc, out var error);
+        var globals = new OptimizationGlobals(
+            Symbol: normalizedSymbol,
+            Interval: _intervalInput,
+            SlippageBps: _slippageBpsInput,
+            InitialBalance: _initialBalanceInput,
+            Leverage: _leverageInput);
+
+        var req = form.BuildRequest(globals, startUtc, endUtc, out var error);
         if (req is null)
         {
             _toast = error ?? "參數驗證失敗。";
@@ -317,7 +916,26 @@
             return;
         }
 
-        State.NotifyJobStarting(_currentGridSize);
+        // S67：Random 模式需要 budget ≥ 1；Grid 不需要。提前擋住避免送出無效 request。
+        if (_searchMethod == SearchMethod.Random && _randomBudget < 1)
+        {
+            _toast = "Random Search budget 必須 ≥ 1。";
+            _toastIsError = true;
+            return;
+        }
+
+        // S67：Strategy 表單只負責 Strategy-specific 欄位（StrategyKey / Ranges / 全局 globals），
+        // 搜尋方法是頁面層的全域選擇 — 在 request 物件成形後用 record `with` 注入，
+        // 避免每個 *ParameterForm.razor 都要學會 SearchMethod 介面。
+        req = req with
+        {
+            SearchMethod = _searchMethod,
+            RandomBudget = _searchMethod == SearchMethod.Random ? _randomBudget : null,
+        };
+
+        // 進度總數依搜尋方法切換 — Random=budget；Grid 沿用既有計算（form 內部產出的 Ranges 大小）。
+        var progressTotal = _searchMethod == SearchMethod.Random ? _randomBudget : _currentGridSize;
+        State.NotifyJobStarting(progressTotal);
         StateHasChanged();
 
         using var http = HttpFactory.CreateClient();
@@ -344,30 +962,56 @@
         if (_activeStrategy is null) return;
         _applyingFor = row.Rank;
         _toast = null;
+        _applyErrorDiag = null; // FINAL-STABILITY T6：新一次套用清掉舊錯誤 Modal
         StateHasChanged();
 
         using var http = HttpFactory.CreateClient();
         http.BaseAddress = new Uri(Nav.BaseUri);
         try
         {
+            // S45 / S42-S47：把當前實驗室的「模型 key + Symbol + Interval」全包一起送 —
+            // 後端會同步覆寫 StrategyType + Symbol + Interval + Parameters，並自動改名為
+            // [模型名] 幣種-週期 (Opt)。Dashboard 下一個心跳即同步顯示。
             var resp = await http.PostAsJsonAsync(
                 $"/api/lab/apply/{_activeStrategy.Id}",
-                new ApplyParamsRequest(row.Fast, row.Slow));
+                new ApplyParamsRequest(
+                    Parameters: row.Parameters,
+                    StrategyKey: State.SelectedModel.Key,
+                    Symbol: _symbolInput,
+                    Interval: _intervalInput));
             if (resp.IsSuccessStatusCode)
             {
-                _toast = $"✓ 已套用 Fast={row.Fast} / Slow={row.Slow} 到 {_activeStrategy.Name}";
+                _toast = $"✓ 已套用 {row.ParameterSummary} 到 {_activeStrategy.Name}";
                 _toastIsError = false;
                 await LoadActiveStrategyAsync();
             }
             else
             {
-                _toast = $"套用失敗：HTTP {(int)resp.StatusCode}";
+                // FINAL-STABILITY T6：400 / 500 都把後端 body 原文撈出來，丟進 Modal 給使用者看完整診斷。
+                // 只靠 `套用失敗：HTTP 400` 對使用者是啞訊息 — S52 T3 回傳的「參數衝突 / 參數缺失 / 邏輯衝突」
+                // 文字必須完整顯示出來才能自救排錯。
+                var bodyText = await SafeReadBodyAsync(resp).ConfigureAwait(false);
+                _applyErrorDiag = new ApplyErrorDiagnostic(
+                    HttpStatus: (int)resp.StatusCode,
+                    StatusText: resp.ReasonPhrase ?? string.Empty,
+                    Body: bodyText,
+                    RowSummary: row.ParameterSummary,
+                    StrategyKey: State.SelectedModel.Key,
+                    TargetStrategyName: _activeStrategy.Name);
+                _toast = $"套用失敗：HTTP {(int)resp.StatusCode}（已開啟診斷）";
                 _toastIsError = true;
             }
         }
         catch (Exception ex)
         {
-            _toast = $"套用失敗：{ex.Message}";
+            _applyErrorDiag = new ApplyErrorDiagnostic(
+                HttpStatus: 0,
+                StatusText: "Client Exception",
+                Body: ex.ToString(),
+                RowSummary: row.ParameterSummary,
+                StrategyKey: State.SelectedModel.Key,
+                TargetStrategyName: _activeStrategy?.Name ?? "(未知)");
+            _toast = $"套用失敗：{ex.Message}（已開啟診斷）";
             _toastIsError = true;
         }
         finally
@@ -377,8 +1021,55 @@
         }
     }
 
-    public void Dispose()
+    /// <summary>
+    /// FINAL-STABILITY T6：安全讀取 response body — 非 2xx 回應時用來抓後端錯誤訊息。
+    /// 空 body 或讀取例外都不該讓 Modal 的 open 流程掉鏈子，所以這支絕不拋。
+    /// </summary>
+    private static async Task<string> SafeReadBodyAsync(HttpResponseMessage resp)
+    {
+        try
+        {
+            var text = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+            return string.IsNullOrWhiteSpace(text) ? "(空 body)" : text;
+        }
+        catch (Exception ex)
+        {
+            return $"(讀取 body 失敗：{ex.Message})";
+        }
+    }
+
+    private void DismissApplyError() => _applyErrorDiag = null;
+
+    private async Task ShowChartAsync(LeaderboardRowDto row)
+    {
+        if (row.EquityCurve.Count == 0) return;
+        _chartRow = row;
+        StateHasChanged();
+
+        // 等 Blazor 把 div 渲染到 DOM 後再呼 JS；直接 await 即可（InvokeAsync 後的第一個 Render 已寫入 DOM）。
+        var title = $"Rank #{row.Rank} · {row.ParameterSummary}";
+        try
+        {
+            await JS.InvokeVoidAsync(
+                "cryptoBotChart.render",
+                ChartElementId, row.EquityCurve, row.FillMarkers, title);
+        }
+        catch (Microsoft.JSInterop.JSException ex)
+        {
+            _toast = $"圖表渲染失敗：{ex.Message}";
+            _toastIsError = true;
+            StateHasChanged();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
     {
         State.StateChanged -= OnStateChanged;
+        // Blazor 解除元件時嘗試 destroy 圖表 — 失敗（例如斷線）忽略。
+        if (_chartRow is not null)
+        {
+            try { await JS.InvokeVoidAsync("cryptoBotChart.dispose", ChartElementId); }
+            catch { /* ignore */ }
+        }
     }
 }

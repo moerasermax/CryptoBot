@@ -1,0 +1,415 @@
+@namespace CryptoBot.ConsoleApp.Components.Lab
+@using System.Globalization
+@using System.Net.Http.Json
+@using System.Text
+@using CryptoBot.Application.Ai
+@using CryptoBot.ConsoleApp.Api
+@using CryptoBot.Domain.Enums
+@inject IHttpClientFactory HttpFactory
+@inject NavigationManager Nav
+@inject IJSRuntime Js
+
+@*
+    S36-S38 T2：AI 導師 Prompt 產生器。
+    - 先前版本（S30）會直接呼叫後端 Gemini；PM 改為「AI 降級可控化」：
+      面板本地彙整 Symbol / Interval / Indicators 產出深度分析 Prompt，使用者可自選丟進
+      ChatGPT / Claude / Gemini 哪一家都行 — 不綁定特定 API，也不吃 Gemini 金鑰配額。
+    - 後端 `/api/ai/context` 只跑 MarketContextBuilder（指標計算），不觸發任何 LLM 呼叫。
+    - Top 10 橫掃（S32-S35-REVISED T3）保留 — 兩顆按鈕差別只在「單一 symbol vs 10 symbols」。
+*@
+
+<section class="panel glass ai-panel">
+    <header class="panel-header">
+        <h2>🤖 AI 量化導師 · Prompt 產生器</h2>
+        <span class="panel-sub">
+            按按鈕產生深度分析 Prompt — 複製到任何 LLM 取得專家級回應
+        </span>
+    </header>
+
+    <div class="ai-actions">
+        <button class="btn-primary" disabled="@(_busy || _sweepBusy || Disabled)" @onclick="GenerateAdvicePromptAsync">
+            @(_busy ? "擷取指標中…" : "📝 生成分析 Prompt")
+        </button>
+
+        @* S32-S35-REVISED T3：一鍵抓 Top 10 幣種技術面快照，生成 copy-paste 用的 LLM 分析 Prompt。*@
+        <button class="btn-primary" disabled="@(_busy || _sweepBusy || Disabled)" @onclick="ScanMarketSweepAsync">
+            @(_sweepBusy ? "掃描中…" : "🚀 掃描 Top 10 市場機會")
+        </button>
+    </div>
+
+    @if (_adviceError is not null)
+    {
+        <div class="ai-error fade-in">⚠ @_adviceError</div>
+    }
+    else if (_adviceSnapshot is not null && _advicePrompt is not null)
+    {
+        <details class="ai-diagnostics fade-in" open>
+            <summary>
+                📝 單一 Symbol 分析 Prompt（@_adviceSnapshot.Symbol · @_adviceSnapshot.Interval ·
+                Trend @_adviceSnapshot.TrendLabel）
+            </summary>
+
+            <div class="ai-actions" style="margin-top:.5rem">
+                <button class="btn-apply" @onclick="CopyAdvicePromptAsync">📋 複製 Prompt</button>
+                @if (!string.IsNullOrEmpty(_adviceToast))
+                {
+                    <span class="lab-toast ok">@_adviceToast</span>
+                }
+            </div>
+
+            @* S48：字體放大 + 等寬字型 — Prompt 內 Min/Max/Step 常是數字對齊；大字也避免使用者漏看「當前決策模型」行。 *@
+            <textarea class="ai-sweep-prompt" readonly rows="16"
+                      style="font-size:1.05rem;line-height:1.6;font-family:ui-monospace,Menlo,Consolas,monospace"
+                      @ref="_advicePromptRef">@_advicePrompt</textarea>
+
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Close</th>
+                        <th>Δ%</th>
+                        <th>RSI14</th>
+                        <th>ATR14</th>
+                        <th>EMA20</th>
+                        <th>EMA50</th>
+                        <th>BB%</th>
+                        <th>Trend</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>@_adviceSnapshot.Symbol</code></td>
+                        <td>@_adviceSnapshot.LatestClose.ToString("F4", CultureInfo.InvariantCulture)</td>
+                        <td class="@(_adviceSnapshot.PercentChange >= 0 ? "pos" : "neg")">
+                            @_adviceSnapshot.PercentChange.ToString("+0.00;-0.00;0.00", CultureInfo.InvariantCulture)%
+                        </td>
+                        <td>@FormatDecOrDash(_adviceSnapshot.Rsi14)</td>
+                        <td>@FormatDecOrDash(_adviceSnapshot.Atr14, "F4")</td>
+                        <td>@FormatDecOrDash(_adviceSnapshot.Ema20, "F4")</td>
+                        <td>@FormatDecOrDash(_adviceSnapshot.Ema50, "F4")</td>
+                        <td>@FormatDecOrDash(_adviceSnapshot.BbPositionPercent)</td>
+                        <td>@_adviceSnapshot.TrendLabel</td>
+                    </tr>
+                </tbody>
+            </table>
+        </details>
+    }
+    else
+    {
+        <div class="ai-hint">
+            提示：面板會把最近 100 根 K 線算出的 RSI / ATR / Bollinger / EMA 組成中文分析 Prompt，
+            你可以複製後貼到 ChatGPT / Claude / Gemini 任一家 LLM 取得專家級分析 —
+            不必再先配 API 金鑰，也不吃系統 Gemini 配額。
+        </div>
+    }
+
+    @* S32-S35-REVISED T3：Top 10 橫掃結果 — 錯誤紅字、成功給出可複製 Prompt + 快照列表。 *@
+    @if (_sweepError is not null)
+    {
+        <div class="ai-error fade-in">⚠ 市場橫掃失敗：@_sweepError</div>
+    }
+    else if (_sweepResult is not null)
+    {
+        <details class="ai-diagnostics fade-in" open>
+            <summary>🌐 Top 10 市場橫掃（@_sweepResult.Interval · @_sweepResult.GeneratedAtUtc.ToLocalTime().ToString("HH:mm:ss")）</summary>
+
+            <div class="ai-actions" style="margin-top:.5rem">
+                <button class="btn-apply" @onclick="CopySweepPromptAsync">📋 複製分析 Prompt</button>
+                @if (!string.IsNullOrEmpty(_sweepToast))
+                {
+                    <span class="lab-toast ok">@_sweepToast</span>
+                }
+            </div>
+
+            <textarea class="ai-sweep-prompt" readonly rows="14"
+                      style="font-size:1.05rem;line-height:1.6;font-family:ui-monospace,Menlo,Consolas,monospace"
+                      @ref="_sweepPromptRef">@_sweepResult.Prompt</textarea>
+
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Close</th>
+                        <th>Δ%</th>
+                        <th>RSI14</th>
+                        <th>ATR14</th>
+                        <th>EMA20</th>
+                        <th>EMA50</th>
+                        <th>BB%</th>
+                        <th>Trend</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var s in _sweepResult.Snapshots)
+                    {
+                        @if (s.Error is not null)
+                        {
+                            <tr class="neg">
+                                <td><code>@s.Symbol</code></td>
+                                <td colspan="8"><span class="ai-error-inline">@s.Error</span></td>
+                            </tr>
+                        }
+                        else
+                        {
+                            <tr>
+                                <td><code>@s.Symbol</code></td>
+                                <td>@s.LatestClose.ToString("F4", CultureInfo.InvariantCulture)</td>
+                                <td class="@(s.PercentChange >= 0 ? "pos" : "neg")">
+                                    @s.PercentChange.ToString("+0.00;-0.00;0.00", CultureInfo.InvariantCulture)%
+                                </td>
+                                <td>@FormatDecOrDash(s.Rsi14)</td>
+                                <td>@FormatDecOrDash(s.Atr14, "F4")</td>
+                                <td>@FormatDecOrDash(s.Ema20, "F4")</td>
+                                <td>@FormatDecOrDash(s.Ema50, "F4")</td>
+                                <td>@FormatDecOrDash(s.BbPositionPercent)</td>
+                                <td>@s.TrendLabel</td>
+                            </tr>
+                        }
+                    }
+                </tbody>
+            </table>
+        </details>
+    }
+</section>
+
+@code {
+    /// <summary>父頁面傳入的當前策略 key（例：sma / rsi-bb / trend / mean-reversion）— 用於 Prompt 裡標註策略背景。</summary>
+    [Parameter, EditorRequired] public string StrategyKey { get; set; } = string.Empty;
+
+    /// <summary>S48：完整模型名（StrategyCatalog.DisplayName）— 比 key 更易讀，放在 Prompt 頂端讓 AI 一眼認出在分析哪個大腦。</summary>
+    [Parameter] public string StrategyDisplayName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// S55 FS-V2 T3：系統對該策略要求的強型別參數鍵名（<c>StrategyCatalog.ExpectedParameterKeys</c>）。
+    /// 注入到 Prompt 裡做明確約束，消除 AI 用 <c>fast_ema / fast / FastPeriod</c> 等別名亂猜名稱的問題。
+    /// 空陣列 = 沒約束（保留 Prompt 先前的通用措辭）。
+    /// </summary>
+    [Parameter] public IReadOnlyList<string> ExpectedParameterKeys { get; set; } = Array.Empty<string>();
+
+    /// <summary>當前 Symbol（BTC-USDT 格式）— 空字串即禁用。</summary>
+    [Parameter, EditorRequired] public string Symbol { get; set; } = string.Empty;
+
+    /// <summary>當前 KlineInterval。</summary>
+    [Parameter, EditorRequired] public KlineInterval Interval { get; set; }
+
+    /// <summary>掃描中時禁用 AI 按鈕，避免跟 API 搶資源。</summary>
+    [Parameter] public bool Disabled { get; set; }
+
+    // 單一 symbol 的 Prompt 生成狀態
+    private bool _busy;
+    private MarketSweepSnapshotDto? _adviceSnapshot;
+    private string? _advicePrompt;
+    private string? _adviceError;
+    private string? _adviceToast;
+    private ElementReference _advicePromptRef;
+
+    // S32-S35-REVISED T3：Top 10 市場橫掃狀態。獨立於單一 symbol 諮詢，避免兩者互相覆蓋結果。
+    private bool _sweepBusy;
+    private MarketSweepResponseDto? _sweepResult;
+    private string? _sweepError;
+    private string? _sweepToast;
+    private ElementReference _sweepPromptRef;
+
+    // S36-S38 T2：本地生成分析 Prompt。向後端 `/api/ai/context` 要指標快照（純計算、不碰 LLM），
+    // 再在 client 端組成中文 Prompt。使用者拿這段文字到任何 LLM 都能獲得專家級分析。
+    private async Task GenerateAdvicePromptAsync()
+    {
+        _adviceError = null;
+        _adviceToast = null;
+
+        if (string.IsNullOrWhiteSpace(Symbol))
+        {
+            _adviceError = "請先選擇 Symbol。";
+            return;
+        }
+
+        _busy = true;
+        StateHasChanged();
+        try
+        {
+            using var http = HttpFactory.CreateClient();
+            http.BaseAddress = new Uri(Nav.BaseUri);
+            var resp = await http.GetAsync(
+                $"/api/ai/context?symbol={Uri.EscapeDataString(Symbol)}&interval={Interval}");
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                _adviceError = $"HTTP {(int)resp.StatusCode}：{await resp.Content.ReadAsStringAsync()}";
+                _adviceSnapshot = null;
+                _advicePrompt = null;
+                return;
+            }
+
+            var snap = await resp.Content.ReadFromJsonAsync<MarketSweepSnapshotDto>();
+            if (snap is null)
+            {
+                _adviceError = "後端回傳空資料。";
+                _adviceSnapshot = null;
+                _advicePrompt = null;
+                return;
+            }
+            if (snap.Error is not null)
+            {
+                _adviceError = snap.Error;
+                _adviceSnapshot = null;
+                _advicePrompt = null;
+                return;
+            }
+
+            _adviceSnapshot = snap;
+            _advicePrompt = BuildAdvicePrompt(StrategyKey, StrategyDisplayName, ExpectedParameterKeys, snap);
+        }
+        catch (Exception ex)
+        {
+            _adviceError = ex.Message;
+            _adviceSnapshot = null;
+            _advicePrompt = null;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private static string BuildAdvicePrompt(
+        string strategyKey,
+        string strategyDisplayName,
+        IReadOnlyList<string> expectedParameterKeys,
+        MarketSweepSnapshotDto s)
+    {
+        string Dec(decimal? v, string fmt = "F2") =>
+            v is null ? "—" : v.Value.ToString(fmt, CultureInfo.InvariantCulture);
+
+        // S48：key → 中文說明的 fallback，僅在 DisplayName 為空時使用。
+        var strategyLabel = strategyKey switch
+        {
+            "sma"            => "SMA Crossover（雙均線金叉 / 死叉）",
+            "trend"          => "EMA Trend Following（EMA 黃金/死亡交叉 × RSI 動能）",
+            "mean-reversion" => "Bollinger Reversion（布林通道 × RSI 極端反轉）",
+            "rsi-bb"         => "B46 Hybrid Model（RSI × Bollinger 複合訊號）",
+            "pa"             => "Price Action Predictor（裸 K 形態 × 動能雙驗證）",
+            _                => string.IsNullOrWhiteSpace(strategyKey) ? "（未指定）" : strategyKey,
+        };
+
+        // S48 VCP-Smart-Prompt：Prompt 最頂端標註「當前決策模型」，AI 一眼認出在分析哪顆大腦。
+        var headerModel = string.IsNullOrWhiteSpace(strategyDisplayName) ? strategyLabel : strategyDisplayName;
+
+        var sb = new StringBuilder();
+        sb.Append("【當前決策模型】：").AppendLine(headerModel);
+        sb.AppendLine();
+        sb.AppendLine("你是一位頂尖的加密貨幣量化交易分析師，請針對以下市場快照給出深度分析。");
+        sb.AppendLine();
+        sb.Append("## 當前標的：").Append(s.Symbol)
+          .Append(" · 週期：").Append(s.Interval)
+          .AppendLine();
+        sb.Append("## 我目前在回測的策略模型：").AppendLine(strategyLabel);
+        sb.AppendLine();
+
+        sb.AppendLine("## 技術面快照（最近 100 根 K 線計算得出）");
+        sb.Append("- Close：").Append(s.LatestClose.ToString("F4", CultureInfo.InvariantCulture)).AppendLine();
+        sb.Append("- 視窗漲跌幅 Δ：").Append(s.PercentChange.ToString("+0.00;-0.00;0.00", CultureInfo.InvariantCulture)).AppendLine("%");
+        sb.Append("- RSI(14)：").AppendLine(Dec(s.Rsi14));
+        sb.Append("- ATR(14)：").AppendLine(Dec(s.Atr14, "F4"));
+        sb.Append("- EMA(20)：").AppendLine(Dec(s.Ema20, "F4"));
+        sb.Append("- EMA(50)：").AppendLine(Dec(s.Ema50, "F4"));
+        sb.Append("- 布林帶位置 BB%：").Append(Dec(s.BbPositionPercent)).AppendLine("（0 = 下軌、1 = 上軌）");
+        sb.Append("- 系統初判趨勢：").AppendLine(s.TrendLabel);
+        sb.AppendLine();
+
+        sb.AppendLine("## 請回答");
+        sb.AppendLine("1. 綜合上述指標，目前市場屬於『上漲趨勢』『下跌趨勢』還是『區間震盪』？請說明依據。");
+        sb.AppendLine("2. 當前環境對我選的策略模型是利還是弊？如果不利，建議改用什麼風格（Trend Following / Mean Reversion / 按兵不動）？");
+        sb.AppendLine("3. 若要進場，建議的風險控制要點（停損位置、倉位比例、ATR 為倍數的止盈）是什麼？");
+        sb.AppendLine("4. 給出最值得掃描優化的 2~3 個參數維度（例如 RSI 門檻、BB StdDev、EMA 長度），並附建議的掃描範圍。");
+        sb.AppendLine("5. 請針對該模型的所有參數提供具體的優化參考值（包含 Min, Max, Step），以便我直接輸入回測系統掃描。");
+
+        // S55 FS-V2 T3：參數字典對齊 — 把 StrategyCatalog 定義的強型別鍵名清單端到 Prompt 裡，
+        // 並明確要求 LLM 只能用這組 PascalCase 鍵回應。消除先前 AI 自由發揮 snake_case / 縮寫
+        // 而我方 Form 側 TryResolve 兜不到的 silent miss。
+        if (expectedParameterKeys is { Count: > 0 })
+        {
+            sb.AppendLine();
+            sb.AppendLine("## 參數鍵名規範（硬性要求）");
+            sb.Append("請使用以下標準鍵名提供建議數值：[");
+            for (var i = 0; i < expectedParameterKeys.Count; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(expectedParameterKeys[i]);
+            }
+            sb.AppendLine("]");
+            sb.AppendLine("不得改名、不得縮寫、不得使用 snake_case；每個鍵對應 Min / Max / Step 三欄數值。");
+        }
+
+        return sb.ToString();
+    }
+
+    private async Task CopyAdvicePromptAsync()
+    {
+        if (string.IsNullOrEmpty(_advicePrompt)) return;
+        try
+        {
+            await Js.InvokeVoidAsync("navigator.clipboard.writeText", _advicePrompt);
+            _adviceToast = "✓ 已複製到剪貼簿";
+        }
+        catch
+        {
+            try { await _advicePromptRef.FocusAsync(); } catch { /* best-effort */ }
+            _adviceToast = "請手動 Ctrl+C 複製文字框內容";
+        }
+        StateHasChanged();
+    }
+
+    // S32-S35-REVISED T3：拉 Top 10 快照。不走 AI — 只用本地 MarketContextBuilder，讓使用者複製進
+    // 任何 LLM（ChatGPT / Claude / Gemini）自行分析；Interval 沿用面板當前選的週期。
+    private async Task ScanMarketSweepAsync()
+    {
+        _sweepBusy = true;
+        _sweepError = null;
+        _sweepToast = null;
+        StateHasChanged();
+        try
+        {
+            using var http = HttpFactory.CreateClient();
+            http.BaseAddress = new Uri(Nav.BaseUri);
+            var resp = await http.GetAsync($"/api/ai/market-sweep?interval={Interval}");
+            if (!resp.IsSuccessStatusCode)
+            {
+                _sweepError = $"HTTP {(int)resp.StatusCode}：{await resp.Content.ReadAsStringAsync()}";
+                _sweepResult = null;
+                return;
+            }
+            _sweepResult = await resp.Content.ReadFromJsonAsync<MarketSweepResponseDto>();
+        }
+        catch (Exception ex)
+        {
+            _sweepError = ex.Message;
+            _sweepResult = null;
+        }
+        finally
+        {
+            _sweepBusy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task CopySweepPromptAsync()
+    {
+        if (_sweepResult is null) return;
+        try
+        {
+            await Js.InvokeVoidAsync("navigator.clipboard.writeText", _sweepResult.Prompt);
+            _sweepToast = "✓ 已複製到剪貼簿";
+        }
+        catch
+        {
+            // navigator.clipboard 在非 HTTPS 或舊瀏覽器會失敗 — 退回選取 textarea 讓使用者手動 Ctrl+C。
+            try { await _sweepPromptRef.FocusAsync(); } catch { /* best-effort */ }
+            _sweepToast = "請手動 Ctrl+C 複製文字框內容";
+        }
+        StateHasChanged();
+    }
+
+    private static string FormatDecOrDash(decimal? v, string fmt = "F2") =>
+        v is null ? "—" : v.Value.ToString(fmt, CultureInfo.InvariantCulture);
+}

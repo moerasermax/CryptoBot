@@ -1,0 +1,155 @@
+@namespace CryptoBot.ConsoleApp.Components.Lab
+@inherits CryptoBot.ConsoleApp.Lab.StrategyParameterFormBase
+@using CryptoBot.Application.Ai
+@using CryptoBot.ConsoleApp.Services
+
+@*
+    B46 RSI + Bollinger 策略的參數掃描表單。
+    五個維度的 Min/Max/Step 直接笛卡兒展開 — LabEndpoints 會擋 > 1000 組合的誤輸。
+    沿用 SmaParameterForm 的 glass-form 玻璃擬態樣式，保持一致 UX。
+*@
+
+<div class="glass-form">
+    <div class="glass-row">
+        <label class="glass-label">RSI Period</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="2"  max="100" disabled="@Disabled" @bind="_rsiPeriodMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="2"  max="100" disabled="@Disabled" @bind="_rsiPeriodMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="20"  disabled="@Disabled" @bind="_rsiPeriodStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">Oversold</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="1"  max="50"  disabled="@Disabled" @bind="_oversoldMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="1"  max="50"  disabled="@Disabled" @bind="_oversoldMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="10"  disabled="@Disabled" @bind="_oversoldStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">Overbought</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="50" max="99"  disabled="@Disabled" @bind="_overboughtMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="50" max="99"  disabled="@Disabled" @bind="_overboughtMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="10"  disabled="@Disabled" @bind="_overboughtStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">BB Period</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="5"  max="200" disabled="@Disabled" @bind="_bbPeriodMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="5"  max="200" disabled="@Disabled" @bind="_bbPeriodMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="20"  disabled="@Disabled" @bind="_bbPeriodStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">BB StdDev</label>
+        <div class="glass-cell"><span>Min</span><input type="number" step="0.1" min="0.5" max="5" disabled="@Disabled" @bind="_bbStdDevMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" step="0.1" min="0.5" max="5" disabled="@Disabled" @bind="_bbStdDevMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" step="0.1" min="0.1" max="2" disabled="@Disabled" @bind="_bbStdDevStep" @bind:after="OnChanged" /></div>
+    </div>
+</div>
+
+@code {
+    private decimal _rsiPeriodMin  = 14, _rsiPeriodMax  = 14, _rsiPeriodStep = 1;
+    private decimal _oversoldMin   = 25, _oversoldMax   = 35, _oversoldStep  = 5;
+    private decimal _overboughtMin = 65, _overboughtMax = 75, _overboughtStep = 5;
+    private decimal _bbPeriodMin   = 20, _bbPeriodMax   = 20, _bbPeriodStep  = 1;
+    private decimal _bbStdDevMin   = 2.0m, _bbStdDevMax = 2.0m, _bbStdDevStep = 0.5m;
+
+    public override int CurrentGridSize =>
+        Math.Max(0, Count(_rsiPeriodMin, _rsiPeriodMax, _rsiPeriodStep))
+        * Math.Max(0, Count(_oversoldMin, _oversoldMax, _oversoldStep))
+        * Math.Max(0, Count(_overboughtMin, _overboughtMax, _overboughtStep))
+        * Math.Max(0, Count(_bbPeriodMin, _bbPeriodMax, _bbPeriodStep))
+        * Math.Max(0, Count(_bbStdDevMin, _bbStdDevMax, _bbStdDevStep));
+
+    // S55 T2：領取式持久化 — 先嘗試從 LabStateContainer 拉回 StrategyKey="rsi-bb" 的網格快照。
+    // 命中時 ApplyGridParametersAsync 內部已 Notify 一次；沒命中才用預設值 Notify 回報 Grid size。
+    // 時序：OnInitializedAsync 在第一次渲染前執行 → UI 直接綁到快取值，絕不露出預設值中間態。
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await RestoreGridFromCacheAsync())
+            await NotifyChangedAsync();
+    }
+
+    private Task OnChanged() => NotifyChangedAsync();
+
+    private static int Count(decimal min, decimal max, decimal step)
+    {
+        if (step <= 0 || max < min) return 0;
+        return (int)Math.Floor((double)((max - min) / step)) + 1;
+    }
+
+    public override async Task ApplyParametersAsync(IReadOnlyDictionary<string, decimal> parameters)
+    {
+        if (TryResolve(parameters, out var rsiP, "RsiPeriod", "rsi_period", "rsi", "RsiLen", "rsi_len"))
+            { _rsiPeriodMin  = _rsiPeriodMax  = rsiP;  _rsiPeriodStep = 1; }
+        if (TryResolve(parameters, out var over, "RsiOversold", "Oversold", "rsi_oversold", "low_rsi", "oversold"))
+            { _oversoldMin   = _oversoldMax   = over;  _oversoldStep = 1; }
+        if (TryResolve(parameters, out var up, "RsiOverbought", "Overbought", "rsi_overbought", "high_rsi", "overbought"))
+            { _overboughtMin = _overboughtMax = up;    _overboughtStep = 1; }
+        if (TryResolve(parameters, out var bbP, "BbPeriod", "bb_period", "bollinger_period", "BollingerPeriod"))
+            { _bbPeriodMin   = _bbPeriodMax   = bbP;   _bbPeriodStep = 1; }
+        if (TryResolve(parameters, out var sd, "BbStdDev", "bb_stddev", "bb_std", "BollingerStdDev", "bollinger_stddev"))
+            { _bbStdDevMin   = _bbStdDevMax   = sd;    _bbStdDevStep = 0.1m; }
+        await NotifyChangedAsync();
+    }
+
+    // S30-GRID-FIX T2：AI 輸出 JSON key 常不照 PascalCase 交 — 透過 TryResolve 做 case-insensitive + 同義詞比對，
+    // 避免 `rsi_period` / `low_rsi` 這類寫法讓整筆建議被默默吃掉。結尾的 NotifyChangedAsync 確保 Grid size 立刻跳轉。
+    public override async Task ApplyGridParametersAsync(IReadOnlyDictionary<string, ParameterGridRange> parameters)
+    {
+        if (TryResolve(parameters, out var rsiP, "RsiPeriod", "rsi_period", "rsi", "RsiLen", "rsi_len"))
+        { _rsiPeriodMin = rsiP.Min; _rsiPeriodMax = rsiP.Max; _rsiPeriodStep = rsiP.Step > 0 ? rsiP.Step : 1; }
+        if (TryResolve(parameters, out var over, "RsiOversold", "Oversold", "rsi_oversold", "low_rsi", "oversold"))
+        { _oversoldMin = over.Min; _oversoldMax = over.Max; _oversoldStep = over.Step > 0 ? over.Step : 1; }
+        if (TryResolve(parameters, out var up, "RsiOverbought", "Overbought", "rsi_overbought", "high_rsi", "overbought"))
+        { _overboughtMin = up.Min; _overboughtMax = up.Max; _overboughtStep = up.Step > 0 ? up.Step : 1; }
+        if (TryResolve(parameters, out var bbP, "BbPeriod", "bb_period", "bollinger_period", "BollingerPeriod"))
+        { _bbPeriodMin = bbP.Min; _bbPeriodMax = bbP.Max; _bbPeriodStep = bbP.Step > 0 ? bbP.Step : 1; }
+        if (TryResolve(parameters, out var sd, "BbStdDev", "bb_stddev", "bb_std", "BollingerStdDev", "bollinger_stddev"))
+        { _bbStdDevMin = sd.Min; _bbStdDevMax = sd.Max; _bbStdDevStep = sd.Step > 0 ? sd.Step : 0.1m; }
+        await NotifyChangedAsync();
+    }
+
+    // S47：當前網格 snapshot — LabStateContainer 快取用。
+    public override IReadOnlyDictionary<string, ParameterGridRange> CurrentGrid
+        => new Dictionary<string, ParameterGridRange>
+        {
+            ["RsiPeriod"]     = new(_rsiPeriodMin,  _rsiPeriodMax,  _rsiPeriodStep),
+            ["RsiOversold"]   = new(_oversoldMin,   _oversoldMax,   _oversoldStep),
+            ["RsiOverbought"] = new(_overboughtMin, _overboughtMax, _overboughtStep),
+            ["BbPeriod"]      = new(_bbPeriodMin,   _bbPeriodMax,   _bbPeriodStep),
+            ["BbStdDev"]      = new(_bbStdDevMin,   _bbStdDevMax,   _bbStdDevStep),
+        };
+
+    public override OptimizationRequest? BuildRequest(
+        OptimizationGlobals globals, DateTime startUtc, DateTime endUtc, out string? error)
+    {
+        if (_rsiPeriodStep <= 0 || _oversoldStep <= 0 || _overboughtStep <= 0
+            || _bbPeriodStep <= 0 || _bbStdDevStep <= 0)
+        { error = "Step must be positive."; return null; }
+
+        if (_rsiPeriodMax < _rsiPeriodMin || _oversoldMax < _oversoldMin
+            || _overboughtMax < _overboughtMin || _bbPeriodMax < _bbPeriodMin
+            || _bbStdDevMax < _bbStdDevMin)
+        { error = "Max must be >= Min."; return null; }
+
+        if (_oversoldMax >= _overboughtMin)
+        { error = "Oversold.Max must be < Overbought.Min (策略語義：超賣線必須 < 超買線)."; return null; }
+
+        if (startUtc >= endUtc) { error = "Start must be before End."; return null; }
+
+        error = null;
+        return new OptimizationRequest(
+            StrategyKey: "rsi-bb",
+            Ranges: new[]
+            {
+                new ParameterRangeDto("RsiPeriod",     _rsiPeriodMin,  _rsiPeriodMax,  _rsiPeriodStep),
+                new ParameterRangeDto("RsiOversold",   _oversoldMin,   _oversoldMax,   _oversoldStep),
+                new ParameterRangeDto("RsiOverbought", _overboughtMin, _overboughtMax, _overboughtStep),
+                new ParameterRangeDto("BbPeriod",      _bbPeriodMin,   _bbPeriodMax,   _bbPeriodStep),
+                new ParameterRangeDto("BbStdDev",      _bbStdDevMin,   _bbStdDevMax,   _bbStdDevStep),
+            },
+            StartUtc: startUtc,
+            EndUtc: endUtc,
+            Symbol: globals.Symbol,
+            Interval: globals.Interval,
+            SlippageBps: globals.SlippageBps,
+            InitialBalance: globals.InitialBalance,
+            Leverage: globals.Leverage);
+    }
+}

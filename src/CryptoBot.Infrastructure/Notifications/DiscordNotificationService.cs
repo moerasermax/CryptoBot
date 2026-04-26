@@ -38,13 +38,25 @@ public sealed class DiscordNotificationService : INotificationService
     public Task NotifyTradeAsync(string symbol, string action, decimal price, decimal quantity,
         CancellationToken ct = default)
     {
+        // S28 T3：action 以 "Buy …" / "Sell …" / "Closed …" 開頭，取第一個 token 決定顏色帶
+        // — 綠=進場買單，紅=進場賣單或平倉；其他（罕見路徑）退回中性灰。
         var title = $"🚀 Trade — {symbol}";
         var body = $"**Action**: {action}\n**Price**: {price}\n**Qty**: {quantity}";
-        return SendEmbedAsync(title, body, 0x2ECC71, mention: false, ct);
+        var color = ColorForTradeAction(action);
+        return SendEmbedAsync(title, body, color, mention: false, ct);
     }
 
     public Task NotifyErrorAsync(Exception ex, CancellationToken ct = default)
         => SendEmbedAsync("❌ Bot Error", $"{ex.GetType().Name}: {ex.Message}", 0xE74C3C, mention: false, ct);
+
+    public Task NotifyCircuitBreakerAsync(string reason, CancellationToken ct = default)
+    {
+        // S28 T3：熔斷採紫色帶，與一般 Critical（紅）區分 — 值班人員一眼辨識「風險閘門觸發」。
+        const int purple = 0x9B59B6;
+        const string title = "🟣 Circuit Breaker Tripped";
+        var body = $"**Reason**: {reason}\n**Action**: All strategies stopped. Manual supervisor reset required.";
+        return SendEmbedAsync(title, body, purple, mention: true, ct);
+    }
 
     private async Task SendEmbedAsync(string title, string description, int color, bool mention, CancellationToken ct)
     {
@@ -89,4 +101,15 @@ public sealed class DiscordNotificationService : INotificationService
         NotificationLevel.Critical => 0xE74C3C,  // 紅
         _ => 0x95A5A6,
     };
+
+    private static int ColorForTradeAction(string action)
+    {
+        if (string.IsNullOrWhiteSpace(action)) return 0x95A5A6;
+        // 前綴切字，避免誤判 "Sell Short" / "Buy Long"
+        var head = action.AsSpan().TrimStart();
+        if (head.StartsWith("Buy", StringComparison.OrdinalIgnoreCase)) return 0x2ECC71;   // 綠
+        if (head.StartsWith("Sell", StringComparison.OrdinalIgnoreCase)) return 0xE74C3C;  // 紅
+        if (head.StartsWith("Closed", StringComparison.OrdinalIgnoreCase)) return 0xE74C3C; // 紅（平倉也視為出場事件）
+        return 0x95A5A6;
+    }
 }

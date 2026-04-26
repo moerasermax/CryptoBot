@@ -48,7 +48,8 @@ public static class DashboardEndpoints
                     PositionSide: o.PositionSide.ToString(),
                     Quantity: o.Quantity.Value,
                     AverageFillPrice: o.AverageFillPrice?.Value,
-                    Status: o.Status.ToString()))
+                    Status: o.Status.ToString(),
+                    RejectReason: o.RejectReason))
                 .ToList();
 
             return Results.Ok(new DashboardStatsDto(
@@ -57,6 +58,31 @@ public static class DashboardEndpoints
                 ActiveStrategyCount: s.ActiveStrategyCount,
                 OpenPositions: positionDtos,
                 RecentTrades: recent));
+        });
+
+        // S39：完整交易歷史（依 ClosedAt 由新到舊） — 預設 50 筆，clamp 1..200。
+        group.MapGet("/trade-history", async (
+            IPositionRepository positionRepo,
+            int? limit,
+            CancellationToken ct) =>
+        {
+            var n = Math.Clamp(limit ?? 50, 1, 200);
+            var closed = await positionRepo.GetRecentClosedAsync(n, ct).ConfigureAwait(false);
+            var rows = closed.Select(p => new ClosedTradeDto(
+                PositionId: p.Id,
+                Symbol: p.Symbol.BingXFormat,
+                Side: p.Side.ToString(),
+                Quantity: p.Quantity.Value,
+                EntryPrice: p.EntryPrice.Value,
+                EntryTimeUtc: p.OpenedAt,
+                ExitPrice: p.ExitPrice?.Value,
+                ExitTimeUtc: p.ClosedAt,
+                RealizedPnL: p.RealizedPnL,
+                TotalCommission: p.TotalCommission,
+                LeverageValue: p.Leverage.Value,
+                StrategyType: p.StrategyType,
+                ParametersSnapshot: p.ParametersSnapshot)).ToList();
+            return Results.Ok(rows);
         });
 
         return app;

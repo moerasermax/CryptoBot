@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using BingX.Net;
 using BingX.Net.Clients;
 using BingX.Net.Objects.Models;
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Enums;
@@ -39,7 +40,8 @@ public sealed class BingXMarketDataStream : IMarketDataStream
     /// </summary>
     private static readonly TimeSpan ListenKeyRenewInterval = TimeSpan.FromMinutes(30);
 
-    private readonly BingXSocketClient _socketClient;
+    // 不是 readonly — ReconfigureAsync 切換環境時需要 dispose 舊的、建新的。
+    private BingXSocketClient _socketClient;
     private readonly BingXExchangeClient _restClient;
     private readonly AppBingXOptions _options;
     private readonly ILogger<BingXMarketDataStream> _logger;
@@ -54,7 +56,7 @@ public sealed class BingXMarketDataStream : IMarketDataStream
 
     private bool _started;
     private bool _disposed;
-    private readonly bool _hasCredentials;
+    private bool _hasCredentials;
 
     public event Func<Symbol, KlineInterval, Kline, Task>? OnKlineUpdate;
     public event Func<Symbol, Price, Task>? OnPriceUpdate;
@@ -70,25 +72,36 @@ public sealed class BingXMarketDataStream : IMarketDataStream
         _options = options.Value;
         _logger = logger;
 
-        _socketClient = new BingXSocketClient(opts =>
+        _socketClient = BuildSocketClient(_options.EffectiveMode);
+    }
+
+    private BingXSocketClient BuildSocketClient(TradingMode mode)
+    {
+        var client = new BingXSocketClient(opts =>
         {
-            opts.Environment = _options.UseDemoTrading
-                ? global::BingX.Net.BingXEnvironment.Demo
-                : global::BingX.Net.BingXEnvironment.Live;
+            opts.Environment = mode == TradingMode.Live
+                ? global::BingX.Net.BingXEnvironment.Live
+                : global::BingX.Net.BingXEnvironment.Demo;
         });
 
         if (!string.IsNullOrWhiteSpace(_options.ApiKey) &&
             !string.IsNullOrWhiteSpace(_options.ApiSecret))
         {
-            BingXCredentials creds = new BingXCredentials()
+            var creds = new BingXCredentials
             {
                 Key = _options.ApiKey,
                 Secret = _options.ApiSecret,
             };
-            _socketClient.PerpetualFuturesApi.SetApiCredentials(creds);
-            _socketClient.SpotApi.SetApiCredentials(creds);
+            client.PerpetualFuturesApi.SetApiCredentials(creds);
+            client.SpotApi.SetApiCredentials(creds);
             _hasCredentials = true;
         }
+        else
+        {
+            _hasCredentials = false;
+        }
+
+        return client;
     }
 
     // ========== 生命週期 ==========
@@ -112,8 +125,8 @@ public sealed class BingXMarketDataStream : IMarketDataStream
             }
 
             _started = true;
-            _logger.LogInformation("BingX market data stream started (Mode={Mode})",
-                _options.UseDemoTrading ? "DEMO" : "LIVE");
+            _logger.LogInformation("BingX market data stream started (Mode={Mode}, QuoteAsset={Asset})",
+                _options.EffectiveMode, _options.QuoteAsset);
         }
         finally
         {
@@ -162,6 +175,40 @@ public sealed class BingXMarketDataStream : IMarketDataStream
 
             _started = false;
             _logger.LogInformation("BingX market data stream stopped");
+        }
+        finally
+        {
+            _startStopLock.Release();
+        }
+    }
+
+    public async Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default)
+    {
+        ThrowIfDisposed();
+
+        // 1) 先確保 REST client 已切到新模式（雙重保險：Switcher 應該已經切了，
+        //    但防止呼叫者順序錯反而留在舊環境）
+        await _restClient.ReconfigureAsync(newMode, ct).ConfigureAwait(false);
+
+        await _startStopLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            // 2) 強制收掉所有 WS 訂閱與續期循環
+            if (_started)
+            {
+                _startStopLock.Release();        // StopAsync 會再 acquire，避免死鎖
+                try { await StopAsync(ct).ConfigureAwait(false); }
+                finally { await _startStopLock.WaitAsync(ct).ConfigureAwait(false); }
+            }
+
+            // 3) 換新的 socket client
+            try { _socketClient.Dispose(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Dispose old socket client threw — ignoring."); }
+
+            _socketClient = BuildSocketClient(newMode);
+
+            _logger.LogWarning("🔁 BingX market data stream reconfigured to {Mode} (stopped — caller must StartAsync)",
+                newMode);
         }
         finally
         {

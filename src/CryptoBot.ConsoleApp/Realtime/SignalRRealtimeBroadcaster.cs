@@ -33,4 +33,34 @@ public sealed class SignalRRealtimeBroadcaster : IRealtimeBroadcaster
         _bus.RaiseStats(update);
         await _hub.Clients.All.SendAsync("StatsUpdate", update, ct).ConfigureAwait(false);
     }
+
+    public async Task BroadcastPositionClosedAsync(PositionClosedUpdate update, CancellationToken ct = default)
+    {
+        _bus.RaisePositionClosed(update);
+        await _hub.Clients.All.SendAsync("PositionClosed", update, ct).ConfigureAwait(false);
+    }
+
+    public async Task BroadcastStrategyEvaluatedAsync(StrategyEvaluatedUpdate update, CancellationToken ct = default)
+    {
+        _bus.RaiseStrategyEvaluated(update);
+        await _hub.Clients.All.SendAsync("StrategyEvaluated", update, ct).ConfigureAwait(false);
+    }
+
+    public async Task BroadcastPositionPnLAsync(PositionPnLTickUpdate update, CancellationToken ct = default)
+    {
+        _bus.RaisePositionPnL(update);
+        await _hub.Clients.All.SendAsync("PositionPnL", update, ct).ConfigureAwait(false);
+    }
+
+    public async Task BroadcastStrategyEvaluationFailedAsync(StrategyEvaluationFailedUpdate update, CancellationToken ct = default)
+    {
+        _bus.RaiseStrategyEvaluationFailed(update);
+        await _hub.Clients.All.SendAsync("StrategyEvaluationFailed", update, ct).ConfigureAwait(false);
+    }
+
+    public async Task BroadcastStrategyMetadataChangedAsync(StrategyMetadataChangedUpdate update, CancellationToken ct = default)
+    {
+        _bus.RaiseStrategyMetadataChanged(update);
+        await _hub.Clients.All.SendAsync("StrategyMetadataChanged", update, ct).ConfigureAwait(false);
+    }
 }

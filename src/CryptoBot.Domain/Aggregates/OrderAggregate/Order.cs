@@ -38,6 +38,13 @@ public sealed class Order : AggregateRoot<Guid>
     /// <summary>交易所給的訂單 ID (下單後才會有)</summary>
     public string? ExchangeOrderId { get; private set; }
 
+    /// <summary>
+    /// S66-C：訊號鏈路追蹤 ID。在 K 線觸發事件最源頭由 <c>StrategyExecutor</c> 生成，
+    /// 隨 LogContext / Order entity / Realtime DTO 一路傳遞，事後排查時可串起整條鏈路。
+    /// 非業務邏輯欄位 — 純為運維追蹤資產。
+    /// </summary>
+    public string? TraceId { get; private set; }
+
     /// <summary>關聯的策略 ID (用來追蹤是哪個策略下的單)</summary>
     public Guid? StrategyId { get; private set; }
 
@@ -71,7 +78,8 @@ public sealed class Order : AggregateRoot<Guid>
         Quantity quantity,
         Price limitPrice,
         Guid? strategyId = null,
-        string? clientOrderId = null)
+        string? clientOrderId = null,
+        string? traceId = null)
     {
         if (quantity.Value <= 0)
             throw new DomainException("Order quantity must be positive.");
@@ -89,6 +97,7 @@ public sealed class Order : AggregateRoot<Guid>
             Status = OrderStatus.New,
             StrategyId = strategyId,
             ClientOrderId = clientOrderId ?? GenerateClientOrderId(),
+            TraceId = traceId,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
         };
@@ -108,7 +117,8 @@ public sealed class Order : AggregateRoot<Guid>
         PositionSide positionSide,
         Quantity quantity,
         Guid? strategyId = null,
-        string? clientOrderId = null)
+        string? clientOrderId = null,
+        string? traceId = null)
     {
         if (quantity.Value <= 0)
             throw new DomainException("Order quantity must be positive.");
@@ -123,6 +133,7 @@ public sealed class Order : AggregateRoot<Guid>
             Status = OrderStatus.New,
             StrategyId = strategyId,
             ClientOrderId = clientOrderId ?? GenerateClientOrderId(),
+            TraceId = traceId,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
         };
@@ -142,7 +153,8 @@ public sealed class Order : AggregateRoot<Guid>
         PositionSide positionSide,
         Quantity quantity,
         Price stopPrice,
-        Guid? strategyId = null)
+        Guid? strategyId = null,
+        string? traceId = null)
     {
         var order = new Order
         {
@@ -155,6 +167,7 @@ public sealed class Order : AggregateRoot<Guid>
             Status = OrderStatus.New,
             StrategyId = strategyId,
             ClientOrderId = GenerateClientOrderId(),
+            TraceId = traceId,
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow
         };

@@ -1,4 +1,5 @@
 using CryptoBot.Application.Backtesting;
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
@@ -36,9 +37,22 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
     private Kline? _currentKline;
 
     public string ExchangeName => "Backtest";
+    public string QuoteAsset => "USDT";
+
+    /// <summary>回測一律視為 Demo（不接真實交易所）。</summary>
+    public TradingMode CurrentMode => TradingMode.Demo;
+
+    /// <summary>回測沒有真正的「環境」可切，呼叫即 no-op；提供此實作只為滿足介面合約。</summary>
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
 
     /// <summary>目前虛擬餘額（USDT），由成交即時扣帳。</summary>
     public decimal VirtualBalance { get; private set; }
+
+    /// <summary>
+    /// S32 爆倉旗標。一旦 <see cref="CheckAndApplyLiquidation"/> 回傳 true，此值永遠為 true，
+    /// 虛擬餘額會被強制歸零；BacktestEngine 會據此中止回測主迴圈，避免用已歸零的帳戶繼續下單。
+    /// </summary>
+    public bool IsLiquidated { get; private set; }
 
     public IReadOnlyList<Order> FilledOrders => _fills;
 
@@ -60,9 +74,39 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
     /// </summary>
     public void ApplyRealizedPnL(decimal realizedPnL) => VirtualBalance += realizedPnL;
 
+    /// <summary>
+    /// S32-T1 爆倉核心判斷：當權益（虛擬餘額 + 未實現損益）≤ 0 即判定爆倉。
+    ///
+    /// <para>
+    /// 執行後果：虛擬餘額強制歸零、<see cref="IsLiquidated"/> 設為 true。回傳 true 表示本輪已爆倉，
+    /// 上層 <see cref="BacktestEngine"/> 應立即中止主迴圈、不再處理後續 K 線 / 訊號 / 下單。
+    /// 已爆倉後再次呼叫一律回傳 true（idempotent），不會回補餘額。
+    /// </para>
+    ///
+    /// <para>
+    /// 手續費已於 <see cref="PlaceOrderAsync"/> 扣進 <see cref="VirtualBalance"/>，因此此處的
+    /// 「餘額 + 浮動損益」已內含手續費損耗 — 高槓桿下這會加速爆倉。
+    /// </para>
+    /// </summary>
+    public bool CheckAndApplyLiquidation(decimal unrealizedPnL)
+    {
+        if (IsLiquidated) return true;
+
+        var balBefore = VirtualBalance;
+        var equity = balBefore + unrealizedPnL;
+        if (equity > 0m) return false;
+
+        VirtualBalance = 0m;
+        IsLiquidated = true;
+        _logger.LogWarning(
+            "💥 [BACKTEST-LIQUIDATION] Equity ≤ 0 (bal={Bal:F4} + uPnL={UPnL:F4} = {Eq:F4}). Balance forced to 0, backtest will halt.",
+            balBefore, unrealizedPnL, equity);
+        return true;
+    }
+
     // ===== 帳戶 =====
 
-    public Task<decimal> GetFuturesBalanceAsync(string asset = "USDT", CancellationToken ct = default)
+    public Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default)
         => Task.FromResult(VirtualBalance);
 
     public Task<decimal> GetSpotBalanceAsync(string asset, CancellationToken ct = default)
@@ -157,8 +201,23 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
     public Task RefreshOrderStatusAsync(Order order, CancellationToken ct = default)
         => Task.CompletedTask;
 
+    // S66-A：回測不會碰到「網路逾時 → retry → 重複 clientOrderId」的場景，永遠回 null
+    // 表示該 ID 在交易所端不存在；上層自癒分支不會被觸發。
+    public Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default)
+        => Task.FromResult<ExchangeOrderSnapshot?>(null);
+
+    // S66-D：回測本身不會發生時鐘漂移，永遠回 UtcNow（模擬伺服器與本地完全同步）
+    public Task<DateTime> GetServerTimeAsync(CancellationToken ct = default)
+        => Task.FromResult(DateTime.UtcNow);
+
     public Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<ExchangePositionInfo>>(Array.Empty<ExchangePositionInfo>());
+
+    // 回測不模擬限價掛單佇列（市價成交後立即結算），對帳命令在回測情境下一律回空集合。
+    public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(
+        Symbol symbol, CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
 
     private Kline RequireCurrent() => _currentKline
         ?? throw new InvalidOperationException(

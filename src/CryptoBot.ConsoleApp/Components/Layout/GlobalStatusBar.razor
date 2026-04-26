@@ -1,0 +1,284 @@
+@using CryptoBot.Application.Common
+@using CryptoBot.Application.Realtime
+@using CryptoBot.Application.Strategies
+@using CryptoBot.ConsoleApp.Lab
+@using CryptoBot.ConsoleApp.Realtime
+@using CryptoBot.Domain.Aggregates.StrategyAggregate
+@using CryptoBot.Domain.Enums
+@using CryptoBot.Domain.Repositories
+@using Microsoft.Extensions.DependencyInjection
+@implements IDisposable
+@inject IStrategyRuntimeController Runtime
+@inject IServiceScopeFactory ScopeFactory
+@inject DashboardEventBus Bus
+@inject LabStateContainer Lab
+@inject IEnvironmentSwitcher EnvSwitcher
+@inject ILogger<GlobalStatusBar> Logger
+
+@*
+    全局環境狀態列 — Demo/Live 模式 + 當前掛載策略 + 引擎運行狀態 + 熱切換 toggle。
+    模式來源是 IEnvironmentSwitcher.CurrentMode（不再讀 IOptions），因為 ReconfigureAsync 後
+    要立即反映新狀態 — IOptions 是建構期快照，會錯。
+*@
+
+<div class="env-bar @ModeCssClass">
+    <span class="env-segment env-mode" title="@ModeTooltip">
+        <span class="env-segment-label">MODE</span>
+        <span class="env-badge env-badge-@ModeCssClass">
+            @ModeIcon @ModeLabel
+        </span>
+    </span>
+
+    <span class="env-segment env-strategy" title="@ActiveTooltip">
+        <span class="env-segment-label">ACTIVE</span>
+        <span class="env-strategy-name">@ActiveSummary</span>
+    </span>
+
+    <span class="env-segment env-engine">
+        <span class="env-segment-label">ENGINE</span>
+        <span class="env-engine-state @(EngineRunning ? "is-running" : "is-stopped")">
+            <span class="env-dot"></span>
+            @(EngineRunning ? "Running" : "Stopped")
+        </span>
+    </span>
+
+    <span class="env-segment env-link" title="@LinkTooltip">
+        <span class="env-segment-label">LINK</span>
+        <span class="env-link-state env-link-@LinkCssClass">
+            <span class="env-dot"></span>
+            @LinkLabel
+        </span>
+    </span>
+
+    <span class="env-segment env-toggle">
+        <span class="env-segment-label">SWITCH</span>
+        <button type="button"
+                class="env-toggle-btn env-toggle-btn-@ModeCssClass"
+                @onclick="OnToggleClicked"
+                disabled="@_switching"
+                title="@ToggleTooltip">
+            @if (_switching)
+            {
+                <span>切換中…</span>
+            }
+            else if (EnvSwitcher.CurrentMode == TradingMode.Demo)
+            {
+                <span>切到 LIVE ⚠️</span>
+            }
+            else
+            {
+                <span>切回 DEMO 🛡</span>
+            }
+        </button>
+    </span>
+
+    @if (Lab.LastEnvChange is { } e)
+    {
+        <span class="env-segment env-flash" title="最近一次切換摘要">
+            <span class="env-flash-text">
+                @e.FromMode → @e.ToMode (停了 @e.StoppedStrategyIds.Count 個策略, @e.ChangedAtUtc.ToLocalTime():HH:mm:ss)
+            </span>
+        </span>
+    }
+</div>
+
+<EnvironmentSwitchModal IsVisible="_modalOpen"
+                        IsBusy="_switching"
+                        OnConfirm="OnModalConfirm"
+                        OnCancel="OnModalCancel" />
+
+@code {
+    private List<Strategy> _running = new();
+    private bool _modalOpen;
+    private bool _switching;
+
+    // S27：交易所 REST 延遲心跳 — 綠 ≤300ms、黃 ≤1000ms、紅 >1000ms 或 IsHealthy=false。
+    private ExchangeHealthUpdate? _lastHealth;
+
+    private string LinkCssClass
+    {
+        get
+        {
+            if (_lastHealth is null) return "idle";
+            if (!_lastHealth.IsHealthy) return "down";
+            return _lastHealth.LatencyMs switch
+            {
+                <= 300  => "good",
+                <= 1000 => "warn",
+                _       => "slow",
+            };
+        }
+    }
+
+    private string LinkLabel
+    {
+        get
+        {
+            if (_lastHealth is null) return "— probing";
+            if (!_lastHealth.IsHealthy) return $"{_lastHealth.ExchangeName} offline";
+            return $"{_lastHealth.ExchangeName} · {_lastHealth.LatencyMs} ms";
+        }
+    }
+
+    private string LinkTooltip => _lastHealth is null
+        ? "尚未完成第一次 REST 心跳探測。"
+        : _lastHealth.IsHealthy
+            ? $"最近一次 {_lastHealth.ExchangeName} REST 探測：{_lastHealth.LatencyMs}ms @ {_lastHealth.Timestamp.ToLocalTime():HH:mm:ss}"
+            : $"{_lastHealth.ExchangeName} 連線異常（{_lastHealth.ErrorMessage}）@ {_lastHealth.Timestamp.ToLocalTime():HH:mm:ss}";
+
+    private string ModeLabel    => EnvSwitcher.CurrentMode == TradingMode.Live ? "LIVE" : "DEMO";
+    private string ModeIcon     => EnvSwitcher.CurrentMode == TradingMode.Live ? "⚠️" : "🛡";
+    private string ModeCssClass => EnvSwitcher.CurrentMode == TradingMode.Live ? "live" : "demo";
+    private string ModeTooltip =>
+        EnvSwitcher.CurrentMode == TradingMode.Live
+            ? "LIVE trading on BingX — quote asset: USDT (real money!)"
+            : "DEMO trading on BingX — quote asset: VST (virtual funds)";
+
+    private string ToggleTooltip => EnvSwitcher.CurrentMode == TradingMode.Demo
+        ? "切換到 LIVE：將彈出二次確認，所有策略會被強制停止。"
+        : "切回 DEMO：立即生效，所有策略會被強制停止。";
+
+    private bool EngineRunning => _running.Any(s => Runtime.IsRunning(s.Id));
+
+    private string ActiveSummary
+    {
+        get
+        {
+            if (_running.Count == 0) return "— (no strategy)";
+            var s = _running[0];
+            var paramSummary = FormatParameters(s);
+            var extra = _running.Count > 1 ? $" +{_running.Count - 1}" : "";
+            return $"{s.Name} · {s.StrategyType}{paramSummary}{extra}";
+        }
+    }
+
+    private string ActiveTooltip
+    {
+        get
+        {
+            if (_running.Count == 0) return "No strategies in Running state.";
+            return string.Join(" | ", _running.Select(s => $"{s.Name} ({s.StrategyType}){FormatParameters(s)}"));
+        }
+    }
+
+    private static string FormatParameters(Strategy s)
+    {
+        var p = s.Configuration.Parameters;
+        if (p.TryGetValue("FastSmaPeriod", out var fast) && p.TryGetValue("SlowSmaPeriod", out var slow))
+            return $" ({(int)fast}, {(int)slow})";
+        if (p.Count == 0) return string.Empty;
+        var first = p.Take(2).Select(kv => $"{kv.Key}={kv.Value:0.##}");
+        return $" ({string.Join(", ", first)})";
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        await ReloadAsync();
+        Bus.StatsUpdated += OnStatsUpdated;
+        Bus.ExchangeHealthUpdated += OnHealthUpdated;
+        EnvSwitcher.EnvironmentChanged += OnEnvChanged;
+        Lab.StateChanged += OnLabStateChanged;
+    }
+
+    private void OnHealthUpdated(ExchangeHealthUpdate update)
+    {
+        _lastHealth = update;
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnStatsUpdated(DashboardStatsUpdate _)
+    {
+        InvokeAsync(async () =>
+        {
+            await ReloadAsync();
+            StateHasChanged();
+        });
+    }
+
+    private void OnEnvChanged(EnvironmentChangedEvent _)
+    {
+        InvokeAsync(async () =>
+        {
+            // 環境切換後 _running 必為空（StopAll 已執行）— 重新拉一次同步 UI
+            await ReloadAsync();
+            StateHasChanged();
+        });
+    }
+
+    private void OnLabStateChanged()
+    {
+        // LabStateContainer 把 LastEnvChange 翻新後也透過 StateChanged 通知，要 re-render
+        InvokeAsync(StateHasChanged);
+    }
+
+    private async Task ReloadAsync()
+    {
+        try
+        {
+            await using var scope = ScopeFactory.CreateAsyncScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IStrategyRepository>();
+            var list = await repo.GetByStatusAsync(StrategyStatus.Running, default);
+            _running = list.ToList();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "GlobalStatusBar.ReloadAsync failed — showing cached state.");
+            _running = new();
+        }
+    }
+
+    private async Task OnToggleClicked()
+    {
+        if (_switching) return;
+
+        if (EnvSwitcher.CurrentMode == TradingMode.Demo)
+        {
+            // Demo → Live：彈出二次確認
+            _modalOpen = true;
+        }
+        else
+        {
+            // Live → Demo：直接切（更安全的方向不需要再防呆）
+            await DoSwitchAsync(TradingMode.Demo, "User switched Live → Demo from status bar");
+        }
+    }
+
+    private async Task OnModalConfirm()
+    {
+        await DoSwitchAsync(TradingMode.Live, "User confirmed Demo → Live via modal");
+        _modalOpen = false;
+    }
+
+    private void OnModalCancel()
+    {
+        if (_switching) return;
+        _modalOpen = false;
+    }
+
+    private async Task DoSwitchAsync(TradingMode target, string reason)
+    {
+        _switching = true;
+        StateHasChanged();
+        try
+        {
+            await Lab.ChangeEnvironmentAsync(target, reason);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Environment switch to {Mode} failed.", target);
+        }
+        finally
+        {
+            _switching = false;
+            StateHasChanged();
+        }
+    }
+
+    public void Dispose()
+    {
+        Bus.StatsUpdated -= OnStatsUpdated;
+        Bus.ExchangeHealthUpdated -= OnHealthUpdated;
+        EnvSwitcher.EnvironmentChanged -= OnEnvChanged;
+        Lab.StateChanged -= OnLabStateChanged;
+    }
+}

@@ -1,0 +1,157 @@
+@namespace CryptoBot.ConsoleApp.Components.Lab
+@inherits CryptoBot.ConsoleApp.Lab.StrategyParameterFormBase
+@using CryptoBot.Application.Ai
+@using CryptoBot.ConsoleApp.Services
+
+@*
+    S43 Price Action Predictor 的參數掃描表單。五個維度：
+    LookbackPeriod (動能窗口 K 根) / MomentumThreshold (動能絕對值門檻)
+    WickToBodyRatio (影線/實體比) / EngulfingEnabled (0 = 禁用, 1 = 啟用)
+    Confidence (訊號置信度)。
+
+    組合數無上限（VCP-Memory 授權 AI Advisor 直接放行），
+    完整組合展開讓使用者掃描裸 K 形態的真實響應面。
+*@
+
+<div class="glass-form">
+    <div class="glass-row">
+        <label class="glass-label">Lookback Period</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="5"  max="100" disabled="@Disabled" @bind="_lookbackMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="5"  max="100" disabled="@Disabled" @bind="_lookbackMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="20"  disabled="@Disabled" @bind="_lookbackStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">Momentum Threshold</label>
+        <div class="glass-cell"><span>Min</span><input type="number" step="0.001" min="0"    max="0.2"  disabled="@Disabled" @bind="_momentumMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" step="0.001" min="0"    max="0.2"  disabled="@Disabled" @bind="_momentumMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" step="0.001" min="0.001" max="0.05" disabled="@Disabled" @bind="_momentumStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">Wick / Body Ratio</label>
+        <div class="glass-cell"><span>Min</span><input type="number" step="0.1" min="1"   max="5"  disabled="@Disabled" @bind="_wickMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" step="0.1" min="1"   max="5"  disabled="@Disabled" @bind="_wickMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" step="0.1" min="0.1" max="2"  disabled="@Disabled" @bind="_wickStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">Engulfing (0/1)</label>
+        <div class="glass-cell"><span>Min</span><input type="number" min="0" max="1" disabled="@Disabled" @bind="_engulfMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" min="0" max="1" disabled="@Disabled" @bind="_engulfMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" min="1" max="1" disabled="@Disabled" @bind="_engulfStep" @bind:after="OnChanged" /></div>
+    </div>
+    <div class="glass-row">
+        <label class="glass-label">Confidence</label>
+        <div class="glass-cell"><span>Min</span><input type="number" step="0.05" min="0.1" max="1" disabled="@Disabled" @bind="_confidenceMin"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Max</span><input type="number" step="0.05" min="0.1" max="1" disabled="@Disabled" @bind="_confidenceMax"  @bind:after="OnChanged" /></div>
+        <div class="glass-cell"><span>Step</span><input type="number" step="0.05" min="0.05" max="0.5" disabled="@Disabled" @bind="_confidenceStep" @bind:after="OnChanged" /></div>
+    </div>
+</div>
+
+@code {
+    private decimal _lookbackMin   = 15,    _lookbackMax   = 25,    _lookbackStep   = 5;
+    private decimal _momentumMin   = 0.005m,_momentumMax   = 0.02m, _momentumStep   = 0.005m;
+    private decimal _wickMin       = 1.5m,  _wickMax       = 3.0m,  _wickStep       = 0.5m;
+    private decimal _engulfMin     = 1,     _engulfMax     = 1,     _engulfStep     = 1;
+    private decimal _confidenceMin = 0.65m, _confidenceMax = 0.65m, _confidenceStep = 0.05m;
+
+    public override int CurrentGridSize =>
+        Math.Max(0, Count(_lookbackMin, _lookbackMax, _lookbackStep))
+        * Math.Max(0, Count(_momentumMin, _momentumMax, _momentumStep))
+        * Math.Max(0, Count(_wickMin, _wickMax, _wickStep))
+        * Math.Max(0, Count(_engulfMin, _engulfMax, _engulfStep))
+        * Math.Max(0, Count(_confidenceMin, _confidenceMax, _confidenceStep));
+
+    // S55 T2：領取式持久化 — StrategyKey="pa"，自 LabStateContainer 拉回網格快照。
+    protected override async Task OnInitializedAsync()
+    {
+        if (!await RestoreGridFromCacheAsync())
+            await NotifyChangedAsync();
+    }
+
+    private Task OnChanged() => NotifyChangedAsync();
+
+    private static int Count(decimal min, decimal max, decimal step)
+    {
+        if (step <= 0 || max < min) return 0;
+        return (int)Math.Floor((double)((max - min) / step)) + 1;
+    }
+
+    public override async Task ApplyParametersAsync(IReadOnlyDictionary<string, decimal> parameters)
+    {
+        if (TryResolve(parameters, out var lb, "LookbackPeriod", "lookback_period", "lookback", "Lookback"))
+        { _lookbackMin = _lookbackMax = lb; _lookbackStep = 1; }
+        if (TryResolve(parameters, out var mom, "MomentumThreshold", "momentum_threshold", "momentum", "Momentum"))
+        { _momentumMin = _momentumMax = mom; _momentumStep = 0.001m; }
+        if (TryResolve(parameters, out var wick, "WickToBodyRatio", "wick_to_body_ratio", "wick_body", "WickBody", "wick_ratio"))
+        { _wickMin = _wickMax = wick; _wickStep = 0.1m; }
+        if (TryResolve(parameters, out var en, "EngulfingEnabled", "engulfing_enabled", "engulfing", "Engulfing"))
+        { _engulfMin = _engulfMax = en; _engulfStep = 1; }
+        if (TryResolve(parameters, out var conf, "Confidence", "confidence"))
+        { _confidenceMin = _confidenceMax = conf; _confidenceStep = 0.05m; }
+        await NotifyChangedAsync();
+    }
+
+    // S30-GRID-FIX T2：AI 輸出 JSON key 常不照 PascalCase — 透過 TryResolve 做 case-insensitive + 同義詞比對，
+    // 避免 `lookback_period` / `wick_ratio` 這類寫法讓整筆建議被默默吃掉。結尾 NotifyChangedAsync 讓 Grid size 立刻跳轉。
+    public override async Task ApplyGridParametersAsync(IReadOnlyDictionary<string, ParameterGridRange> parameters)
+    {
+        if (TryResolve(parameters, out var lb, "LookbackPeriod", "lookback_period", "lookback", "Lookback"))
+        { _lookbackMin = lb.Min; _lookbackMax = lb.Max; _lookbackStep = lb.Step > 0 ? lb.Step : 1; }
+        if (TryResolve(parameters, out var mom, "MomentumThreshold", "momentum_threshold", "momentum", "Momentum"))
+        { _momentumMin = mom.Min; _momentumMax = mom.Max; _momentumStep = mom.Step > 0 ? mom.Step : 0.001m; }
+        if (TryResolve(parameters, out var wick, "WickToBodyRatio", "wick_to_body_ratio", "wick_body", "WickBody", "wick_ratio"))
+        { _wickMin = wick.Min; _wickMax = wick.Max; _wickStep = wick.Step > 0 ? wick.Step : 0.1m; }
+        if (TryResolve(parameters, out var en, "EngulfingEnabled", "engulfing_enabled", "engulfing", "Engulfing"))
+        { _engulfMin = en.Min; _engulfMax = en.Max; _engulfStep = en.Step > 0 ? en.Step : 1; }
+        if (TryResolve(parameters, out var conf, "Confidence", "confidence"))
+        { _confidenceMin = conf.Min; _confidenceMax = conf.Max; _confidenceStep = conf.Step > 0 ? conf.Step : 0.05m; }
+        await NotifyChangedAsync();
+    }
+
+    // S47：當前網格 snapshot — LabStateContainer 快取用。
+    public override IReadOnlyDictionary<string, ParameterGridRange> CurrentGrid
+        => new Dictionary<string, ParameterGridRange>
+        {
+            ["LookbackPeriod"]    = new(_lookbackMin,   _lookbackMax,   _lookbackStep),
+            ["MomentumThreshold"] = new(_momentumMin,   _momentumMax,   _momentumStep),
+            ["WickToBodyRatio"]   = new(_wickMin,       _wickMax,       _wickStep),
+            ["EngulfingEnabled"]  = new(_engulfMin,     _engulfMax,     _engulfStep),
+            ["Confidence"]        = new(_confidenceMin, _confidenceMax, _confidenceStep),
+        };
+
+    public override OptimizationRequest? BuildRequest(
+        OptimizationGlobals globals, DateTime startUtc, DateTime endUtc, out string? error)
+    {
+        if (_lookbackStep <= 0 || _momentumStep <= 0 || _wickStep <= 0
+            || _engulfStep <= 0 || _confidenceStep <= 0)
+        { error = "Step must be positive."; return null; }
+
+        if (_lookbackMax < _lookbackMin || _momentumMax < _momentumMin
+            || _wickMax < _wickMin || _engulfMax < _engulfMin
+            || _confidenceMax < _confidenceMin)
+        { error = "Max must be >= Min."; return null; }
+
+        if (_wickMin < 1m)
+        { error = "WickToBodyRatio.Min must be >= 1 (影線/實體比小於 1 意味影線比實體短，無形態意義)."; return null; }
+
+        if (startUtc >= endUtc) { error = "Start must be before End."; return null; }
+
+        error = null;
+        return new OptimizationRequest(
+            StrategyKey: "pa",
+            Ranges: new[]
+            {
+                new ParameterRangeDto("LookbackPeriod",    _lookbackMin,   _lookbackMax,   _lookbackStep),
+                new ParameterRangeDto("MomentumThreshold", _momentumMin,   _momentumMax,   _momentumStep),
+                new ParameterRangeDto("WickToBodyRatio",   _wickMin,       _wickMax,       _wickStep),
+                new ParameterRangeDto("EngulfingEnabled",  _engulfMin,     _engulfMax,     _engulfStep),
+                new ParameterRangeDto("Confidence",        _confidenceMin, _confidenceMax, _confidenceStep),
+            },
+            StartUtc: startUtc,
+            EndUtc: endUtc,
+            Symbol: globals.Symbol,
+            Interval: globals.Interval,
+            SlippageBps: globals.SlippageBps,
+            InitialBalance: globals.InitialBalance,
+            Leverage: globals.Leverage);
+    }
+}

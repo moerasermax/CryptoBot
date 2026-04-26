@@ -1,3 +1,4 @@
+using CryptoBot.Application.Common;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Synchronization;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
@@ -411,6 +412,7 @@ internal sealed class SyncFakeMarketDataStream : IMarketDataStream
 
     public Task StartAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task StopAsync(CancellationToken ct = default) => Task.CompletedTask;
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeKlinesAsync(Symbol s, KlineInterval i, CancellationToken ct = default) => Task.CompletedTask;
     public Task SubscribeMarkPriceAsync(Symbol s, CancellationToken ct = default) => Task.CompletedTask;
     public Task UnsubscribeAsync(Symbol s, CancellationToken ct = default) => Task.CompletedTask;
@@ -432,12 +434,15 @@ internal sealed class SyncFakeMarketDataStream : IMarketDataStream
 internal sealed class SyncFakeExchangeClient : IExchangeClient
 {
     public string ExchangeName => "SYNCFAKE";
+    public string QuoteAsset => "USDT";
+    public TradingMode CurrentMode => TradingMode.Demo;
+    public Task ReconfigureAsync(TradingMode newMode, CancellationToken ct = default) => Task.CompletedTask;
     public Price MarkPrice { get; set; } = Price.Create(100m);
     public IReadOnlyList<ExchangePositionInfo> OpenPositions { get; set; } = Array.Empty<ExchangePositionInfo>();
     public int RefreshOrderStatusCalls { get; private set; }
     public int GetMarkPriceCalls { get; private set; }
 
-    public Task<decimal> GetFuturesBalanceAsync(string asset = "USDT", CancellationToken ct = default) => Task.FromResult(0m);
+    public Task<decimal> GetFuturesBalanceAsync(string? asset = null, CancellationToken ct = default) => Task.FromResult(0m);
     public Task<decimal> GetSpotBalanceAsync(string asset, CancellationToken ct = default) => Task.FromResult(0m);
     public Task SetLeverageAsync(Symbol symbol, Leverage leverage, CancellationToken ct = default) => Task.CompletedTask;
     public Task SetMarginModeAsync(Symbol symbol, MarginMode mode, CancellationToken ct = default) => Task.CompletedTask;
@@ -472,6 +477,16 @@ internal sealed class SyncFakeExchangeClient : IExchangeClient
 
     public Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default) =>
         Task.FromResult(OpenPositions);
+
+    public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
+
+    public Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
+        Symbol symbol, string clientOrderId, CancellationToken ct = default) =>
+        Task.FromResult<ExchangeOrderSnapshot?>(null);
+
+    public Task<DateTime> GetServerTimeAsync(CancellationToken ct = default) =>
+        Task.FromResult(DateTime.UtcNow);
 }
 
 internal sealed class StatefulOrderRepo : IOrderRepository
@@ -490,6 +505,9 @@ internal sealed class StatefulOrderRepo : IOrderRepository
 
     public Task<Order?> GetByExchangeOrderIdAsync(string exchangeOrderId, CancellationToken ct = default) =>
         Task.FromResult(_byExchangeId.TryGetValue(exchangeOrderId, out var o) ? o : null);
+
+    public Task<Order?> GetByClientOrderIdAsync(string clientOrderId, CancellationToken ct = default) =>
+        Task.FromResult<Order?>(_byExchangeId.Values.FirstOrDefault(o => o.ClientOrderId == clientOrderId));
 
     public Task<IReadOnlyList<Order>> GetActiveOrdersAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Order>>(_byExchangeId.Values.Where(o => o.IsActive).ToList());
@@ -520,6 +538,7 @@ internal sealed class ThrowingOrderRepo : IOrderRepository
 {
     public Task<Order?> GetByIdAsync(Guid id, CancellationToken ct = default) => throw new InvalidOperationException("boom");
     public Task<Order?> GetByExchangeOrderIdAsync(string exchangeOrderId, CancellationToken ct = default) => throw new InvalidOperationException("boom");
+    public Task<Order?> GetByClientOrderIdAsync(string clientOrderId, CancellationToken ct = default) => throw new InvalidOperationException("boom");
     public Task<IReadOnlyList<Order>> GetActiveOrdersAsync(CancellationToken ct = default) => throw new InvalidOperationException("boom");
     public Task<IReadOnlyList<Order>> GetBySymbolAsync(Symbol symbol, CancellationToken ct = default) => throw new InvalidOperationException("boom");
     public Task<IReadOnlyList<Order>> GetByStrategyIdAsync(Guid strategyId, CancellationToken ct = default) => throw new InvalidOperationException("boom");
@@ -553,6 +572,10 @@ internal sealed class StatefulPositionRepo : IPositionRepository
     public Task<IReadOnlyList<Position>> GetClosedPositionsInRangeAsync(DateTime from, DateTime to, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<Position>>(_store.Where(p => p.IsClosed && p.ClosedAt >= from && p.ClosedAt <= to).ToList());
 
+    public Task<IReadOnlyList<Position>> GetRecentClosedAsync(int limit, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<Position>>(
+            _store.Where(p => p.IsClosed).OrderByDescending(p => p.ClosedAt).Take(limit).ToList());
+
     public Task AddAsync(Position position, CancellationToken ct = default) { _store.Add(position); return Task.CompletedTask; }
     public Task UpdateAsync(Position position, CancellationToken ct = default) => Task.CompletedTask;
 }
@@ -561,6 +584,8 @@ internal sealed class CountingUnitOfWork : IUnitOfWork
 {
     public int SaveChangesCalls { get; private set; }
     public Task<int> SaveChangesAsync(CancellationToken ct = default) { SaveChangesCalls++; return Task.FromResult(1); }
+    public Task<int> SaveChangesWithRetryAsync(int maxAttempts = 3, CancellationToken ct = default)
+        => SaveChangesAsync(ct);
     public Task BeginTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task CommitTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task RollbackTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;

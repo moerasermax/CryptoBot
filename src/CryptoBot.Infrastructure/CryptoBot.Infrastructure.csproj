@@ -41,4 +41,8 @@
     <ProjectReference Include="..\CryptoBot.Domain\CryptoBot.Domain.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="CryptoBot.Application.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -40,6 +40,9 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
         b.Property(o => o.ExchangeOrderId).HasMaxLength(64);
         b.Property(o => o.RejectReason).HasMaxLength(512);
 
+        // S66-C：訊號鏈路追蹤 ID（StrategyExecutor 在 K 線 tick 開頭生成的 12 字 hash）
+        b.Property(o => o.TraceId).HasMaxLength(32);
+
         b.Property(o => o.CreatedAt).IsRequired();
         b.Property(o => o.UpdatedAt).IsRequired();
 
@@ -51,7 +54,15 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
 
         // 索引（查單常用路徑）
         b.HasIndex(o => o.ExchangeOrderId);
-        b.HasIndex(o => o.ClientOrderId);
+
+        // S66-A：ClientOrderId 唯一索引 — 同一個訊號特徵（決定性 hash）絕不允許產出兩筆訂單。
+        // 過濾條件：當 ClientOrderId IS NOT NULL（歷史 row 可能為 null，避免 backfill 造成衝突）。
+        // 假設前提：當前單帳戶單交易所部署。未來若導入多帳戶 / 多交易所，需改為複合 unique
+        //         (ExchangeAccountId, ClientOrderId) 或 (ExchangeName, ClientOrderId)。
+        b.HasIndex(o => o.ClientOrderId)
+            .IsUnique()
+            .HasFilter("\"ClientOrderId\" IS NOT NULL");
+
         b.HasIndex(o => o.StrategyId);
         b.HasIndex(o => o.Status);
         b.HasIndex(o => new { o.Symbol, o.Status });

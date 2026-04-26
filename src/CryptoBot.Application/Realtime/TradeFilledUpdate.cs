@@ -13,4 +13,5 @@ public sealed record TradeFilledUpdate(
     string PositionSide,   // "Long" / "Short"
     decimal Quantity,
     decimal Price,
-    string StrategyName);
+    string StrategyName,
+    string? TraceId = null);
