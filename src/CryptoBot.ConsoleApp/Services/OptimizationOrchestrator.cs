@@ -1,5 +1,6 @@
 using System.Text.Json;
 using CryptoBot.Application.Backtesting;
+using CryptoBot.Application.Backtesting.Search;
 using CryptoBot.Application.Strategies;
 using CryptoBot.Application.Strategies.B46RsiBb;
 using CryptoBot.Application.Strategies.MeanReversion;
@@ -101,8 +102,19 @@ public sealed class OptimizationOrchestrator
             .Select(r => new ParameterRange(r.Name, r.Min, r.Max, r.Step))
             .ToArray();
 
-        // 3) 先算總數，才能在每次完成時推「x / total」
-        var total = ranges.Aggregate(1, (acc, r) => acc * r.Enumerate().Count());
+        // 3) 依搜尋方法派發 ISearchStrategy + 計算總數（Random=budget；Grid=笛卡兒積大小）
+        ISearchStrategy search = req.SearchMethod switch
+        {
+            SearchMethod.Random => new RandomSearchStrategy(
+                budget: req.RandomBudget
+                    ?? throw new InvalidOperationException(
+                        "RandomBudget must be specified for SearchMethod=Random.")),
+            _ => new GridSearchStrategy(),
+        };
+
+        var total = req.SearchMethod == SearchMethod.Random
+            ? req.RandomBudget ?? 0
+            : ranges.Aggregate(1, (acc, r) => acc * r.Enumerate().Count());
         var completed = 0;
 
         // 4) 初始進度 0 / total
@@ -114,6 +126,7 @@ public sealed class OptimizationOrchestrator
 
         var runs = await optimizer.RunAsync(
             ranges,
+            search,
             runOne: async (paramSet, token) =>
             {
                 BacktestReport report;
@@ -493,7 +506,11 @@ public sealed record OptimizationRequest(
     KlineInterval Interval,
     decimal SlippageBps,
     decimal InitialBalance,
-    int Leverage = 1);
+    int Leverage = 1,
+    // S67：可插拔搜尋演算法。預設 Grid 維持向後相容（舊 client / 未升級 form 不送這欄就走網格）。
+    SearchMethod SearchMethod = SearchMethod.Grid,
+    // Random 模式必填（取樣次數）；Grid 模式忽略。LabEndpoints.ValidateRequest 把關必填條件。
+    int? RandomBudget = null);
 
 /// <summary>
 /// Leaderboard 套用請求 — 整包參數字典直接灌進 StrategyConfiguration.Parameters。

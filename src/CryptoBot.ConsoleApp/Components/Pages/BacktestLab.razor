@@ -2,6 +2,7 @@
 @using System.Globalization
 @using System.Net.Http.Json
 @using CryptoBot.Application.Ai
+@using CryptoBot.Application.Backtesting.Search
 @using CryptoBot.ConsoleApp.Api
 @using CryptoBot.ConsoleApp.Api.Dtos
 @using CryptoBot.ConsoleApp.Components.Lab
@@ -185,6 +186,30 @@
                        @bind:after="PersistFormSnapshot"
                        disabled="@State.IsRunning" title="1..100x — 高倍數會觸發爆倉模擬" />
             </div>
+        </div>
+
+        @* S67：搜尋演算法選擇器 — Grid（笛卡兒積）vs Random（依 budget 抽樣）。
+           Random 模式才會出現 Budget 欄位；切回 Grid 時 Budget 自動隱藏（值仍保留以利再切回）。 *@
+        <div class="form-row">
+            <label class="lead">Search</label>
+            <div class="field">
+                <span>Method</span>
+                <GlassDropdown TValue="SearchMethod"
+                               Value="@_searchMethod"
+                               ValueChanged="@OnSearchMethodChangedAsync"
+                               Items="@_searchMethodChoices"
+                               Label="@(s => SearchMethodLabel(s))"
+                               Disabled="@State.IsRunning" />
+            </div>
+            @if (_searchMethod == SearchMethod.Random)
+            {
+                <div class="field">
+                    <span>Budget</span>
+                    <input type="number" min="1" step="1" @bind="_randomBudget"
+                           disabled="@State.IsRunning"
+                           title="Random Search 取樣次數（每次從各維度獨立均勻抽一個值）" />
+                </div>
+            }
         </div>
 
         <div class="form-actions">
@@ -423,6 +448,12 @@
     // 預設 3x：既非 1x 無意義、也不像 50x 那樣預設就危險，讓新手第一次跑就感受到槓桿對 MaxDD 的放大。
     private int _leverageInput = 3;
 
+    // S67：搜尋演算法（預設 Grid 維持重構前行為）。Random 模式才會啟用 _randomBudget。
+    // 不寫進 LabFormSnapshot — search method 屬於「每次優化的當下決策」，重整時讓使用者重選一次降低誤跑風險。
+    private SearchMethod _searchMethod = SearchMethod.Grid;
+    private int _randomBudget = 50;
+    private static readonly SearchMethod[] _searchMethodChoices = new[] { SearchMethod.Grid, SearchMethod.Random };
+
     // 排除長週期（OneWeek / OneMonth）— 回測資料量 & 使用情境都不合理。
     private static readonly KlineInterval[] _allowedIntervals = new[]
     {
@@ -603,6 +634,20 @@
         _intervalInput = newInterval;
         await OnMarketChangedAsync();
     }
+
+    // S67：GlassDropdown<SearchMethod> ValueChanged — 純 UI 狀態切換，不重打 cache（搜尋方法不影響 cache key）。
+    private Task OnSearchMethodChangedAsync(SearchMethod newMethod)
+    {
+        _searchMethod = newMethod;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    private static string SearchMethodLabel(SearchMethod m) => m switch
+    {
+        SearchMethod.Random => "Random Search",
+        _                   => "Grid Search",
+    };
 
     private Task OnMarketChangedAsync()
     {
@@ -871,7 +916,26 @@
             return;
         }
 
-        State.NotifyJobStarting(_currentGridSize);
+        // S67：Random 模式需要 budget ≥ 1；Grid 不需要。提前擋住避免送出無效 request。
+        if (_searchMethod == SearchMethod.Random && _randomBudget < 1)
+        {
+            _toast = "Random Search budget 必須 ≥ 1。";
+            _toastIsError = true;
+            return;
+        }
+
+        // S67：Strategy 表單只負責 Strategy-specific 欄位（StrategyKey / Ranges / 全局 globals），
+        // 搜尋方法是頁面層的全域選擇 — 在 request 物件成形後用 record `with` 注入，
+        // 避免每個 *ParameterForm.razor 都要學會 SearchMethod 介面。
+        req = req with
+        {
+            SearchMethod = _searchMethod,
+            RandomBudget = _searchMethod == SearchMethod.Random ? _randomBudget : null,
+        };
+
+        // 進度總數依搜尋方法切換 — Random=budget；Grid 沿用既有計算（form 內部產出的 Ranges 大小）。
+        var progressTotal = _searchMethod == SearchMethod.Random ? _randomBudget : _currentGridSize;
+        State.NotifyJobStarting(progressTotal);
         StateHasChanged();
 
         using var http = HttpFactory.CreateClient();

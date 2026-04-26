@@ -1,4 +1,5 @@
 using System.Text.Json;
+using CryptoBot.Application.Backtesting.Search;
 using CryptoBot.Application.Realtime;
 using CryptoBot.Application.Strategies;
 using CryptoBot.ConsoleApp.Lab;
@@ -373,6 +374,16 @@ public static class LabEndpoints
         {
             if (range.Step <= 0) { error = $"Step must be positive for '{range.Name}'."; return false; }
             if (range.Max < range.Min) { error = $"Max must be >= Min for '{range.Name}'."; return false; }
+        }
+
+        // S67：搜尋方法相關欄位 — Random 必須帶正整數 budget；Grid 不要求 budget。
+        if (r.SearchMethod == SearchMethod.Random)
+        {
+            if (r.RandomBudget is null || r.RandomBudget <= 0)
+            {
+                error = "RandomBudget must be a positive integer when SearchMethod=Random.";
+                return false;
+            }
         }
 
         return true;
