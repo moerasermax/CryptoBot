@@ -3,8 +3,10 @@ using CryptoBot.Application.Backtesting;
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Domain.Repositories;
 using CryptoBot.Infrastructure.Ai;
+using CryptoBot.Application.Backtesting.Search;
 using CryptoBot.Infrastructure.Backtesting;
 using CryptoBot.Infrastructure.Backtesting.Persistence;
+using CryptoBot.Infrastructure.Backtesting.Search;
 using CryptoBot.Infrastructure.Configuration;
 using CryptoBot.Infrastructure.Exchange.BingX;
 using CryptoBot.Infrastructure.ExchangeAccounts;
@@ -47,6 +49,32 @@ public static class DependencyInjection
         services.AddNotifications(configuration);
         services.AddBacktesting();
         services.AddAiAdvisor(configuration);
+        services.AddBayesianSidecar(configuration);
+        return services;
+    }
+
+    /// <summary>
+    /// S69 Phase 2 — 註冊 Bayesian Optuna sidecar 連線。
+    ///
+    /// Strategy 為 Transient — 每次 optimize job 取得新實例（內部持有 study_id 狀態 + IAsyncDisposable）；
+    /// HttpClient 隨 strategy 共生死，job 結束後與 strategy 一起 dispose。Optimize 為使用者觸發的低頻
+    /// 操作，不會造成 socket exhaustion，故未啟用 IHttpClientFactory（與 Discord/Gemini 同模式）。
+    /// </summary>
+    public static IServiceCollection AddBayesianSidecar(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        services.Configure<BayesianSidecarOptions>(
+            configuration.GetSection(BayesianSidecarOptions.SectionName));
+
+        services.AddTransient<BayesianSearchStrategy>(sp =>
+            new BayesianSearchStrategy(
+                new HttpClient(),
+                sp.GetRequiredService<IOptions<BayesianSidecarOptions>>(),
+                sp.GetRequiredService<ILogger<BayesianSearchStrategy>>()));
+        services.AddTransient<IAdaptiveSearchStrategy>(sp =>
+            sp.GetRequiredService<BayesianSearchStrategy>());
+
         return services;
     }
 

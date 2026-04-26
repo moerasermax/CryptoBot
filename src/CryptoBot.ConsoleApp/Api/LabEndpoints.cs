@@ -9,6 +9,8 @@ using CryptoBot.Domain.Enums;
 using CryptoBot.Domain.Exceptions;
 using CryptoBot.Domain.Repositories;
 using CryptoBot.Domain.ValueObjects;
+using CryptoBot.Infrastructure.Configuration;
+using Microsoft.Extensions.Options;
 
 namespace CryptoBot.ConsoleApp.Api;
 
@@ -29,6 +31,33 @@ public static class LabEndpoints
 
         group.MapGet("/status", (OptimizationOrchestrator orchestrator) =>
             Results.Ok(new { isRunning = orchestrator.IsRunning }));
+
+        // S69 Phase 3：Sidecar 在線探針 — UI 切到 Bayesian 時 reactive 探一次，offline 即顯示「AI 引擎離線」。
+        // 故意短 timeout（2s）+ 包覆所有例外為「online=false」回應，避免 UI 端拉長等待或撞 500。
+        group.MapGet("/sidecar/health", async (
+            IOptions<BayesianSidecarOptions> opts,
+            CancellationToken ct) =>
+        {
+            var cfg = opts.Value;
+            using var http = new HttpClient
+            {
+                BaseAddress = new Uri(cfg.BaseUrl.EndsWith('/') ? cfg.BaseUrl : cfg.BaseUrl + "/"),
+                Timeout = TimeSpan.FromSeconds(2),
+            };
+            try
+            {
+                using var resp = await http.GetAsync("healthz", ct).ConfigureAwait(false);
+                return Results.Ok(new
+                {
+                    online = resp.IsSuccessStatusCode,
+                    statusCode = (int)resp.StatusCode,
+                });
+            }
+            catch (Exception ex)
+            {
+                return Results.Ok(new { online = false, error = ex.Message });
+            }
+        });
 
         // S25 T1：查詢上次優化存檔。{strategyKey} 為 StrategyCatalog 的 key（例 "trend"），
         // 搭配 query symbol+interval 組成唯一鍵。沒有快取時回 404。
@@ -376,12 +405,12 @@ public static class LabEndpoints
             if (range.Max < range.Min) { error = $"Max must be >= Min for '{range.Name}'."; return false; }
         }
 
-        // S67：搜尋方法相關欄位 — Random 必須帶正整數 budget；Grid 不要求 budget。
-        if (r.SearchMethod == SearchMethod.Random)
+        // S67/S69：Random 與 Bayesian 共用 RandomBudget 欄位控制 trial 數，皆需帶正整數；Grid 不要求 budget。
+        if (r.SearchMethod == SearchMethod.Random || r.SearchMethod == SearchMethod.Bayesian)
         {
             if (r.RandomBudget is null || r.RandomBudget <= 0)
             {
-                error = "RandomBudget must be a positive integer when SearchMethod=Random.";
+                error = $"RandomBudget must be a positive integer when SearchMethod={r.SearchMethod}.";
                 return false;
             }
         }

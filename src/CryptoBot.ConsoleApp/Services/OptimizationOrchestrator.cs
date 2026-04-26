@@ -102,19 +102,12 @@ public sealed class OptimizationOrchestrator
             .Select(r => new ParameterRange(r.Name, r.Min, r.Max, r.Step))
             .ToArray();
 
-        // 3) 依搜尋方法派發 ISearchStrategy + 計算總數（Random=budget；Grid=笛卡兒積大小）
-        ISearchStrategy search = req.SearchMethod switch
+        // 3) 依搜尋方法計算進度總數（Random/Bayesian=budget；Grid=笛卡兒積大小）
+        var total = req.SearchMethod switch
         {
-            SearchMethod.Random => new RandomSearchStrategy(
-                budget: req.RandomBudget
-                    ?? throw new InvalidOperationException(
-                        "RandomBudget must be specified for SearchMethod=Random.")),
-            _ => new GridSearchStrategy(),
+            SearchMethod.Random or SearchMethod.Bayesian => req.RandomBudget ?? 0,
+            _ => ranges.Aggregate(1, (acc, r) => acc * r.Enumerate().Count()),
         };
-
-        var total = req.SearchMethod == SearchMethod.Random
-            ? req.RandomBudget ?? 0
-            : ranges.Aggregate(1, (acc, r) => acc * r.Enumerate().Count());
         var completed = 0;
 
         // 4) 初始進度 0 / total
@@ -124,10 +117,9 @@ public sealed class OptimizationOrchestrator
             _scopeFactory.CreateScope().ServiceProvider.GetRequiredService<ILoggerFactory>()
                 .CreateLogger<StrategyOptimizer>());
 
-        var runs = await optimizer.RunAsync(
-            ranges,
-            search,
-            runOne: async (paramSet, token) =>
+        // 共用 runOne 委派：Grid/Random/Bayesian 三條路徑共用同一個回測 + 進度廣播閉包，差異只在誰出題。
+        Func<IReadOnlyDictionary<string, decimal>, CancellationToken, Task<BacktestReport>> runOne =
+            async (paramSet, token) =>
             {
                 BacktestReport report;
                 if (!IsValidCombination(req.StrategyKey, paramSet))
@@ -147,8 +139,31 @@ public sealed class OptimizationOrchestrator
                     .ConfigureAwait(false);
 
                 return report;
-            },
-            ct: ct).ConfigureAwait(false);
+            };
+
+        IReadOnlyList<OptimizationRun> runs;
+        if (req.SearchMethod == SearchMethod.Bayesian)
+        {
+            // 貝氏優化走 IAdaptiveSearchStrategy 路徑（序列、邊跑邊建議），strategy 由 DI 提供。
+            using var scope = _scopeFactory.CreateScope();
+            var adaptive = scope.ServiceProvider.GetRequiredService<IAdaptiveSearchStrategy>();
+            var budget = req.RandomBudget
+                ?? throw new InvalidOperationException(
+                    "RandomBudget must be specified for SearchMethod=Bayesian.");
+            runs = await optimizer.RunAsync(ranges, adaptive, budget, runOne, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            ISearchStrategy search = req.SearchMethod switch
+            {
+                SearchMethod.Random => new RandomSearchStrategy(
+                    budget: req.RandomBudget
+                        ?? throw new InvalidOperationException(
+                            "RandomBudget must be specified for SearchMethod=Random.")),
+                _ => new GridSearchStrategy(),
+            };
+            runs = await optimizer.RunAsync(ranges, search, runOne, ct: ct).ConfigureAwait(false);
+        }
 
         // 5) 排名 + 推送完成事件 + 持久化 Top1 到 StrategyOptimizationSettings
         await BroadcastCompletedAsync(req, symbol, runs, ct).ConfigureAwait(false);

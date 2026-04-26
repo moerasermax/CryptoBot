@@ -18,4 +18,11 @@ public enum SearchMethod
     /// 適用於高維度空間（笛卡兒積過大）或前期粗掃。
     /// </summary>
     Random = 1,
+
+    /// <summary>
+    /// 貝氏優化 — 透過 Optuna sidecar TPE sampler「邊跑邊建議」，下一組參數依過往 trial 結果學習推薦。
+    /// 走 <see cref="IAdaptiveSearchStrategy"/> 路徑（與 Grid/Random 的 <see cref="ISearchStrategy"/> 不同），
+    /// 優化執行為序列模式而非並行。掃描次數同樣由 <c>RandomBudget</c> 欄位控制（與 Random 共用 budget 語意）。
+    /// </summary>
+    Bayesian = 2,
 }

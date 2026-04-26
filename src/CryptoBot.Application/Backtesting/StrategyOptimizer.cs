@@ -104,6 +104,77 @@ public sealed class StrategyOptimizer
         CancellationToken ct = default)
         => RunAsync(ranges, new GridSearchStrategy(), runOne, maxDegreeOfParallelism, ct);
 
+    /// <summary>
+    /// S69 — 自適應搜尋的 RunAsync 路徑。與 ISearchStrategy 的「先列舉再並行」模型不同：
+    /// 本 overload 序列執行 budget 次 (suggest → run → report) 三步循環，讓 sampler 從上一輪結果學習。
+    ///
+    /// 為什麼不能並行：sampler 的下一組推薦依賴所有「已 tell 完成」的 trial。若多個 worker 同時 ask
+    /// 而結果還沒 tell 回去，會吃到 stale state。Optuna 自身支援多 worker 模式但需額外協調機制 —
+    /// Phase 2 先用最簡的序列模型，未來如需並行再迭代。
+    /// </summary>
+    public async Task<IReadOnlyList<OptimizationRun>> RunAsync(
+        IReadOnlyList<ParameterRange> ranges,
+        IAdaptiveSearchStrategy strategy,
+        int budget,
+        Func<IReadOnlyDictionary<string, decimal>, CancellationToken, Task<BacktestReport>> runOne,
+        CancellationToken ct = default)
+    {
+        if (ranges.Count == 0)
+            throw new ArgumentException("At least one parameter range is required.", nameof(ranges));
+        if (budget <= 0)
+            throw new ArgumentException($"Budget must be positive: {budget}", nameof(budget));
+
+        await strategy.InitializeAsync(ranges, budget, ct).ConfigureAwait(false);
+
+        var results = new List<OptimizationRun>(budget);
+
+        try
+        {
+            _logger.LogInformation(
+                "🧪 [OPTIMIZE-ADAPTIVE] budget={Budget} via {Strategy}",
+                budget, strategy.GetType().Name);
+
+            for (var i = 0; i < budget; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var paramSet = await strategy.SuggestNextAsync(ct).ConfigureAwait(false);
+
+                BacktestReport report;
+                try
+                {
+                    report = await runOne(paramSet, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "🧪 [OPTIMIZE-ADAPTIVE] Run failed for params={Params}",
+                        FormatParams(paramSet));
+                    // 失敗 trial 仍要回報 sampler — 用 decimal.MinValue 與真實負 PnL 區分（合法 PnL 不會這麼極端）。
+                    await strategy.ReportResultAsync(paramSet, decimal.MinValue, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                results.Add(new OptimizationRun(paramSet, report));
+
+                _logger.LogInformation(
+                    "🧪 [OPTIMIZE-ADAPTIVE] {Done}/{Total} params={Params} pnl={PnL:F2} dd={DD:F2}% fills={Fills}",
+                    i + 1, budget, FormatParams(paramSet),
+                    report.NetPnL, report.MaxDrawdownPercent, report.OrdersFilled);
+
+                await strategy.ReportResultAsync(paramSet, report.NetPnL, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await strategy.DisposeAsync().ConfigureAwait(false);
+        }
+
+        return results
+            .OrderByDescending(r => r.Report.NetPnL)
+            .ToList();
+    }
+
     private static string FormatParams(IReadOnlyDictionary<string, decimal> p) =>
         string.Join(", ", p.Select(kv => $"{kv.Key}={kv.Value}"));
 }
