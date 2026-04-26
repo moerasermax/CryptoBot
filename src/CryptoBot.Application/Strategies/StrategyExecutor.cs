@@ -316,16 +316,65 @@ public sealed class StrategyExecutor : IStrategyExecutor
 
     private async Task HandleSignalAsync(IServiceProvider sp, TradingSignal signal, DateTime signalCloseTimeUtc, string traceId)
     {
-        var sizer = sp.GetRequiredService<IOrderSizer>();
-        var risk = sp.GetRequiredService<IRiskManager>();
         var orderRepo = sp.GetRequiredService<IOrderRepository>();
         var positionRepo = sp.GetRequiredService<IPositionRepository>();
         var uow = sp.GetRequiredService<IUnitOfWork>();
 
-        // 1) 計算目標數量
-        var qty = await sizer.ComputeAsync(_strategy, signal, CancellationToken.None).ConfigureAwait(false);
-        if (qty.Value <= 0)
+        // S69-Hotfix：開倉與平倉訊號分流。CheckBeforeOpenAsync 內含 MaxConcurrentPositions、餘額、敞口
+        // 等檢查，皆是「開新倉前的護欄」；對 CloseLong/CloseShort 而言，本意就是把現有部位數從 N→N-1，
+        // 這些檢查反而會永久攔截平倉（已在實盤觀察到 [RISK] already has 1/max 1 永久卡住）。
+        // 故 close 路徑：跳過 Sizer + RiskManager，直接以現有部位的 Quantity 作為平倉數量。
+        var isOpenSignal = signal.Type == SignalType.OpenLong || signal.Type == SignalType.OpenShort;
+        var isCloseSignal = signal.Type == SignalType.CloseLong || signal.Type == SignalType.CloseShort;
+
+        Quantity qty;
+        if (isCloseSignal)
         {
+            var targetSide = signal.Type == SignalType.CloseLong ? PositionSide.Long : PositionSide.Short;
+            var openPositions = await positionRepo
+                .GetByStrategyIdAsync(_strategy.Id, includeClosedPositions: false, CancellationToken.None)
+                .ConfigureAwait(false);
+            var matched = openPositions.FirstOrDefault(p => p.Side == targetSide);
+            if (matched is null)
+            {
+                // 收到平倉訊號但無對應方向部位 — 沿用 §⑤ 風控透明化：[CLOSE] 前綴廣播 + warn log，
+                // 策略維持 Running（不呼叫 ReportError）。
+                _logger.LogWarning(
+                    "Close signal {Signal} received but no open {Side} position for strategy {Name} — skipping.",
+                    signal, targetSide, _strategy.Name);
+                try
+                {
+                    await _broadcaster.BroadcastStrategyEvaluationFailedAsync(new StrategyEvaluationFailedUpdate(
+                        StrategyId: _strategy.Id,
+                        StrategyName: _strategy.Name,
+                        OccurredAtUtc: DateTime.UtcNow,
+                        Symbol: _strategy.Configuration.Symbol.BingXFormat,
+                        ErrorMessage: $"[CLOSE] No open {targetSide} position to close — signal {signal.Type} ignored.",
+                        TraceId: traceId), CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception broadcastEx)
+                {
+                    _logger.LogWarning(broadcastEx,
+                        "Failed to broadcast no-position-to-close event for {Name}.", _strategy.Name);
+                }
+                return;
+            }
+            qty = matched.Quantity;
+        }
+        else if (!isOpenSignal)
+        {
+            _logger.LogWarning("Unexpected signal type {Type} reached HandleSignalAsync — ignoring.", signal.Type);
+            return;
+        }
+        else
+        {
+            var sizer = sp.GetRequiredService<IOrderSizer>();
+            var risk = sp.GetRequiredService<IRiskManager>();
+
+            // 1) 計算目標數量
+            qty = await sizer.ComputeAsync(_strategy, signal, CancellationToken.None).ConfigureAwait(false);
+            if (qty.Value <= 0)
+            {
             // S59 T1：過去這裡只 log 就 return，使用者面板看不到任何跡象 —「有信號、無下單、無報錯」的
             // 靜默失敗就是這樣來的。比照 S56 風控攔截雙軌：Warning 通知 + [SIZE] 前綴廣播，Dashboard
             // 滾動日誌會以橘色標註；策略維持 Running 不走 ReportError（與 [RISK] 同理）。
@@ -410,6 +459,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
             }
             return;
         }
+        }
 
         // 3) 建 Order aggregate — S66-A：採決定性 ClientOrderId。同一根 K 線 + 同策略 + 同方向
         //    永遠產出同樣的 ID；網路逾時或 SDK 自動重試時，BingX 以 clientOrderId 去重，本地 DB
@@ -470,7 +520,6 @@ public sealed class StrategyExecutor : IStrategyExecutor
         //    則 Position.Open + AddAsync。只對 Open* 訊號做；Close* 交給 AccountSynchronizer
         //    的 WS HandleAccountUpdate 處理（那邊會偵測 remote.Quantity == 0 自動 Close()）。
         Position? newPosition = null;
-        var isOpenSignal = signal.Type == SignalType.OpenLong || signal.Type == SignalType.OpenShort;
         if (isOpenSignal && order.IsActive)
         {
             try
