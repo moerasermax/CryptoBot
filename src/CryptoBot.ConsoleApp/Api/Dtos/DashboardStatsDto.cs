@@ -1,9 +1,10 @@
-namespace CryptoBot.ConsoleApp.Api.Dtos;
+﻿namespace CryptoBot.ConsoleApp.Api.Dtos;
 
-/// <summary>儀表板三卡 + 開倉清單的 API 回傳格式。</summary>
+/// <summary>儀表板三卡 + 開倉清單的 API 回傳格式（S70 後拆分版本）。</summary>
 public sealed record DashboardStatsDto(
     decimal TotalEquity,
-    decimal TodayPnL,
+    decimal TodayRealizedPnL,
+    decimal OpenUnrealizedPnL,
     int ActiveStrategyCount,
     IReadOnlyList<OpenPositionDto> OpenPositions,
     IReadOnlyList<RecentTradeDto> RecentTrades);

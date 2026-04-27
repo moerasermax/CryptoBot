@@ -252,11 +252,19 @@
     </article>
 
     <article class="card">
-        <span class="card-label">Today P&amp;L</span>
-        <span class="card-value @(_stats is null ? "" : _stats.TodayPnL >= 0 ? "pos" : "neg")">
-            @FormatSignedMoney(_stats?.TodayPnL)
+        <span class="card-label">Today Realized P&amp;L</span>
+        <span class="card-value @(_stats is null ? "" : _stats.TodayRealizedPnL >= 0 ? "pos" : "neg")">
+            @FormatSignedMoney(_stats?.TodayRealizedPnL)
         </span>
-        <span class="card-footnote">Realized + Unrealized since UTC 00:00</span>
+        <span class="card-footnote">Closed positions since local 00:00</span>
+    </article>
+
+    <article class="card">
+        <span class="card-label">Open Unrealized P&amp;L</span>
+        <span class="card-value @(_stats is null ? "" : _stats.OpenUnrealizedPnL >= 0 ? "pos" : "neg")">
+            @FormatSignedMoney(_stats?.OpenUnrealizedPnL)
+        </span>
+        <span class="card-footnote">Mark-to-market of all open positions</span>
     </article>
 
     <article class="card">

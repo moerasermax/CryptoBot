@@ -1,4 +1,4 @@
-using CryptoBot.ConsoleApp.Api.Dtos;
+﻿using CryptoBot.ConsoleApp.Api.Dtos;
 using CryptoBot.ConsoleApp.Services;
 using CryptoBot.Domain.Repositories;
 
@@ -54,7 +54,8 @@ public static class DashboardEndpoints
 
             return Results.Ok(new DashboardStatsDto(
                 TotalEquity: s.TotalEquity,
-                TodayPnL: s.TodayPnL,
+                TodayRealizedPnL: s.TodayRealizedPnL,
+                OpenUnrealizedPnL: s.OpenUnrealizedPnL,
                 ActiveStrategyCount: s.ActiveStrategyCount,
                 OpenPositions: positionDtos,
                 RecentTrades: recent));
