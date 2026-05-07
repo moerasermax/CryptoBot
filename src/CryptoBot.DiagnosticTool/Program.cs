@@ -23,6 +23,11 @@ public static class Program
         // 因為本工具不讀 stdin。
         Console.OutputEncoding = System.Text.Encoding.UTF8;
 
+        // S71：cwd 自癒 — 若從 repo 根 / 任意目錄執行（dotnet run --project ...），
+        // SQLite 相對路徑 Data Source=cryptobot.db 會解析到錯誤位置（缺 ExchangeAccounts 表），
+        // 在此自動切回 ConsoleApp 目錄並廣播（依 IRON ⑥ 風控透明化精神）。
+        TryRelocateCwdToConsoleApp();
+
         var services = BuildServices();
         var commands = services.GetRequiredService<IEnumerable<IDiagnosticCommand>>().ToList();
         var dispatch = BuildDispatch(commands);
@@ -52,6 +57,46 @@ public static class Program
             Console.Error.WriteLine(ex.StackTrace);
             return 99;
         }
+    }
+
+    /// <summary>
+    /// S71 cwd 自癒：當前工作目錄缺 cryptobot.db 時，依優先序探測 ConsoleApp 候選位置，
+    /// 找到（同時含 cryptobot.db 與 appsettings.json 才視為合格 ConsoleApp 目錄）即切過去。
+    /// 失敗時刻意不拋例外 — 維持向後相容（讓既有 PrintUsage 提示繼續引導使用者）。
+    /// </summary>
+    private static void TryRelocateCwdToConsoleApp()
+    {
+        var currentCwd = Directory.GetCurrentDirectory();
+
+        // cwd 已是 ConsoleApp（含 cryptobot.db）即不動 — 向後相容路徑。
+        if (File.Exists(Path.Combine(currentCwd, "cryptobot.db")))
+        {
+            return;
+        }
+
+        // 候選相對路徑（由近至遠覆蓋常見執行情境：repo 根 / DiagnosticTool 旁 / src 同層 / 其他兄弟）
+        string[] candidates =
+        {
+            "src/CryptoBot.ConsoleApp",
+            "CryptoBot/src/CryptoBot.ConsoleApp",
+            "../CryptoBot.ConsoleApp",
+            "../src/CryptoBot.ConsoleApp",
+            "../../src/CryptoBot.ConsoleApp",
+        };
+
+        foreach (var rel in candidates)
+        {
+            var abs = Path.GetFullPath(Path.Combine(currentCwd, rel));
+            if (File.Exists(Path.Combine(abs, "cryptobot.db")) &&
+                File.Exists(Path.Combine(abs, "appsettings.json")))
+            {
+                Directory.SetCurrentDirectory(abs);
+                Console.WriteLine($"[CWD] relocated from {currentCwd} to {abs}");
+                return;
+            }
+        }
+
+        Console.WriteLine($"[CWD] could not relocate (no ConsoleApp candidate found from {currentCwd})");
     }
 
     private static IServiceProvider BuildServices()

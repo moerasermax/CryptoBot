@@ -219,6 +219,12 @@ public sealed class BacktestSimulator : IExchangeClient, IBacktestClock
         Symbol symbol, CancellationToken ct = default)
         => Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
 
+    // S72：回測情境永遠回空集合 — 回測中所有成交是 BacktestSimulator 自己模擬的（_fills），
+    // 不對應「交易所端真實成交歷史」概念。AccountSynchronizer 在回測下也不會走實證對帳路徑。
+    public Task<IReadOnlyList<ExchangeTradeInfo>> GetTradeHistoryAsync(
+        Symbol symbol, DateTime since, DateTime? until = null, CancellationToken ct = default)
+        => Task.FromResult<IReadOnlyList<ExchangeTradeInfo>>(Array.Empty<ExchangeTradeInfo>());
+
     private Kline RequireCurrent() => _currentKline
         ?? throw new InvalidOperationException(
             "BacktestSimulator has no current kline; BacktestEngine must call AdvanceTo() before any price / order call.");

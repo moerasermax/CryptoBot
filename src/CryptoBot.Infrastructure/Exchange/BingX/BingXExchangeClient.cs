@@ -822,6 +822,105 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
         return list;
     }
 
+    // ========== S72：交易所側成交歷史（實證對帳用）==========
+
+    /// <summary>
+    /// S72：呼叫 BingX <c>swap/v1/trade/fillHistory</c> 取得指定 symbol 自 since 起的成交明細。
+    /// 用於 AccountSynchronizer 對「本地 Open / 遠端不存在」的 orphan position 做實證對帳。
+    /// IM §S72 鐵則：嚴禁用 <see cref="GetMarkPriceAsync"/> 推算「假設成交價」結算 RealizedPnL。
+    ///
+    /// <para>
+    /// SDK 屬性名（TradeId / OrderId / Volume / Price / Commission / RealizedPnl / FilledTime 等）
+    /// 同 <see cref="GetOpenPositionsAsync"/> 的 BingXPosition 模式以 <c>dynamic</c> 讀取，
+    /// 因為 v3.10.0 BingXFuturesUserTradeDetails 結構在不同 SDK minor 版間屬性名飄移。
+    /// 單筆解析失敗只跳過該筆、不阻擋整個對帳流程。
+    /// </para>
+    /// </summary>
+    public async Task<IReadOnlyList<ExchangeTradeInfo>> GetTradeHistoryAsync(
+        Symbol symbol, DateTime since, DateTime? until = null, CancellationToken ct = default)
+    {
+        var result = await _client.PerpetualFuturesApi.Trading
+            .GetUserTradesAsync(
+                symbol: symbol.BingXFormat,
+                orderId: (long?)null,
+                settleAsset: (string?)null,
+                startTime: since,
+                endTime: until,
+                fromId: (long?)null,
+                limit: (int?)null,
+                ct: ct)
+            .ConfigureAwait(false);
+
+        result.Check(nameof(GetTradeHistoryAsync));
+
+        var list = new List<ExchangeTradeInfo>();
+        foreach (dynamic t in result.Data)
+        {
+            try
+            {
+                string tradeId;
+                try { tradeId = ((object)t.TradeId).ToString() ?? string.Empty; }
+                catch { try { tradeId = ((object)t.Id).ToString() ?? string.Empty; } catch { tradeId = string.Empty; } }
+
+                string orderId;
+                try { orderId = ((object)t.OrderId).ToString() ?? string.Empty; }
+                catch { orderId = string.Empty; }
+
+                string sym;
+                try { sym = (string)t.Symbol; } catch { continue; }
+                Symbol parsedSymbol;
+                try { parsedSymbol = Symbol.Parse(sym); } catch { continue; }
+                if (!parsedSymbol.Equals(symbol)) continue;
+
+                var side = ((global::BingX.Net.Enums.OrderSide)t.Side).ToDomain();
+
+                global::BingX.Net.Enums.PositionSide posSideRaw;
+                try { posSideRaw = (global::BingX.Net.Enums.PositionSide)t.PositionSide; }
+                catch { posSideRaw = global::BingX.Net.Enums.PositionSide.Long; }
+                var posSide = posSideRaw.ToDomain();
+
+                decimal qty = 0m;
+                try { qty = (decimal)t.Quantity; }
+                catch { try { qty = (decimal)t.Volume; } catch { } }
+
+                decimal price = 0m;
+                try { price = (decimal)t.Price; } catch { }
+
+                decimal commission = 0m;
+                try { commission = (decimal?)t.Commission ?? 0m; }
+                catch { try { commission = (decimal?)t.Fee ?? 0m; } catch { } }
+
+                decimal realizedPnl = 0m;
+                try { realizedPnl = (decimal?)t.RealisedPnl ?? 0m; }
+                catch { try { realizedPnl = (decimal?)t.RealizedPnl ?? 0m; } catch { } }
+
+                DateTime time = DateTime.UtcNow;
+                try { time = (DateTime)t.FilledTime; }
+                catch { try { time = (DateTime)t.Timestamp; } catch { try { time = (DateTime)t.Time; } catch { } } }
+
+                list.Add(new ExchangeTradeInfo(
+                    TradeId: tradeId,
+                    OrderId: orderId,
+                    Symbol: parsedSymbol,
+                    Side: side,
+                    PositionSide: posSide,
+                    Quantity: Math.Abs(qty),
+                    Price: price,
+                    Commission: commission,
+                    RealizedPnl: realizedPnl,
+                    Time: time));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "GetTradeHistoryAsync: failed to parse single trade entry for {Symbol} — skipped.",
+                    symbol.BingXFormat);
+            }
+        }
+
+        return list;
+    }
+
     // ========== S61：交易所側活躍掛單 ==========
 
     /// <summary>

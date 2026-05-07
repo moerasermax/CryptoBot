@@ -162,7 +162,12 @@ public static class Program
             builder.Services.AddHostedService<ExchangeHealthCheckService>();
 
             // S66-B：訂單對帳服務（每 1 min 巡檢 Pending / 殭屍訂單，與 AccountSynchronizer 互補的兜底機制）
+            // S72 升級：本服務 line 119 已擴大涵蓋 PartiallyFilled，補殺長時間殭屍 partial 單。
             builder.Services.AddHostedService<OrderReconciliationService>();
+
+            // S72：帳戶對帳週期性服務（每 5 min 跑 AccountSynchronizer.ReconcileAsync，含實證對帳）—
+            // 補完原版「只啟動時跑一次」的盲區，杜絕 phantom close（IM §S72 鐵則）。
+            builder.Services.AddHostedService<PeriodicAccountReconciliationService>();
 
             // S66-D：NTP 時鐘漂移監控（啟動立即 sync 一次 + 每 5 min tick；偏差 > 1000ms 由 RiskManager 攔截）
             builder.Services.AddHostedService<NtpDriftMonitor>();

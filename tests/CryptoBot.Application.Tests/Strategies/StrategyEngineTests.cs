@@ -633,6 +633,7 @@ internal sealed class CapturingBroadcaster : IRealtimeBroadcaster
     public Task BroadcastPositionClosedAsync(PositionClosedUpdate update, CancellationToken ct = default) => Task.CompletedTask;
     public Task BroadcastPositionPnLAsync(PositionPnLTickUpdate update, CancellationToken ct = default) => Task.CompletedTask;
     public Task BroadcastStrategyMetadataChangedAsync(StrategyMetadataChangedUpdate update, CancellationToken ct = default) => Task.CompletedTask;
+    public Task BroadcastReconciliationCriticalAsync(ReconciliationCriticalUpdate update, CancellationToken ct = default) => Task.CompletedTask;
 }
 
 internal sealed class FakeMarketDataStream : IMarketDataStream
@@ -740,6 +741,8 @@ internal sealed class FakeExchangeClient : IExchangeClient
         Task.FromResult<IReadOnlyList<ExchangePositionInfo>>(Array.Empty<ExchangePositionInfo>());
     public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
+    public Task<IReadOnlyList<ExchangeTradeInfo>> GetTradeHistoryAsync(Symbol symbol, DateTime since, DateTime? until = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ExchangeTradeInfo>>(Array.Empty<ExchangeTradeInfo>());
 
     public Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
         Symbol symbol, string clientOrderId, CancellationToken ct = default) =>

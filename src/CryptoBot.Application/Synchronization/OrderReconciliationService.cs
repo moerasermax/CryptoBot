@@ -115,8 +115,11 @@ public sealed class OrderReconciliationService : BackgroundService
         {
             if (ct.IsCancellationRequested) return;
 
-            // 只處理 Status == New（PartiallyFilled 已在推進中，由 AccountSynchronizer WS 接管）
-            if (order.Status != OrderStatus.New) continue;
+            // S72：擴大涵蓋至 PartiallyFilled — S71 揪出 3 筆 LINK-USDT PartiallyFilled 卡 8 天，
+            // 真因為 user-data WS 漏接最後 1% fill update + 原版本只處理 New。
+            // 對 PartiallyFilled 只走情境 B（已有 ExchangeOrderId）路徑：
+            //   age ≥ ZombieRefreshThreshold → 強制 RefreshOrderStatusAsync 讓 BingX 端最終狀態落地
+            if (order.Status != OrderStatus.New && order.Status != OrderStatus.PartiallyFilled) continue;
 
             try
             {

@@ -26,4 +26,7 @@ public sealed class NullRealtimeBroadcaster : IRealtimeBroadcaster
 
     public Task BroadcastStrategyMetadataChangedAsync(StrategyMetadataChangedUpdate update, CancellationToken ct = default)
         => Task.CompletedTask;
+
+    public Task BroadcastReconciliationCriticalAsync(ReconciliationCriticalUpdate update, CancellationToken ct = default)
+        => Task.CompletedTask;
 }

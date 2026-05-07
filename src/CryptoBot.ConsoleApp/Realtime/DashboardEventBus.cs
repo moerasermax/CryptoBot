@@ -42,6 +42,9 @@ public sealed class DashboardEventBus
     /// <summary>S45-S48：策略身分（Name / Type / Symbol / Interval / Leverage）熱套用後立即跳轉用。</summary>
     public event Action<StrategyMetadataChangedUpdate>? StrategyMetadataChanged;
 
+    /// <summary>S72 [CRITICAL_SYNC]：對帳關鍵事件 — Dashboard 應顯著呈現，提示人工介入。</summary>
+    public event Action<ReconciliationCriticalUpdate>? ReconciliationCritical;
+
     public void RaiseTrade(TradeFilledUpdate update) => TradeFilled?.Invoke(update);
     public void RaiseStats(DashboardStatsUpdate update) => StatsUpdated?.Invoke(update);
     public void RaisePositionClosed(PositionClosedUpdate update) => PositionClosed?.Invoke(update);
@@ -70,4 +73,7 @@ public sealed class DashboardEventBus
 
     public void RaiseStrategyMetadataChanged(StrategyMetadataChangedUpdate update) =>
         StrategyMetadataChanged?.Invoke(update);
+
+    public void RaiseReconciliationCritical(ReconciliationCriticalUpdate update) =>
+        ReconciliationCritical?.Invoke(update);
 }

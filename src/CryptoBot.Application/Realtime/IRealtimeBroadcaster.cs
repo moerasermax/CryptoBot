@@ -29,4 +29,10 @@ public interface IRealtimeBroadcaster
     /// <c>/api/lab/apply</c> 在熱套用後立即觸發，Dashboard 卡片不必等下一個 K 線心跳就能跳轉。
     /// </summary>
     Task BroadcastStrategyMetadataChangedAsync(StrategyMetadataChangedUpdate update, CancellationToken ct = default);
+
+    /// <summary>
+    /// S72 [CRITICAL_SYNC]：對帳關鍵事件廣播 — Position Unaccounted / 殭屍訂單補殺等
+    /// 需人工注意的偏差。與 <c>ILogger.LogError</c> 構成雙軌通知（IM §S72 紀律）。
+    /// </summary>
+    Task BroadcastReconciliationCriticalAsync(ReconciliationCriticalUpdate update, CancellationToken ct = default);
 }

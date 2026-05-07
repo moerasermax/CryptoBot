@@ -63,4 +63,10 @@ public sealed class SignalRRealtimeBroadcaster : IRealtimeBroadcaster
         _bus.RaiseStrategyMetadataChanged(update);
         await _hub.Clients.All.SendAsync("StrategyMetadataChanged", update, ct).ConfigureAwait(false);
     }
+
+    public async Task BroadcastReconciliationCriticalAsync(ReconciliationCriticalUpdate update, CancellationToken ct = default)
+    {
+        _bus.RaiseReconciliationCritical(update);
+        await _hub.Clients.All.SendAsync("ReconciliationCritical", update, ct).ConfigureAwait(false);
+    }
 }

@@ -234,21 +234,23 @@ public class OrderReconciliationServiceTests
     }
 
     [Fact]
-    public async Task PartiallyFilledOrder_NotTouchedByService()
+    public async Task PartiallyFilledOrder_GetsRefreshedAfterZombieThreshold()
     {
-        // PartiallyFilled 由 AccountSynchronizer 管，本服務不該動
+        // S72：擴大涵蓋 PartiallyFilled。S71 揪出 3 筆 LINK-USDT PartiallyFilled 卡 8 天的真因為
+        // 原版本只處理 New + WS 漏接最後 1% fill update。本服務現在會對 PartiallyFilled + age > 5min
+        // 的 Order 強制 RefreshOrderStatusAsync，避免長時間殭屍占用風控額度。
         var (svc, exchange, repo) = BuildSut(out var clock, out var uow);
         var order = MakePendingOrder(cid: "cb_strat_partial", createdAt: T0, qty: 0.02m);
         order.AssignExchangeOrderId("EX-PARTIAL-1");
         order.RecordFill(Quantity.Create(0.01m), Price.Create(50000m), commission: 0m);
         // 此時 Status = PartiallyFilled
         repo.Seed(order);
+        // age = 10min > ZombieRefreshThreshold (5min) → 應觸發 RefreshOrderStatusAsync
         clock.SetNow(T0.AddMinutes(10));
 
         await svc.ReconcileOnceAsync(CancellationToken.None);
 
-        Assert.Equal(OrderStatus.PartiallyFilled, order.Status);
-        Assert.Equal(0, exchange.RefreshCalls);
+        Assert.Equal(1, exchange.RefreshCalls);
     }
 
     // ============== Helpers ==============
@@ -347,6 +349,8 @@ internal sealed class FakeExchange : IExchangeClient
         Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
     public Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ExchangePositionInfo>>(Array.Empty<ExchangePositionInfo>());
+    public Task<IReadOnlyList<ExchangeTradeInfo>> GetTradeHistoryAsync(Symbol symbol, DateTime since, DateTime? until = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ExchangeTradeInfo>>(Array.Empty<ExchangeTradeInfo>());
     public Task<DateTime> GetServerTimeAsync(CancellationToken ct = default) =>
         Task.FromResult(DateTime.UtcNow);
 }

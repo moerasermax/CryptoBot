@@ -112,6 +112,20 @@ public interface IExchangeClient
 
     /// <summary>取得交易所側的所有持倉 (用於對帳)</summary>
     Task<IReadOnlyList<ExchangePositionInfo>> GetOpenPositionsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// S72：查詢交易所側的歷史成交明細，用於「實證對帳」— 當本地 Open Position 在遠端
+    /// <see cref="GetOpenPositionsAsync"/> 查無時，必須以此方法查實際成交記錄取證，
+    /// 嚴禁用 <see cref="GetMarkPriceAsync"/> 推算「假設成交價」結算 RealizedPnL（IM §S72 鐵則）。
+    ///
+    /// 找不到對應成交（Unaccounted）時呼叫端應採隱式約定（IsClosed=1 + RealizedPnL=0 + 廣播 [CRITICAL_SYNC]），
+    /// 而非用行情價填充。
+    /// </summary>
+    /// <param name="symbol">過濾單一交易對。</param>
+    /// <param name="since">起始時間（UTC，含）— 通常傳 Position.OpenedAt。</param>
+    /// <param name="until">結束時間（UTC，含），null 代表「至今」。</param>
+    Task<IReadOnlyList<ExchangeTradeInfo>> GetTradeHistoryAsync(
+        Symbol symbol, DateTime since, DateTime? until = null, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -170,3 +184,30 @@ public sealed record ExchangeOrderSnapshot(
     decimal QuantityFilled,
     decimal? AveragePrice,
     DateTime UpdateTime);
+
+/// <summary>
+/// S72：交易所端的單筆成交明細（fill / trade），由 <see cref="IExchangeClient.GetTradeHistoryAsync"/> 回傳。
+/// 用於 AccountSynchronizer 對「本地 Open / 遠端不存在」的 orphan position 做實證對帳，
+/// 加權平均 <see cref="Price"/> 後才能結算 RealizedPnL（嚴禁以行情 MarkPrice 推算）。
+/// </summary>
+/// <param name="TradeId">成交 ID（交易所側唯一）。</param>
+/// <param name="OrderId">所屬訂單的 ExchangeOrderId — 對映本地 Order.ExchangeOrderId。</param>
+/// <param name="Symbol">交易對。</param>
+/// <param name="Side">買 / 賣方向（成交方向）。</param>
+/// <param name="PositionSide">部位方向（Long / Short）— 用於對帳時匹配本地 Position.Side。</param>
+/// <param name="Quantity">成交數量（base asset）。</param>
+/// <param name="Price">成交價（quote asset / base asset）。</param>
+/// <param name="Commission">手續費（負值代表支出）。</param>
+/// <param name="RealizedPnl">交易所側已實現損益（若 SDK 不提供則為 0；以呼叫端的加權計算為準）。</param>
+/// <param name="Time">成交時間（UTC）。</param>
+public sealed record ExchangeTradeInfo(
+    string TradeId,
+    string OrderId,
+    Symbol Symbol,
+    OrderSide Side,
+    PositionSide PositionSide,
+    decimal Quantity,
+    decimal Price,
+    decimal Commission,
+    decimal RealizedPnl,
+    DateTime Time);

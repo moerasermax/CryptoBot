@@ -241,8 +241,10 @@ public class AccountSynchronizerTests
     }
 
     [Fact]
-    public async Task AccountUpdate_PositionZeroWithoutMarkPrice_FallsBackToExchangeQuery()
+    public async Task AccountUpdate_PositionZero_QueriesTradeHistoryNotMarkPrice()
     {
+        // S72：實證對帳紀律 — Quantity=0 時嚴禁用 MarkPrice 推算 ExitPrice（IM §S72 鐵則）。
+        // 改為呼叫 GetTradeHistoryAsync 取真實成交。本測試驗證 GetMarkPrice 不被呼叫、改打 GetTradeHistory。
         var market = new SyncFakeMarketDataStream();
         var exchange = new SyncFakeExchangeClient { MarkPrice = Price.Create(123m) };
         var localPos = MakeOpenPosition(PositionSide.Long, qty: 1m, entry: 100m);
@@ -264,7 +266,8 @@ public class AccountSynchronizerTests
             }));
 
         Assert.True(localPos.IsClosed);
-        Assert.Equal(1, exchange.GetMarkPriceCalls);
+        Assert.Equal(1, exchange.GetTradeHistoryCalls);  // 走實證對帳路徑
+        Assert.Equal(0, exchange.GetMarkPriceCalls);     // 嚴禁盲猜 MarkPrice
     }
 
     [Fact]
@@ -315,12 +318,20 @@ public class AccountSynchronizerTests
     }
 
     [Fact]
-    public async Task Reconcile_ClosesOrphanLocalPosition()
+    public async Task Reconcile_OrphanWithEvidence_ClosesUsingTradePrice()
     {
+        // S72：本地有 / 遠端 GetOpenPositions 不存在 → 走實證對帳路徑：
+        // 呼叫 GetTradeHistoryAsync 找對應平倉 trades，找到即用加權平均成交價結算
+        // （**不**用 MarkPrice 推算）
         var market = new SyncFakeMarketDataStream();
         var exchange = new SyncFakeExchangeClient { MarkPrice = Price.Create(99m) };
-        // 遠端回傳空 list → 本地那倉就是孤兒
         exchange.OpenPositions = Array.Empty<ExchangePositionInfo>();
+        // 遠端歷史中有對應 closing trade（Long Position 平倉 = Sell trade、PositionSide=Long）
+        exchange.TradeHistory.Add(new ExchangeTradeInfo(
+            TradeId: "T1", OrderId: "EX-CLOSE-1", Symbol: BTC,
+            Side: OrderSide.Sell, PositionSide: PositionSide.Long,
+            Quantity: 1m, Price: 110m, Commission: -0.5m, RealizedPnl: 9.5m,
+            Time: DateTime.UtcNow));
 
         var orphan = MakeOpenPosition(PositionSide.Long, qty: 1m, entry: 100m);
         var positionRepo = new StatefulPositionRepo();
@@ -332,9 +343,72 @@ public class AccountSynchronizerTests
         await sut.ReconcileAsync();
 
         Assert.True(orphan.IsClosed);
-        Assert.NotNull(orphan.CurrentPrice);
-        Assert.Equal(99m, orphan.CurrentPrice.Value);
+        Assert.NotNull(orphan.ExitPrice);
+        Assert.Equal(110m, orphan.ExitPrice!.Value);     // 用 trade 真實成交價、非 MarkPrice 99m
+        Assert.Equal(0, exchange.GetMarkPriceCalls);     // 嚴禁盲猜
+        Assert.Equal(1, exchange.GetTradeHistoryCalls);
         Assert.Equal(1, uow.SaveChangesCalls);
+    }
+
+    [Fact]
+    public async Task Reconcile_OrphanWithoutEvidence_GoesToUnaccounted()
+    {
+        // S72 §4 VCP：本地有 / 遠端不存在 + GetTradeHistoryAsync 查無實證 → 採隱式約定：
+        //   IsClosed=1、用 EntryPrice 平倉（grossPnL=0、不假宣告獲利）、廣播 [CRITICAL_SYNC]
+        var market = new SyncFakeMarketDataStream();
+        var exchange = new SyncFakeExchangeClient { MarkPrice = Price.Create(99m) };
+        exchange.OpenPositions = Array.Empty<ExchangePositionInfo>();
+        // 遠端歷史回空 → Unaccounted 路徑
+        exchange.TradeHistory.Clear();
+
+        var orphan = MakeOpenPosition(PositionSide.Long, qty: 1m, entry: 100m);
+        var positionRepo = new StatefulPositionRepo();
+        positionRepo.Seed(orphan);
+        var uow = new CountingUnitOfWork();
+        var capturingBroadcaster = new CriticalCapturingBroadcaster();
+        var sp = BuildSp(positionRepo: positionRepo, uow: uow);
+
+        var sut = new AccountSynchronizer(market, exchange, sp,
+            NullLogger<AccountSynchronizer>.Instance, capturingBroadcaster);
+        await sut.ReconcileAsync();
+
+        Assert.True(orphan.IsClosed);
+        Assert.NotNull(orphan.ExitPrice);
+        Assert.Equal(100m, orphan.ExitPrice!.Value);     // 用 EntryPrice 確保 grossPnL=0
+        Assert.Equal(0m, orphan.RealizedPnL);            // 不假宣告獲利（commission=0、grossPnL=0）
+        Assert.Equal(0, exchange.GetMarkPriceCalls);     // 嚴禁盲猜
+        Assert.Equal(1, exchange.GetTradeHistoryCalls);
+        // [CRITICAL_SYNC] 廣播應觸發
+        Assert.Single(capturingBroadcaster.CriticalEvents);
+        Assert.Equal("PositionUnaccounted", capturingBroadcaster.CriticalEvents[0].Category);
+    }
+
+    [Fact]
+    public async Task Reconcile_TradeHistoryFails_KeepsPositionOpen()
+    {
+        // S72：實證對帳呼叫 GetTradeHistoryAsync 失敗 → 不結算、保留 Open、廣播 ReconcileFailed
+        // 「寧可報錯也不要假宣告獲利」紀律落地。
+        var market = new SyncFakeMarketDataStream();
+        var exchange = new SyncFakeExchangeClient
+        {
+            MarkPrice = Price.Create(99m),
+            TradeHistoryThrows = new InvalidOperationException("BingX 5xx"),
+        };
+        exchange.OpenPositions = Array.Empty<ExchangePositionInfo>();
+
+        var orphan = MakeOpenPosition(PositionSide.Long, qty: 1m, entry: 100m);
+        var positionRepo = new StatefulPositionRepo();
+        positionRepo.Seed(orphan);
+        var capturingBroadcaster = new CriticalCapturingBroadcaster();
+        var sp = BuildSp(positionRepo: positionRepo);
+
+        var sut = new AccountSynchronizer(market, exchange, sp,
+            NullLogger<AccountSynchronizer>.Instance, capturingBroadcaster);
+        await sut.ReconcileAsync();
+
+        Assert.False(orphan.IsClosed);   // 保留 Open 等下次重試
+        Assert.Single(capturingBroadcaster.CriticalEvents);
+        Assert.Equal("ReconcileFailed", capturingBroadcaster.CriticalEvents[0].Category);
     }
 
     [Fact]
@@ -481,6 +555,24 @@ internal sealed class SyncFakeExchangeClient : IExchangeClient
     public Task<IReadOnlyList<ExchangeOpenOrderInfo>> GetOpenOrdersAsync(Symbol symbol, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ExchangeOpenOrderInfo>>(Array.Empty<ExchangeOpenOrderInfo>());
 
+    /// <summary>
+    /// S72：實證對帳取資料源。測試可塞入特定 trades 模擬 BingX 端歷史成交，
+    /// 用於驗證「實證 close vs Unaccounted 降級」分支。預設回空 list（觸發 Unaccounted 路徑）。
+    /// </summary>
+    public List<ExchangeTradeInfo> TradeHistory { get; } = new();
+    public int GetTradeHistoryCalls { get; private set; }
+    public Func<Symbol, DateTime, DateTime?, IReadOnlyList<ExchangeTradeInfo>>? TradeHistoryProvider { get; set; }
+    public Exception? TradeHistoryThrows { get; set; }
+
+    public Task<IReadOnlyList<ExchangeTradeInfo>> GetTradeHistoryAsync(Symbol symbol, DateTime since, DateTime? until = null, CancellationToken ct = default)
+    {
+        GetTradeHistoryCalls++;
+        if (TradeHistoryThrows is not null) throw TradeHistoryThrows;
+        if (TradeHistoryProvider is not null)
+            return Task.FromResult(TradeHistoryProvider(symbol, since, until));
+        return Task.FromResult<IReadOnlyList<ExchangeTradeInfo>>(TradeHistory.AsReadOnly());
+    }
+
     public Task<ExchangeOrderSnapshot?> GetOrderByClientOrderIdAsync(
         Symbol symbol, string clientOrderId, CancellationToken ct = default) =>
         Task.FromResult<ExchangeOrderSnapshot?>(null);
@@ -589,4 +681,33 @@ internal sealed class CountingUnitOfWork : IUnitOfWork
     public Task BeginTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task CommitTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
     public Task RollbackTransactionAsync(CancellationToken ct = default) => Task.CompletedTask;
+}
+
+/// <summary>
+/// S72：擷取 [CRITICAL_SYNC] 廣播事件的 fake broadcaster — 用於驗證實證對帳路徑的雙軌通知落地。
+/// 其他事件全部 no-op。
+/// </summary>
+internal sealed class CriticalCapturingBroadcaster : CryptoBot.Application.Realtime.IRealtimeBroadcaster
+{
+    public List<CryptoBot.Application.Realtime.ReconciliationCriticalUpdate> CriticalEvents { get; } = new();
+    public List<CryptoBot.Application.Realtime.PositionClosedUpdate> ClosedEvents { get; } = new();
+
+    public Task BroadcastReconciliationCriticalAsync(CryptoBot.Application.Realtime.ReconciliationCriticalUpdate update, CancellationToken ct = default)
+    {
+        CriticalEvents.Add(update);
+        return Task.CompletedTask;
+    }
+
+    public Task BroadcastPositionClosedAsync(CryptoBot.Application.Realtime.PositionClosedUpdate update, CancellationToken ct = default)
+    {
+        ClosedEvents.Add(update);
+        return Task.CompletedTask;
+    }
+
+    public Task BroadcastTradeAsync(CryptoBot.Application.Realtime.TradeFilledUpdate update, CancellationToken ct = default) => Task.CompletedTask;
+    public Task BroadcastStatsAsync(CryptoBot.Application.Realtime.DashboardStatsUpdate update, CancellationToken ct = default) => Task.CompletedTask;
+    public Task BroadcastStrategyEvaluatedAsync(CryptoBot.Application.Realtime.StrategyEvaluatedUpdate update, CancellationToken ct = default) => Task.CompletedTask;
+    public Task BroadcastPositionPnLAsync(CryptoBot.Application.Realtime.PositionPnLTickUpdate update, CancellationToken ct = default) => Task.CompletedTask;
+    public Task BroadcastStrategyEvaluationFailedAsync(CryptoBot.Application.Realtime.StrategyEvaluationFailedUpdate update, CancellationToken ct = default) => Task.CompletedTask;
+    public Task BroadcastStrategyMetadataChangedAsync(CryptoBot.Application.Realtime.StrategyMetadataChangedUpdate update, CancellationToken ct = default) => Task.CompletedTask;
 }

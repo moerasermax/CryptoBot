@@ -1,6 +1,7 @@
 using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Realtime;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
+using CryptoBot.Domain.Aggregates.PositionAggregate;
 using CryptoBot.Domain.Enums;
 using CryptoBot.Domain.Repositories;
 using CryptoBot.Domain.ValueObjects;
@@ -141,10 +142,12 @@ public sealed class AccountSynchronizer : IAccountSynchronizer
             }
         }
 
-        // 2) 倉位對帳 — 本地 open 但遠端已不存在 ⇒ 以 MarkPrice 平倉
+        // 2) 倉位對帳 — S72 實證對帳：本地 Open / 遠端不存在時，嚴禁用 MarkPrice 推算成交價（IM §S72 鐵則）。
+        //    走 GetTradeHistoryAsync 取真實成交、找到才結算；查無實證即降級 Unaccounted 並廣播 [CRITICAL_SYNC]。
         var localOpen = await positionRepo.GetOpenPositionsAsync(ct).ConfigureAwait(false);
         var remoteOpen = await _exchange.GetOpenPositionsAsync(ct).ConfigureAwait(false);
 
+        var closedBroadcasts = new List<PositionClosedUpdate>();
         var closedOrphans = 0;
         foreach (var local in localOpen)
         {
@@ -154,18 +157,10 @@ public sealed class AccountSynchronizer : IAccountSynchronizer
                 r.Quantity > 0m);
             if (matched) continue;
 
-            try
+            if (await TryCloseWithEvidenceAsync(local, "Reconcile", positionRepo, closedBroadcasts, ct)
+                .ConfigureAwait(false))
             {
-                var mark = await _exchange.GetMarkPriceAsync(local.Symbol, ct).ConfigureAwait(false);
-                local.Close(mark, reason: "Reconcile: position not found on exchange");
-                await positionRepo.UpdateAsync(local, ct).ConfigureAwait(false);
                 closedOrphans++;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex,
-                    "Reconcile: failed to close orphan local position {Id} ({Symbol} {Side}).",
-                    local.Id, local.Symbol, local.Side);
             }
         }
 
@@ -173,6 +168,23 @@ public sealed class AccountSynchronizer : IAccountSynchronizer
         _logger.LogInformation(
             "Reconciliation complete: refreshed {Orders} orders, closed {Orphans} orphan positions.",
             refreshed, closedOrphans);
+
+        // SaveChanges 成功後再 fire PositionClosed 廣播 — 與 HandleAccountUpdateAsync 對齊（避免 UI 提前收到事件查無資料）。
+        if (_broadcaster is not null && closedBroadcasts.Count > 0)
+        {
+            foreach (var payload in closedBroadcasts)
+            {
+                try
+                {
+                    await _broadcaster.BroadcastPositionClosedAsync(payload, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Reconcile: BroadcastPositionClosedAsync failed for {Id}.", payload.PositionId);
+                }
+            }
+        }
 
         // FINAL-STABILITY T7：盤點完畢後，把當前仍開倉的 symbol 全部訂上 MarkPrice tick stream。
         // 開機後第一次 Reconcile 會把還沒來得及訂閱的遺留持倉接上，後續 OrderUpdate 成交才補掛的那段交由
@@ -278,28 +290,11 @@ public sealed class AccountSynchronizer : IAccountSynchronizer
 
                 if (remote.Quantity == 0m)
                 {
-                    var exitPrice = remote.MarkPrice > 0m
-                        ? Price.Create(remote.MarkPrice)
-                        : await _exchange.GetMarkPriceAsync(remote.Symbol, CancellationToken.None)
-                            .ConfigureAwait(false);
-                    match.Close(exitPrice, reason: "Exchange reported position closed");
-                    await positionRepo.UpdateAsync(match, CancellationToken.None).ConfigureAwait(false);
-                    _logger.LogInformation(
-                        "Position {Id} auto-closed via WS ({Symbol} {Side} @ {Price}).",
-                        match.Id, match.Symbol, match.Side, exitPrice.Value);
-
-                    // S31：通知 UI 歷史表即時新增此筆 — SaveChangesAsync 在迴圈外統一提交，
-                    // 這裡先把 broadcast payload 準備好，等 SaveChangesAsync 成功後統一 fire。
-                    if (_broadcaster is not null)
-                    {
-                        closedBroadcasts.Add(new PositionClosedUpdate(
-                            PositionId: match.Id,
-                            ClosedAtUtc: match.ClosedAt ?? DateTime.UtcNow,
-                            Symbol: match.Symbol.BingXFormat,
-                            PositionSide: match.Side.ToString(),
-                            ExitPrice: exitPrice.Value,
-                            RealizedPnL: match.RealizedPnL));
-                    }
+                    // S72：實證對帳 — 嚴禁用 remote.MarkPrice / GetMarkPriceAsync 推算 ExitPrice（IM §S72 鐵則）。
+                    // 走 GetTradeHistoryAsync 取真實成交；查無實證即降級 Unaccounted + 廣播 [CRITICAL_SYNC]。
+                    await TryCloseWithEvidenceAsync(
+                        match, "AccountUpdateWS", positionRepo, closedBroadcasts, CancellationToken.None)
+                        .ConfigureAwait(false);
                 }
                 else if (remote.MarkPrice > 0m)
                 {
@@ -431,6 +426,140 @@ public sealed class AccountSynchronizer : IAccountSynchronizer
                 symbol.BingXFormat, price.Value);
         }
     }
+
+    /// <summary>
+    /// S72：實證對帳共用路徑 — 對「本地 Open / 遠端不存在」的 Position 做平倉決策。
+    ///
+    /// <para>
+    /// 嚴禁用 <see cref="IExchangeClient.GetMarkPriceAsync"/> 推算 ExitPrice（IM §S72 鐵則）。
+    /// 改為呼叫 <see cref="IExchangeClient.GetTradeHistoryAsync"/> 取真實成交：
+    /// </para>
+    /// <list type="number">
+    ///   <item>有對應 closing trades → 加權平均成交價結算 → <see cref="Position.Close"/></item>
+    ///   <item>無對應 closing trades（Unaccounted）→ 用 EntryPrice 平倉（RealizedPnL≈0、僅反映既有 commission）+ LogError + 廣播 [CRITICAL_SYNC]</item>
+    ///   <item>GetTradeHistoryAsync 本身失敗 → 保留 Open + 廣播 [CRITICAL_SYNC] ReconcileFailed，等下次重試</item>
+    /// </list>
+    /// 回傳 <c>true</c> 代表 Position 已被平倉（有實際 mutation 需 SaveChanges 入庫）；
+    /// 回傳 <c>false</c> 代表保留 Open（GetTradeHistoryAsync 失敗）。
+    /// </summary>
+    private async Task<bool> TryCloseWithEvidenceAsync(
+        Position local,
+        string sourceTag,
+        IPositionRepository positionRepo,
+        List<PositionClosedUpdate> closedBroadcasts,
+        CancellationToken ct)
+    {
+        IReadOnlyList<ExchangeTradeInfo> trades;
+        try
+        {
+            trades = await _exchange.GetTradeHistoryAsync(local.Symbol, local.OpenedAt, until: null, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "[CRITICAL_SYNC] {Source}: GetTradeHistoryAsync failed for {Symbol} (Position={Id}) — " +
+                "keeping Open, will retry next tick. Manual investigation may be required if persistent.",
+                sourceTag, local.Symbol, local.Id);
+            await BroadcastReconciliationCriticalAsync(
+                "ReconcileFailed", local,
+                $"[{sourceTag}] GetTradeHistoryAsync failed: {ex.Message}", ct)
+                .ConfigureAwait(false);
+            return false;
+        }
+
+        // 對應此 Position 的「平倉成交」：(a) Side 反向（Long Position 平倉 = Sell）（b) PositionSide 同
+        var closingSide = local.Side == PositionSide.Long ? OrderSide.Sell : OrderSide.Buy;
+        var closingTrades = trades
+            .Where(t => t.Side == closingSide && t.PositionSide == local.Side)
+            .ToList();
+
+        if (closingTrades.Count == 0)
+        {
+            // Unaccounted：實證查無 — 採隱式約定，用 EntryPrice 平倉確保 grossPnL=0、不假宣告獲利
+            _logger.LogError(
+                "[CRITICAL_SYNC] {Source} Unaccounted: Position {Id} ({Symbol} {Side} qty={Qty} entry={Entry}) " +
+                "appears closed remotely but NO closing trade found in BingX history since {Since:u}. " +
+                "Closing locally with grossPnL=0 (Unaccounted convention) — manual investigation required.",
+                sourceTag, local.Id, local.Symbol, local.Side, local.Quantity.Value,
+                local.EntryPrice.Value, local.OpenedAt);
+
+            local.Close(local.EntryPrice, reason: $"{sourceTag} Unaccounted: no closing trade found");
+            await positionRepo.UpdateAsync(local, ct).ConfigureAwait(false);
+
+            if (_broadcaster is not null)
+            {
+                closedBroadcasts.Add(BuildPositionClosedPayload(local, local.EntryPrice));
+            }
+
+            await BroadcastReconciliationCriticalAsync(
+                "PositionUnaccounted", local,
+                $"[{sourceTag}] No closing trade in BingX history since {local.OpenedAt:u}. " +
+                $"Closed locally with grossPnL=0 ({local.Quantity.Value} {local.Symbol.BingXFormat} {local.Side}).",
+                ct)
+                .ConfigureAwait(false);
+            return true;
+        }
+
+        // 有實證：以加權平均成交價結算
+        var totalQty = closingTrades.Sum(t => t.Quantity);
+        var weightedExit = totalQty > 0m
+            ? closingTrades.Sum(t => t.Price * t.Quantity) / totalQty
+            : closingTrades[0].Price;
+        var exitPrice = Price.Create(weightedExit);
+
+        _logger.LogInformation(
+            "[RECONCILIATION] {Source} evidenced close: Position {Id} ({Symbol} {Side}) settled with " +
+            "{N} closing trades, weighted exit price={Exit}, total filled qty={Qty}.",
+            sourceTag, local.Id, local.Symbol, local.Side,
+            closingTrades.Count, weightedExit, totalQty);
+
+        local.Close(exitPrice, reason: $"{sourceTag} evidenced from {closingTrades.Count} trades");
+        await positionRepo.UpdateAsync(local, ct).ConfigureAwait(false);
+
+        if (_broadcaster is not null)
+        {
+            closedBroadcasts.Add(BuildPositionClosedPayload(local, exitPrice));
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// S72：[CRITICAL_SYNC] 廣播包裝 — broadcaster 為 null（test / headless）時 no-op；
+    /// 廣播本身失敗只 log warning，不阻擋對帳主流程（與 PositionClosed 廣播策略一致）。
+    /// </summary>
+    private async Task BroadcastReconciliationCriticalAsync(
+        string category, Position local, string detail, CancellationToken ct)
+    {
+        if (_broadcaster is null) return;
+        try
+        {
+            await _broadcaster.BroadcastReconciliationCriticalAsync(
+                new ReconciliationCriticalUpdate(
+                    OccurredAtUtc: DateTime.UtcNow,
+                    Category: category,
+                    Symbol: local.Symbol.BingXFormat,
+                    EntityId: local.Id.ToString(),
+                    Detail: detail),
+                ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "BroadcastReconciliationCriticalAsync failed for {Id} — UI may miss this critical sync event.",
+                local.Id);
+        }
+    }
+
+    private static PositionClosedUpdate BuildPositionClosedPayload(Position local, Price exitPrice)
+        => new PositionClosedUpdate(
+            PositionId: local.Id,
+            ClosedAtUtc: local.ClosedAt ?? DateTime.UtcNow,
+            Symbol: local.Symbol.BingXFormat,
+            PositionSide: local.Side.ToString(),
+            ExitPrice: exitPrice.Value,
+            RealizedPnL: local.RealizedPnL);
 
     private static void ApplyOrderStateTransition(Order order, ExchangeOrderUpdate update)
     {
