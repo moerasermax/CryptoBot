@@ -839,11 +839,16 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
     public async Task<IReadOnlyList<ExchangeTradeInfo>> GetTradeHistoryAsync(
         Symbol symbol, DateTime since, DateTime? until = null, CancellationToken ct = default)
     {
+        // S71_B fix（2 輪 PM 實機驗證）：BingX `GetUserTradesAsync` 端點要求**顯式 settleAsset**，
+        // 但傳值必須是「環境結算資產」而非「合約命名 quote」。在 Demo VST mode 下兩者分歧：
+        //   - Symbol.QuoteAsset (來自字串 "LINK-USDT") = "USDT"        ← 合約命名 quote、Demo 下傳此值仍 raw=0
+        //   - BingXExchangeClient.QuoteAsset (= _options.QuoteAsset)   ← Live 為 "USDT"、Demo 為 "VST"，環境感知
+        // 既有 DashboardStatsService.cs:46 已沉澱此差異註釋。本處改傳 instance 端 QuoteAsset。
         var result = await _client.PerpetualFuturesApi.Trading
             .GetUserTradesAsync(
                 symbol: symbol.BingXFormat,
                 orderId: (long?)null,
-                settleAsset: (string?)null,
+                settleAsset: QuoteAsset,
                 startTime: since,
                 endTime: until,
                 fromId: (long?)null,
@@ -854,8 +859,11 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
         result.Check(nameof(GetTradeHistoryAsync));
 
         var list = new List<ExchangeTradeInfo>();
+        // S71_B 診斷計數器：揭露 silent-skip 路徑；raw>0 但 list 全空時觸發 stderr 輸出（DiagnosticTool 可見）
+        int rawCount = 0, skipNoSymbol = 0, skipParse = 0, skipFilter = 0, parseErrors = 0;
         foreach (dynamic t in result.Data)
         {
+            rawCount++;
             try
             {
                 string tradeId;
@@ -867,10 +875,10 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
                 catch { orderId = string.Empty; }
 
                 string sym;
-                try { sym = (string)t.Symbol; } catch { continue; }
+                try { sym = (string)t.Symbol; } catch { skipNoSymbol++; continue; }
                 Symbol parsedSymbol;
-                try { parsedSymbol = Symbol.Parse(sym); } catch { continue; }
-                if (!parsedSymbol.Equals(symbol)) continue;
+                try { parsedSymbol = Symbol.Parse(sym); } catch { skipParse++; continue; }
+                if (!parsedSymbol.Equals(symbol)) { skipFilter++; continue; }
 
                 var side = ((global::BingX.Net.Enums.OrderSide)t.Side).ToDomain();
 
@@ -912,10 +920,31 @@ public sealed class BingXExchangeClient : IExchangeClient, IDisposable
             }
             catch (Exception ex)
             {
+                parseErrors++;
                 _logger.LogWarning(ex,
                     "GetTradeHistoryAsync: failed to parse single trade entry for {Symbol} — skipped.",
                     symbol.BingXFormat);
             }
+        }
+
+        // S71_B 診斷：raw>0 但 list 全空 = silent-skip bug；DiagnosticTool 端 stderr 可見
+        // 不影響呼叫端回傳值；只是揭露為何結果是空的
+        if (rawCount > 0 && list.Count == 0)
+        {
+            Console.Error.WriteLine(
+                $"[TRADES-DIAG] {symbol.BingXFormat}: raw={rawCount}, parsed=0, " +
+                $"skip_no_symbol={skipNoSymbol}, skip_parse={skipParse}, " +
+                $"skip_filter={skipFilter}, parse_errors={parseErrors} " +
+                $"— ALL entries dropped silently. Inspect SDK schema vs dynamic parser assumptions.");
+        }
+        else if (rawCount == 0)
+        {
+            // raw=0 直接揭露：是 SDK / VST 端真的沒回任何 trade（非解析問題）
+            Console.Error.WriteLine(
+                $"[TRADES-DIAG] {symbol.BingXFormat}: raw=0 from BingX SDK GetUserTradesAsync " +
+                $"(since={since:yyyy-MM-dd HH:mm:ss}Z). " +
+                $"Possibilities: (a) VST endpoint returns empty; (b) symbol/time params not recognized; " +
+                $"(c) SDK requires different settleAsset/orderId scoping for VST.");
         }
 
         return list;

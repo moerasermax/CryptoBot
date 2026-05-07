@@ -135,6 +135,7 @@ public static class Program
         services.AddSingleton<IDiagnosticCommand, CheckMtfCommand>();
         services.AddSingleton<IDiagnosticCommand, CheckKlineCommand>();
         services.AddSingleton<IDiagnosticCommand, SyncOrdersCommand>();
+        services.AddSingleton<IDiagnosticCommand, ProbeTradesCommand>();
         services.AddSingleton<IDiagnosticCommand, CheckOrderCommand>();
         services.AddSingleton<IDiagnosticCommand, ProbeBingxCommand>();
         services.AddSingleton<IDiagnosticCommand, CheckSkewCommand>();
