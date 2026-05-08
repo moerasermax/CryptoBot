@@ -602,6 +602,7 @@ public sealed class StrategyExecutor : IStrategyExecutor
                 Quantity: qty.Value,
                 Price: order.AverageFillPrice?.Value ?? signal.SuggestedPrice.Value,
                 StrategyName: _strategy.Name,
+                ExchangeOrderId: order.ExchangeOrderId,
                 TraceId: traceId), CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)

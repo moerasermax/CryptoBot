@@ -14,4 +14,5 @@ public sealed record TradeFilledUpdate(
     decimal Quantity,
     decimal Price,
     string StrategyName,
+    string? ExchangeOrderId = null,
     string? TraceId = null);

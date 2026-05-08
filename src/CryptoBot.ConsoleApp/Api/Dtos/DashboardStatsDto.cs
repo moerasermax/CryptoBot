@@ -29,7 +29,8 @@ public sealed record RecentTradeDto(
     decimal Quantity,
     decimal? AverageFillPrice,
     string Status,
-    string? RejectReason);
+    string? RejectReason,
+    string? ExchangeOrderId);
 
 /// <summary>
 /// S39：交易歷史列表 row — 對應「開倉 → 平倉」的一筆完整紀錄快照。

@@ -49,7 +49,8 @@ public static class DashboardEndpoints
                     Quantity: o.Quantity.Value,
                     AverageFillPrice: o.AverageFillPrice?.Value,
                     Status: o.Status.ToString(),
-                    RejectReason: o.RejectReason))
+                    RejectReason: o.RejectReason,
+                    ExchangeOrderId: o.ExchangeOrderId))
                 .ToList();
 
             return Results.Ok(new DashboardStatsDto(

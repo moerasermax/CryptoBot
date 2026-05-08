@@ -336,6 +336,7 @@
             <thead>
                 <tr>
                     <th>Time</th>
+                    <th>Trade ID</th>
                     <th>Symbol</th>
                     <th>Side</th>
                     <th>Qty</th>
@@ -349,7 +350,10 @@
                 {
                     var isRejected = string.Equals(t.Status, "Rejected", StringComparison.OrdinalIgnoreCase);
                     <tr>
-                        <td>@t.CreatedAt.ToLocalTime().ToString("HH:mm:ss")</td>
+                        <td>@t.CreatedAt.ToLocalTime().ToString("MM/dd HH:mm:ss")</td>
+                        <td title="@(t.ExchangeOrderId ?? string.Empty)" style="max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                            @(string.IsNullOrWhiteSpace(t.ExchangeOrderId) ? "—" : t.ExchangeOrderId)
+                        </td>
                         <td>@t.Symbol</td>
                         <td class="@(t.Side == "Buy" ? "pos" : "neg")">@t.Side @t.PositionSide</td>
                         <td>@t.Quantity.ToString("N4")</td>
@@ -800,7 +804,8 @@
                 Quantity: o.Quantity.Value,
                 AverageFillPrice: o.AverageFillPrice?.Value,
                 Status: o.Status.ToString(),
-                RejectReason: o.RejectReason))
+                RejectReason: o.RejectReason,
+                ExchangeOrderId: o.ExchangeOrderId))
             .ToList();
     }
 
