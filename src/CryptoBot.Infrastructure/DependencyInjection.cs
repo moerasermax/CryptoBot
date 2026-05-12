@@ -48,7 +48,7 @@ public static class DependencyInjection
 
         services.AddNotifications(configuration);
         services.AddBacktesting();
-        services.AddAiAdvisor(configuration);
+        services.AddSidekick(configuration);
         services.AddBayesianSidecar(configuration);
         return services;
     }
@@ -79,47 +79,30 @@ public static class DependencyInjection
     }
 
     /// <summary>
-    /// S30 / S74 / S74-C：註冊 AI Advisor 服務與金鑰 Provider。
+    /// S74-D：CryptoBot Sidekick — 全域常駐 AI 對話 service 註冊（取代 legacy AddAiAdvisor）。
     ///
-    /// 啟動時即 Replace 掉 Application 層的 NoOp — 我們允許使用者在「沒設金鑰」狀態下啟動，
-    /// Gemini service 在每次請求時從 SQLite 讀金鑰；找不到就回 Success=false 的友善訊息。
-    ///
-    /// S74-C：依 <c>Configuration["AiAdvisor:Provider"]</c> 切換實作（headless / 給 /api/ai/advise 用） —
-    ///   - <c>"Gemini"</c>（預設）：HTTP REST 走 <see cref="GeminiAiAdvisorService"/>。
-    ///   - <c>"InteractiveCli"</c>：<c>gemini -p</c> 單發走 <see cref="InteractiveCliAdvisorService"/>。
-    /// UI 的對話 UX 走全域 <c>GlobalAiSidebar</c>（Scoped <c>IGlobalAiChatService</c>）— 與此處 DI 獨立。
-    /// 切換在啟動時鎖定；運行期間更換需重啟 host。
+    /// 變更摘要：
+    /// <list type="bullet">
+    ///   <item>移除 <c>IAiAdvisorService</c> Replace 邏輯（GeminiAiAdvisorService / InteractiveCliAdvisorService 已刪）。</item>
+    ///   <item>移除 <c>GeminiOptions</c> Configure（GeminiOptions.cs 已刪）。</item>
+    ///   <item>保留 <c>InteractiveCliAdvisorOptions</c> Configure — <see cref="GlobalAiChatService"/>
+    ///         仍依賴其 Executable / TimeoutSeconds（Sidekick 唯一可用 source、必須保留）。</item>
+    ///   <item>保留 <c>IAiCredentialProvider</c> Singleton — <c>/api/ai/credentials</c> 端點與 ExchangeSettings.razor
+    ///         的 Gemini API Key 管理 UI 仍由 <c>AiCredentialEndpoints.cs</c> 使用，與本 Sidekick 註冊獨立。</item>
+    /// </list>
     /// </summary>
-    public static IServiceCollection AddAiAdvisor(
+    public static IServiceCollection AddSidekick(
         this IServiceCollection services,
         IConfiguration configuration)
     {
-        services.Configure<GeminiOptions>(configuration.GetSection(GeminiOptions.SectionName));
         services.Configure<InteractiveCliAdvisorOptions>(configuration.GetSection(InteractiveCliAdvisorOptions.SectionName));
 
         services.AddSingleton<IAiCredentialProvider, DbAiCredentialProvider>();
 
-        var provider = configuration["AiAdvisor:Provider"] ?? "Gemini";
-        if (string.Equals(provider, "InteractiveCli", StringComparison.OrdinalIgnoreCase))
-        {
-            // S74-C：本地 CLI 模式走 gemini -p 單發；headless 路徑、不持久 process。
-            services.Replace(ServiceDescriptor.Singleton<IAiAdvisorService>(sp =>
-                new InteractiveCliAdvisorService(
-                    sp.GetRequiredService<IOptions<InteractiveCliAdvisorOptions>>(),
-                    sp.GetRequiredService<ILogger<InteractiveCliAdvisorService>>())));
-        }
-        else
-        {
-            // 單一 Singleton HttpClient — Gemini endpoint 固定、呼叫頻率低（UI 按鈕觸發），
-            // 不需要 HttpClientFactory 的池化。與 DiscordNotificationService 同模式。
-            services.Replace(ServiceDescriptor.Singleton<IAiAdvisorService>(sp =>
-                new GeminiAiAdvisorService(
-                    new HttpClient(),
-                    sp.GetRequiredService<IAiCredentialProvider>(),
-                    sp.GetRequiredService<IAiAdviceTraceLog>(),
-                    sp.GetRequiredService<IOptions<GeminiOptions>>(),
-                    sp.GetRequiredService<ILogger<GeminiAiAdvisorService>>())));
-        }
+        // S74-C / S74-D：CryptoBot Sidekick — Scoped per Blazor Server circuit。
+        // 注入 IStrategyParameterKeyCatalog（介面位於 Application；具體 adapter 由 ConsoleApp 端註冊）+
+        // InteractiveCliAdvisorOptions（共用 gemini executable / timeout 設定）。
+        services.AddScoped<IGlobalAiChatService, GlobalAiChatService>();
 
         return services;
     }

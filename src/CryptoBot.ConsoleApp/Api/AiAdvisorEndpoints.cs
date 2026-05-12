@@ -1,7 +1,6 @@
-using System.Globalization;
+﻿using System.Globalization;
 using System.Text;
 using CryptoBot.Application.Ai;
-using CryptoBot.ConsoleApp.Lab;
 using CryptoBot.Domain.Enums;
 using CryptoBot.Domain.Exceptions;
 using CryptoBot.Domain.ValueObjects;
@@ -10,20 +9,17 @@ using Microsoft.Extensions.Configuration;
 namespace CryptoBot.ConsoleApp.Api;
 
 /// <summary>
-/// <c>/api/ai/*</c> — S30 AI 量化導師端點。
+/// <c>/api/ai/*</c> — AI 相關端點。
 ///
-/// <c>POST /api/ai/advise</c>：
-/// <list type="number">
-///   <item>用 <see cref="IMarketContextBuilder"/> 從當前交易所抓 K 線 + 跑指標 → <see cref="MarketContext"/></item>
-///   <item>用 <see cref="StrategyCatalog"/> 取該策略的合法參數 key 清單</item>
-///   <item>呼 <see cref="IAiAdvisorService.GetAdviceAsync"/> 拿 Gemini 回應</item>
+/// S74-D：legacy <c>POST /api/ai/advise</c> + <c>GET /api/ai/traces</c> + <c>GET /api/ai/models</c>
+/// 已隨 <c>IAiAdvisorService</c> 一併移除（CryptoBot Sidekick 全域 sidebar 取代）。剩餘端點：
+///
+/// <list type="bullet">
+///   <item><c>GET /api/ai/config</c>：暴露當前 advisor provider 名稱（向下兼容用，下游 UI 可能讀）。</item>
+///   <item><c>GET /api/ai/context</c>：單一 Symbol 技術指標快照 — 純走 <see cref="IMarketContextBuilder"/>、不觸發 LLM。
+///         AiAdvisorPanel 用此產 LLM 分析 prompt，使用者複製到外部 LLM。</item>
+///   <item><c>GET /api/ai/market-sweep</c>：Top 10 主流幣種技術面快照 + copy-paste ready Prompt 字串。</item>
 /// </list>
-/// Service 合約保證不拋 — 任何失敗轉成 <c>Success=false</c> + <c>Error</c>，都回 HTTP 200。
-///
-/// <c>GET /api/ai/traces</c>（S30-ELITE+）：
-/// 回傳最近 N 筆 AI 呼叫的結構化診斷紀錄。每筆含該次呼叫跑過的所有模型嘗試
-/// （primary / fallback），帶 HTTP status、finishReason、safetyBlock、錯誤訊息、耗時。
-/// 用於 UI 除錯面板，省掉翻 log / 通靈。
 /// </summary>
 public static class AiAdvisorEndpoints
 {
@@ -31,95 +27,11 @@ public static class AiAdvisorEndpoints
     {
         var group = app.MapGroup("/api/ai").WithTags("AiAdvisor");
 
-        group.MapPost("/advise", async (
-            AiAdviseRequestDto body,
-            StrategyCatalog catalog,
-            IMarketContextBuilder contextBuilder,
-            IAiAdvisorService advisor,
-            CancellationToken ct) =>
-        {
-            if (string.IsNullOrWhiteSpace(body.StrategyKey))
-                return Results.BadRequest(new { error = "strategyKey is required." });
-            if (string.IsNullOrWhiteSpace(body.Symbol))
-                return Results.BadRequest(new { error = "symbol is required." });
-
-            var model = catalog.FindByKey(body.StrategyKey);
-            if (model is null)
-                return Results.BadRequest(new { error = $"Unknown strategyKey: {body.StrategyKey}" });
-
-            Symbol symbolVo;
-            try { symbolVo = Symbol.Parse(body.Symbol); }
-            catch (DomainException ex) { return Results.BadRequest(new { error = ex.Message }); }
-
-            MarketContext ctx;
-            try
-            {
-                ctx = await contextBuilder.BuildAsync(symbolVo, body.Interval, klineCount: 100, ct)
-                    .ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                // 抓 K 線失敗（交易所未配置、網路等）— 轉成 Success=false 讓 UI 顯示友善訊息。
-                return Results.Ok(new AiAdviseResponseDto(
-                    Success: false,
-                    Commentary: string.Empty,
-                    SuggestedParameters: new Dictionary<string, ParameterGridRange>(),
-                    Error: $"無法取得市場資料：{ex.Message}",
-                    Model: "gemini",
-                    TrendLabel: TrendLabel.Unknown.ToString(),
-                    Attempts: Array.Empty<AiAttemptDiagnostic>()));
-            }
-
-            var currentParams = body.CurrentParameters ?? new Dictionary<string, decimal>();
-
-            var req = new AiAdviceRequest(
-                StrategyKey: model.Key,
-                StrategyDisplayName: model.DisplayName,
-                Context: ctx,
-                CurrentParameters: currentParams,
-                ExpectedParameterKeys: model.ExpectedParameterKeys);
-
-            var result = await advisor.GetAdviceAsync(req, ct).ConfigureAwait(false);
-
-            return Results.Ok(new AiAdviseResponseDto(
-                Success: result.Success,
-                Commentary: result.Commentary,
-                SuggestedParameters: result.SuggestedParameters,
-                Error: result.Error,
-                Model: result.Model,
-                TrendLabel: ctx.TrendLabel.ToString(),
-                Attempts: result.Attempts));
-        });
-
-        // S74-B：揭露當前 AI Advisor provider 名（"Gemini" / "InteractiveCli"），讓 UI 端決定按鈕走哪條路：
-        //   - Gemini → 直接 POST /api/ai/advise（既有同步 HTTP）
-        //   - InteractiveCli → 開 AiChatModal、走 /api/ai/chat/start + SignalR
+        // S74-C 保留：揭露當前 advisor provider 配置（向下兼容；無正式使用者，未來可移）。
         group.MapGet("/config", (IConfiguration config) =>
         {
-            var provider = config["AiAdvisor:Provider"] ?? "Gemini";
+            var provider = config["AiAdvisor:Provider"] ?? "Sidekick";
             return Results.Ok(new AiAdvisorConfigDto(Provider: provider));
-        });
-
-        // S30-ELITE+：診斷紀錄。寫死預設 20 筆，使用者可用 ?limit=N 覆蓋（會被 log 自動 clamp 到容量上限）。
-        group.MapGet("/traces", (IAiAdviceTraceLog log, int? limit) =>
-        {
-            var take = limit ?? 20;
-            var recent = log.GetRecent(take);
-            return Results.Ok(new AiTracesResponseDto(
-                Count: recent.Count,
-                Traces: recent));
-        });
-
-        // S30-ELITE+2：探測此金鑰當前可用的模型清單。當 Primary 回 404 時，使用者可
-        // 照這份清單挑出真正可用的模型名填回 appsettings / 環境變數。
-        group.MapGet("/models", async (IAiAdvisorService advisor, CancellationToken ct) =>
-        {
-            var result = await advisor.ListModelsAsync(ct).ConfigureAwait(false);
-            return Results.Ok(new AiModelListDto(
-                Success: result.Success,
-                Error: result.Error,
-                Count: result.Models.Count,
-                Models: result.Models));
         });
 
         // S36-S38 T2：單一 Symbol 的技術面快照。給 AiAdvisorPanel「Prompt 產生器」用 —
@@ -152,8 +64,8 @@ public static class AiAdvisorEndpoints
         });
 
         // S32-S35-REVISED T3：「橫掃 Top 10 市場機會」。拉 10 個主流幣種的最新技術面快照，
-        // 組成一份 copy-paste 就能丟到任何 LLM 的分析 Prompt；不呼叫自家 Gemini（用戶可能想餵到
-        // 別的模型對照、或單純複製下來人工分析）。Interval 預設 OneHour，可被 UI 覆蓋。
+        // 組成一份 copy-paste 就能丟到任何 LLM 的分析 Prompt；不呼叫自家 AI（user 自行外部分析）。
+        // Interval 預設 OneHour，可被 UI 覆蓋。
         group.MapGet("/market-sweep", async (
             IMarketContextBuilder contextBuilder,
             KlineInterval? interval,
@@ -220,8 +132,8 @@ public static class AiAdvisorEndpoints
         {
             if (s.Error is not null)
             {
-                sb.Append("- ").Append(s.Symbol).Append("：資料取得失敗（")
-                  .Append(s.Error).AppendLine("）");
+                sb.Append("- ").Append(s.Symbol).Append("：資料取得失敗(")
+                  .Append(s.Error).AppendLine(")");
                 continue;
             }
 
@@ -244,47 +156,7 @@ public static class AiAdvisorEndpoints
     }
 }
 
-/// <summary>
-/// /lab 頁面送出的 AI 諮詢請求。CurrentParameters 可為 null — 表單還沒填滿時允許空值。
-/// </summary>
-public sealed record AiAdviseRequestDto(
-    string StrategyKey,
-    string Symbol,
-    KlineInterval Interval,
-    IReadOnlyDictionary<string, decimal>? CurrentParameters);
-
-/// <summary>
-/// AI 諮詢回應。Success=false 時 SuggestedParameters 會是空 dict，UI 禁用「填入建議參數」。
-/// S30-ELITE+：<see cref="Attempts"/> 夾帶這一次呼叫的模型診斷清單，UI 展開即可看見
-/// Primary / Fallback 的 HTTP status、finishReason、safetyBlock、錯誤訊息，不必再翻 console log。
-/// </summary>
-public sealed record AiAdviseResponseDto(
-    bool Success,
-    string Commentary,
-    IReadOnlyDictionary<string, ParameterGridRange> SuggestedParameters,
-    string? Error,
-    string Model,
-    string TrendLabel,
-    IReadOnlyList<AiAttemptDiagnostic> Attempts);
-
-/// <summary>
-/// <c>GET /api/ai/traces</c> 回應。直接回 <see cref="AiAdviceTrace"/> 清單 — 它已是 UI 友善濃縮版。
-/// </summary>
-public sealed record AiTracesResponseDto(
-    int Count,
-    IReadOnlyList<AiAdviceTrace> Traces);
-
-/// <summary>
-/// <c>GET /api/ai/models</c> 回應。失敗（金鑰缺、HTTP error）時 <see cref="Success"/>=false + <see cref="Error"/>，
-/// UI 就地顯示訊息；成功時 <see cref="Models"/> 直接渲染為表格。
-/// </summary>
-public sealed record AiModelListDto(
-    bool Success,
-    string? Error,
-    int Count,
-    IReadOnlyList<AiModelInfo> Models);
-
-/// <summary>S74-C：<c>GET /api/ai/config</c> — 暴露當前 advisor provider 名稱，給 UI 端 / 外部 client 知曉 backend 配置。</summary>
+/// <summary>S74-C：<c>GET /api/ai/config</c> — 暴露當前 advisor provider 名稱。S74-D 後預設 "Sidekick"。</summary>
 public sealed record AiAdvisorConfigDto(string Provider);
 
 /// <summary>

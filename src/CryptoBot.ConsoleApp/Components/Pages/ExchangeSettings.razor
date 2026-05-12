@@ -1,6 +1,5 @@
 @page "/settings/exchanges"
 @using System.Net.Http.Json
-@using CryptoBot.Application.Ai
 @using CryptoBot.ConsoleApp.Api
 @inject IHttpClientFactory HttpFactory
 @inject NavigationManager Nav
@@ -137,124 +136,7 @@
             {
                 <button class="btn-primary" disabled="@_busy" @onclick="SaveGeminiKeyAsync">儲存金鑰</button>
             }
-            <button class="btn-inline" disabled="@(_modelsBusy || _geminiStatus?.IsConfigured != true)" @onclick="ProbeModelsAsync">
-                @(_modelsBusy ? "探測中…" : "🔍 探測可用模型")
-            </button>
         </div>
-
-        @if (_modelsOpen)
-        {
-            <details class="ai-diagnostics" open>
-                <summary>Google ListModels — 此金鑰當前可用的模型（@(_models?.Count ?? 0) 筆）</summary>
-                @if (!string.IsNullOrEmpty(_modelsError))
-                {
-                    <div class="settings-error">@_modelsError</div>
-                }
-                else if (_models is null || _models.Count == 0)
-                {
-                    <div class="empty">尚未探測 — 按上方按鈕取得清單。</div>
-                }
-                else
-                {
-                    <p class="settings-hint">
-                        粗體列代表支援 <code>generateContent</code> 的模型 —
-                        把此名字（<code>models/</code> 前綴去掉）貼到
-                        <code>appsettings.json</code> 的 <code>Gemini:PrimaryModel</code>
-                        或環境變數 <code>Gemini__PrimaryModel</code> 重啟即生效。
-                    </p>
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>Name</th>
-                                <th>DisplayName</th>
-                                <th>Version</th>
-                                <th>Output Tokens</th>
-                                <th>Methods</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            @foreach (var m in _models)
-                            {
-                                var canGenerate = m.SupportedMethods.Contains("generateContent");
-                                <tr class="@(canGenerate ? "pos" : "")">
-                                    <td>
-                                        @if (canGenerate)
-                                        {
-                                            <strong><code>@m.Name</code></strong>
-                                        }
-                                        else
-                                        {
-                                            <code>@m.Name</code>
-                                        }
-                                    </td>
-                                    <td>@(m.DisplayName ?? "—")</td>
-                                    <td>@(m.Version ?? "—")</td>
-                                    <td>@(m.OutputTokenLimit?.ToString() ?? "—")</td>
-                                    <td><code>@string.Join(", ", m.SupportedMethods)</code></td>
-                                </tr>
-                            }
-                        </tbody>
-                    </table>
-                }
-            </details>
-        }
-
-        @* S30-ELITE+：AI 呼叫診斷面板 — 讀 /api/ai/traces 的 ring buffer，展開看最近 20 次呼叫細節 *@
-        <details class="ai-diagnostics" open="@_tracesOpen">
-            <summary @onclick:preventDefault @onclick="ToggleTracesAsync">
-                🔍 AI 呼叫診斷（最近 @(_traces?.Count ?? 0) 筆）
-                <button class="btn-inline" @onclick:stopPropagation @onclick="ReloadTracesAsync" disabled="@_tracesBusy">
-                    @(_tracesBusy ? "載入中…" : "↻ 重新整理")
-                </button>
-            </summary>
-            @if (!string.IsNullOrEmpty(_tracesError))
-            {
-                <div class="settings-error">@_tracesError</div>
-            }
-            @if (_traces is null || _traces.Count == 0)
-            {
-                <div class="empty">尚無紀錄 — 到 <code>/lab</code> 按「🪄 問問 Gemini 的看法」後這裡會自動累積。</div>
-            }
-            else
-            {
-                <table class="data-table">
-                    <thead>
-                        <tr>
-                            <th>時間</th>
-                            <th>結果</th>
-                            <th>最終模型</th>
-                            <th>嘗試鏈</th>
-                            <th>錯誤 / 備註</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        @foreach (var t in _traces)
-                        {
-                            <tr>
-                                <td>@t.At.ToLocalTime().ToString("MM-dd HH:mm:ss")</td>
-                                <td class="@(t.Success ? "pos" : "neg")">@(t.Success ? "✓ OK" : "✗ FAIL")</td>
-                                <td><code>@t.Model</code></td>
-                                <td>@FormatAttemptChain(t.Attempts)</td>
-                                <td>
-                                    @if (!string.IsNullOrEmpty(t.Error))
-                                    {
-                                        <div class="ai-error-inline">@t.Error</div>
-                                    }
-                                    else if (!string.IsNullOrEmpty(t.CommentaryPreview))
-                                    {
-                                        <div class="muted">@t.CommentaryPreview</div>
-                                    }
-                                    else
-                                    {
-                                        <span class="muted">—</span>
-                                    }
-                                </td>
-                            </tr>
-                        }
-                    </tbody>
-                </table>
-            }
-        </details>
 
         <h3 class="settings-subtitle">已存帳號</h3>
         @if (_accounts.Count == 0)
@@ -322,17 +204,8 @@
     // S30-FIX2：Eco/Pro 切換期間的 busy 旗標 — 避免快速連按造成競態。
     private bool _modeBusy;
 
-    // S30-ELITE+：AI 呼叫診斷 ring buffer 讀取。
-    private IReadOnlyList<AiAdviceTrace>? _traces;
-    private bool _tracesBusy;
-    private bool _tracesOpen;
-    private string? _tracesError;
-
-    // S30-ELITE+2：Google ListModels 探測結果。
-    private IReadOnlyList<AiModelInfo>? _models;
-    private bool _modelsBusy;
-    private bool _modelsOpen;
-    private string? _modelsError;
+    // S74-D：legacy _traces / _models 狀態 + ReloadTracesAsync / ToggleTracesAsync /
+    // FormatAttemptChain / ProbeModelsAsync 方法已隨 /api/ai/{traces, models} endpoints 一併移除。
 
     private HttpClient CreateClient()
     {
@@ -345,7 +218,6 @@
     {
         await ReloadAsync();
         await ReloadGeminiAsync();
-        await ReloadTracesAsync();
     }
 
     private async Task ReloadAsync()
@@ -373,70 +245,6 @@
         catch (Exception ex)
         {
             _error = $"Gemini 金鑰狀態載入失敗：{ex.Message}";
-        }
-    }
-
-    private async Task ReloadTracesAsync()
-    {
-        _tracesError = null;
-        _tracesBusy = true;
-        try
-        {
-            using var http = CreateClient();
-            var resp = await http.GetFromJsonAsync<AiTracesResponseDto>("/api/ai/traces?limit=20");
-            _traces = resp?.Traces ?? Array.Empty<AiAdviceTrace>();
-        }
-        catch (Exception ex)
-        {
-            _tracesError = $"診斷紀錄載入失敗：{ex.Message}";
-        }
-        finally
-        {
-            _tracesBusy = false;
-        }
-    }
-
-    private Task ToggleTracesAsync()
-    {
-        _tracesOpen = !_tracesOpen;
-        // 每次展開都重新整理 — ring buffer 容量小，呼叫成本可忽略。
-        return _tracesOpen ? ReloadTracesAsync() : Task.CompletedTask;
-    }
-
-    private static string FormatAttemptChain(IReadOnlyList<AiAttemptDiagnostic> attempts)
-    {
-        if (attempts is null || attempts.Count == 0) return "—";
-        return string.Join(" → ", attempts.Select(a =>
-            $"{a.Phase}:{a.Model}({a.HttpStatus}{(a.RetryCount > 0 ? $",×{a.RetryCount}" : "")})"));
-    }
-
-    private async Task ProbeModelsAsync()
-    {
-        _modelsError = null;
-        _modelsBusy = true;
-        _modelsOpen = true;
-        try
-        {
-            using var http = CreateClient();
-            var resp = await http.GetFromJsonAsync<AiModelListDto>("/api/ai/models");
-            if (resp?.Success == true)
-            {
-                _models = resp.Models;
-            }
-            else
-            {
-                _models = Array.Empty<AiModelInfo>();
-                _modelsError = resp?.Error ?? "未知錯誤。";
-            }
-        }
-        catch (Exception ex)
-        {
-            _models = Array.Empty<AiModelInfo>();
-            _modelsError = $"探測失敗：{ex.Message}";
-        }
-        finally
-        {
-            _modelsBusy = false;
         }
     }
 

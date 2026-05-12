@@ -76,16 +76,11 @@ public static class DependencyInjection
         // 通知服務：預設 NoOp。Infrastructure 層若偵測到有效 Discord/Telegram 設定會 Replace 此註冊。
         services.TryAddSingleton<INotificationService, NoOpNotificationService>();
 
-        // S30 AI Advisor：預設 NoOp（回傳「未配置」提示）。Infrastructure 啟動時會 Replace 成
-        // GeminiAiAdvisorService — 即便啟動時沒金鑰也會換上去，金鑰是 per-request 從 DB 讀，
-        // 使用者在 UI 填入後立即生效，不必重啟。
-        services.TryAddSingleton<IAiAdvisorService, NoOpAiAdvisorService>();
-
-        // S30-ELITE+：AI 呼叫診斷 Ring Buffer（最後 20 筆）— UI /lab 與 /settings/exchanges
-        // 透過 /api/ai/traces 讀取，讓使用者看到 Primary 404 / Fallback 安全過濾等真實原因。
-        services.AddSingleton<IAiAdviceTraceLog, AiAdviceTraceLog>();
+        // S74-D：legacy IAiAdvisorService + IAiAdviceTraceLog 已隨 Gemini/InteractiveCli advisor 一併移除。
+        // 參數建議入口改走 IGlobalAiChatService（Infrastructure 端註冊）。
 
         // MarketContextBuilder 依賴 Singleton IExchangeClient，本身無狀態 — Singleton 即可。
+        // 仍被 AiAdvisorPanel + /api/ai/{context, market-sweep} 端點使用。
         services.AddSingleton<IMarketContextBuilder, MarketContextBuilder>();
 
         // 即時推播：預設 NoOp。Web host（ConsoleApp）啟動時會 Replace 成 SignalR 版本。

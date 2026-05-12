@@ -45,6 +45,9 @@ public sealed class DashboardEventBus
     /// <summary>S72 [CRITICAL_SYNC]：對帳關鍵事件 — Dashboard 應顯著呈現，提示人工介入。</summary>
     public event Action<ReconciliationCriticalUpdate>? ReconciliationCritical;
 
+    /// <summary>S74-C：GlobalAiSidebar 「🪄 套用參數至實驗室」按鈕 — 廣播結構化參數 payload 給 /lab 訂閱端。</summary>
+    public event Action<ApplyAiParametersUpdate>? ApplyAiParametersRequested;
+
     public void RaiseTrade(TradeFilledUpdate update) => TradeFilled?.Invoke(update);
     public void RaiseStats(DashboardStatsUpdate update) => StatsUpdated?.Invoke(update);
     public void RaisePositionClosed(PositionClosedUpdate update) => PositionClosed?.Invoke(update);
@@ -76,4 +79,7 @@ public sealed class DashboardEventBus
 
     public void RaiseReconciliationCritical(ReconciliationCriticalUpdate update) =>
         ReconciliationCritical?.Invoke(update);
+
+    public void RaiseApplyAiParameters(ApplyAiParametersUpdate update) =>
+        ApplyAiParametersRequested?.Invoke(update);
 }

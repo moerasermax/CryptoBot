@@ -1,4 +1,5 @@
 using CryptoBot.Application;
+using CryptoBot.Application.Ai;
 using CryptoBot.Application.Realtime;
 using CryptoBot.Application.RiskManagement;
 using CryptoBot.Application.Strategies;
@@ -184,6 +185,11 @@ public static class Program
             // Lab 介面狀態艙：策略目錄 + 跨頁面狀態容器（訂閱 EventBus、做 ETA 計算）
             builder.Services.AddSingleton<StrategyCatalog>();
             builder.Services.AddSingleton<LabStateContainer>();
+
+            // S74-C：把 ConsoleApp 的 StrategyCatalog adapter 成 Application 的
+            // IStrategyParameterKeyCatalog — Infrastructure 的 GlobalAiChatService 透過此介面拿
+            // union expected keys 餵 AiAdvicePayloadParser（不破壞 IRON ⑥ 四層相依）。
+            builder.Services.AddSingleton<IStrategyParameterKeyCatalog, StrategyParameterKeyCatalogAdapter>();
 
             // S57 T1：IP 白名單管理 — 單例，內部用 SemaphoreSlim 序列化檔寫入避免 race。
             builder.Services.AddSingleton<IIpWhitelistService, IpWhitelistService>();
