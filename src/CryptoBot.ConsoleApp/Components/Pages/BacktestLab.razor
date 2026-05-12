@@ -260,12 +260,69 @@
         }
     </section>
 
+    @* S74：AI 輔助雙階段流程（PM 拍板兩段式佈局） —
+         Step 1：市場分析 — 既有 AiAdvisorPanel，本地指標 + 自選 LLM 對話判讀行情（S36-S38 T2「降級可控化」）
+         Step 2：參數微調 — 後端 IAiAdvisorService 直連（Gemini HTTP / InteractiveCli 彈窗）→ 自動灌入表單
+         兩段並存非替換；user 可只用 Step 1（離線 prompt）、或 Step 1 → Step 2 串接、或直接 Step 2。 *@
+
+    <div class="lab-step-label"
+         style="margin-top:1rem; padding:.55rem .85rem; font-size:1rem; font-weight:600; opacity:.95; background:rgba(94,158,255,.10); border-left:3px solid rgba(94,158,255,.55); border-radius:6px">
+        📊 <span style="background:rgba(94,158,255,.22); padding:.1rem .55rem; border-radius:999px; font-size:.78rem; margin:0 .4rem 0 0">Step 1</span>
+        市場分析 — 取本地指標、產 LLM 分析 Prompt（離線 / 跨家 LLM 通用）
+    </div>
+
     <AiAdvisorPanel StrategyKey="@State.SelectedModel.Key"
                     StrategyDisplayName="@State.SelectedModel.DisplayName"
                     ExpectedParameterKeys="@State.SelectedModel.ExpectedParameterKeys"
                     Symbol="@_symbolInput"
                     Interval="@_intervalInput"
                     Disabled="@State.IsRunning" />
+
+    <div class="lab-step-label"
+         style="margin-top:1.5rem; padding:.55rem .85rem; font-size:1rem; font-weight:600; opacity:.95; background:rgba(255,184,77,.10); border-left:3px solid rgba(255,184,77,.55); border-radius:6px">
+        🎯 <span style="background:rgba(255,184,77,.22); padding:.1rem .55rem; border-radius:999px; font-size:.78rem; margin:0 .4rem 0 0">Step 2</span>
+        參數微調 — 後端 AI Advisor 直連，建議 Min/Max/Step 自動灌入表單
+    </div>
+
+    <section class="panel glass ai-panel">
+        <header class="panel-header">
+            <h2>🪄 互動式 AI 建議</h2>
+            <span class="panel-sub">
+                按按鈕呼叫後端 AI Advisor — 依 <code>appsettings.json::AiAdvisor.Provider</code> 切換 Gemini HTTP 或本地 CLI 對話視窗；成功後自動把 Min/Max/Step 灌入下方參數表單。
+            </span>
+        </header>
+
+        <div class="ai-actions">
+            <button class="btn-primary"
+                    disabled="@(_interactiveBusy || State.IsRunning)"
+                    @onclick="RequestInteractiveAdviceAsync">
+                @(_interactiveBusy ? "等待 AI 回傳…" : "🪄 AI 建議")
+            </button>
+        </div>
+
+        @if (_interactiveError is not null)
+        {
+            <div class="ai-error fade-in">⚠ @_interactiveError</div>
+        }
+        else if (!string.IsNullOrEmpty(_interactiveCommentary))
+        {
+            <details class="ai-diagnostics fade-in" open>
+                <summary>
+                    ✓ AI 建議已套用
+                    @if (!string.IsNullOrEmpty(_interactiveTrendLabel))
+                    {
+                        <span> · trend=<code>@_interactiveTrendLabel</code></span>
+                    }
+                    @if (!string.IsNullOrEmpty(_interactiveModel))
+                    {
+                        <span> · model=<code>@_interactiveModel</code></span>
+                    }
+                </summary>
+                <textarea class="ai-sweep-prompt" readonly rows="6"
+                          style="font-size:.95rem;line-height:1.55;font-family:ui-monospace,Menlo,Consolas,monospace">@_interactiveCommentary</textarea>
+            </details>
+        }
+    </section>
 
     <section class="panel glass">
         <header class="panel-header">
@@ -515,6 +572,15 @@
     private int _currentGridSize;
 
     private string? _lastSelectedKey;
+
+    // S74：Step 2 互動式 AI 建議按鈕狀態。後端 IAiAdvisorService 由 DI 切換實作（Gemini / InteractiveCli），
+    // 此處不關心走哪條路 — 只看 AiAdviseResponseDto 結果決定 UI 渲染。
+    private bool _interactiveBusy;
+    private string? _interactiveError;
+    private string? _interactiveCommentary;
+    private string? _interactiveTrendLabel;
+    private string? _interactiveModel;
+
 
     // S25 T3：上次優化最佳結果（存在 StrategyOptimizationSettings）。
     // null = 尚未撈 / 該組合無快取；非 null = 顯示提示卡。
@@ -1105,6 +1171,98 @@
     }
 
     private void DismissApplyError() => _applyErrorDiag = null;
+
+    /// <summary>
+    /// S74 / S74-C Step 2：點「🪄 AI 建議」→ POST <c>/api/ai/advise</c> → 後端 <see cref="IAiAdvisorService"/>
+    /// 走 DI 拍板的實作（Gemini HTTP / InteractiveCli gemini -p 單發）→ 收到 SuggestedParameters 後直接呼
+    /// 當前 ParameterForm 的 <see cref="StrategyParameterFormBase.ApplyGridParametersAsync"/> 把 Min/Max/Step 灌入。
+    ///
+    /// 永不拋；任何失敗轉成 _interactiveError 紅字訊息（與後端 IAiAdvisorService 永不拋契約對稱）。
+    ///
+    /// 註：UI 對話 UX 走全域 <c>GlobalAiSidebar</c>（Phase 4 補完）；本按鈕保留作為「快速一次性建議」入口。
+    /// </summary>
+    private async Task RequestInteractiveAdviceAsync()
+    {
+        _interactiveError = null;
+        _interactiveCommentary = null;
+        _interactiveTrendLabel = null;
+        _interactiveModel = null;
+
+        if (_dynamicRef?.Instance is not StrategyParameterFormBase form)
+        {
+            _interactiveError = "尚未載入策略表單（_dynamicRef.Instance is not StrategyParameterFormBase）。";
+            StateHasChanged();
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_symbolInput))
+        {
+            _interactiveError = "請先選擇 Symbol。";
+            StateHasChanged();
+            return;
+        }
+
+        _interactiveBusy = true;
+        StateHasChanged();
+        try
+        {
+            using var http = HttpFactory.CreateClient();
+            http.BaseAddress = new Uri(Nav.BaseUri);
+            // InteractiveCli 預設 timeout 600s；HttpClient 預設 100s 不夠，主動拉長到 12 分鐘。
+            // Gemini 模式下 GeminiAiAdvisorService.TimeoutSeconds 已自管 HTTP timeout；外層放寬無害。
+            http.Timeout = TimeSpan.FromMinutes(12);
+
+            var req = new AiAdviseRequestDto(
+                StrategyKey: State.SelectedModel.Key,
+                Symbol: _symbolInput,
+                Interval: _intervalInput,
+                CurrentParameters: null);
+
+            var resp = await http.PostAsJsonAsync("/api/ai/advise", req);
+            if (!resp.IsSuccessStatusCode)
+            {
+                _interactiveError = $"HTTP {(int)resp.StatusCode}：{await resp.Content.ReadAsStringAsync()}";
+                return;
+            }
+
+            var dto = await resp.Content.ReadFromJsonAsync<AiAdviseResponseDto>();
+            if (dto is null)
+            {
+                _interactiveError = "後端回傳空資料。";
+                return;
+            }
+
+            if (!dto.Success)
+            {
+                _interactiveError = dto.Error ?? "AI 建議失敗（未提供原因）。";
+                _interactiveModel = dto.Model;
+                return;
+            }
+
+            if (dto.SuggestedParameters.Count == 0)
+            {
+                _interactiveError = "AI 回傳成功但無建議參數（合法 keys 過濾後為空）。";
+                _interactiveModel = dto.Model;
+                return;
+            }
+
+            await form.ApplyGridParametersAsync(dto.SuggestedParameters);
+            _interactiveCommentary = dto.Commentary;
+            _interactiveTrendLabel = dto.TrendLabel;
+            _interactiveModel = dto.Model;
+            _toast = $"✓ AI 建議已套用 — {dto.SuggestedParameters.Count} 個參數維度（model={dto.Model}）。";
+            _toastIsError = false;
+        }
+        catch (Exception ex)
+        {
+            _interactiveError = $"互動式 AI 建議失敗：{ex.Message}";
+        }
+        finally
+        {
+            _interactiveBusy = false;
+            StateHasChanged();
+        }
+    }
 
     private async Task ShowChartAsync(LeaderboardRowDto row)
     {

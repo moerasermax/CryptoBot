@@ -5,6 +5,7 @@ using CryptoBot.ConsoleApp.Lab;
 using CryptoBot.Domain.Enums;
 using CryptoBot.Domain.Exceptions;
 using CryptoBot.Domain.ValueObjects;
+using Microsoft.Extensions.Configuration;
 
 namespace CryptoBot.ConsoleApp.Api;
 
@@ -88,6 +89,15 @@ public static class AiAdvisorEndpoints
                 Model: result.Model,
                 TrendLabel: ctx.TrendLabel.ToString(),
                 Attempts: result.Attempts));
+        });
+
+        // S74-B：揭露當前 AI Advisor provider 名（"Gemini" / "InteractiveCli"），讓 UI 端決定按鈕走哪條路：
+        //   - Gemini → 直接 POST /api/ai/advise（既有同步 HTTP）
+        //   - InteractiveCli → 開 AiChatModal、走 /api/ai/chat/start + SignalR
+        group.MapGet("/config", (IConfiguration config) =>
+        {
+            var provider = config["AiAdvisor:Provider"] ?? "Gemini";
+            return Results.Ok(new AiAdvisorConfigDto(Provider: provider));
         });
 
         // S30-ELITE+：診斷紀錄。寫死預設 20 筆，使用者可用 ?limit=N 覆蓋（會被 log 自動 clamp 到容量上限）。
@@ -273,6 +283,9 @@ public sealed record AiModelListDto(
     string? Error,
     int Count,
     IReadOnlyList<AiModelInfo> Models);
+
+/// <summary>S74-C：<c>GET /api/ai/config</c> — 暴露當前 advisor provider 名稱，給 UI 端 / 外部 client 知曉 backend 配置。</summary>
+public sealed record AiAdvisorConfigDto(string Provider);
 
 /// <summary>
 /// S32-S35-REVISED T3：單一幣種的市場快照（給 Top 10 橫掃用）。

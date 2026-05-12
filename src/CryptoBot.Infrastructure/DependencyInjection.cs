@@ -79,29 +79,47 @@ public static class DependencyInjection
     }
 
     /// <summary>
-    /// S30：註冊 AI Advisor（Gemini）服務與金鑰 Provider。
+    /// S30 / S74 / S74-C：註冊 AI Advisor 服務與金鑰 Provider。
     ///
     /// 啟動時即 Replace 掉 Application 層的 NoOp — 我們允許使用者在「沒設金鑰」狀態下啟動，
     /// Gemini service 在每次請求時從 SQLite 讀金鑰；找不到就回 Success=false 的友善訊息。
-    /// 這樣 UI 改完金鑰下一次按鈕點擊就生效，不必重啟 host。
+    ///
+    /// S74-C：依 <c>Configuration["AiAdvisor:Provider"]</c> 切換實作（headless / 給 /api/ai/advise 用） —
+    ///   - <c>"Gemini"</c>（預設）：HTTP REST 走 <see cref="GeminiAiAdvisorService"/>。
+    ///   - <c>"InteractiveCli"</c>：<c>gemini -p</c> 單發走 <see cref="InteractiveCliAdvisorService"/>。
+    /// UI 的對話 UX 走全域 <c>GlobalAiSidebar</c>（Scoped <c>IGlobalAiChatService</c>）— 與此處 DI 獨立。
+    /// 切換在啟動時鎖定；運行期間更換需重啟 host。
     /// </summary>
     public static IServiceCollection AddAiAdvisor(
         this IServiceCollection services,
         IConfiguration configuration)
     {
         services.Configure<GeminiOptions>(configuration.GetSection(GeminiOptions.SectionName));
+        services.Configure<InteractiveCliAdvisorOptions>(configuration.GetSection(InteractiveCliAdvisorOptions.SectionName));
 
         services.AddSingleton<IAiCredentialProvider, DbAiCredentialProvider>();
 
-        // 單一 Singleton HttpClient — Gemini endpoint 固定、呼叫頻率低（UI 按鈕觸發），
-        // 不需要 HttpClientFactory 的池化。與 DiscordNotificationService 同模式。
-        services.Replace(ServiceDescriptor.Singleton<IAiAdvisorService>(sp =>
-            new GeminiAiAdvisorService(
-                new HttpClient(),
-                sp.GetRequiredService<IAiCredentialProvider>(),
-                sp.GetRequiredService<IAiAdviceTraceLog>(),
-                sp.GetRequiredService<IOptions<GeminiOptions>>(),
-                sp.GetRequiredService<ILogger<GeminiAiAdvisorService>>())));
+        var provider = configuration["AiAdvisor:Provider"] ?? "Gemini";
+        if (string.Equals(provider, "InteractiveCli", StringComparison.OrdinalIgnoreCase))
+        {
+            // S74-C：本地 CLI 模式走 gemini -p 單發；headless 路徑、不持久 process。
+            services.Replace(ServiceDescriptor.Singleton<IAiAdvisorService>(sp =>
+                new InteractiveCliAdvisorService(
+                    sp.GetRequiredService<IOptions<InteractiveCliAdvisorOptions>>(),
+                    sp.GetRequiredService<ILogger<InteractiveCliAdvisorService>>())));
+        }
+        else
+        {
+            // 單一 Singleton HttpClient — Gemini endpoint 固定、呼叫頻率低（UI 按鈕觸發），
+            // 不需要 HttpClientFactory 的池化。與 DiscordNotificationService 同模式。
+            services.Replace(ServiceDescriptor.Singleton<IAiAdvisorService>(sp =>
+                new GeminiAiAdvisorService(
+                    new HttpClient(),
+                    sp.GetRequiredService<IAiCredentialProvider>(),
+                    sp.GetRequiredService<IAiAdviceTraceLog>(),
+                    sp.GetRequiredService<IOptions<GeminiOptions>>(),
+                    sp.GetRequiredService<ILogger<GeminiAiAdvisorService>>())));
+        }
 
         return services;
     }
