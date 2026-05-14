@@ -1,5 +1,4 @@
-﻿using System.Diagnostics;
-using System.Text;
+﻿using System.Text;
 using CryptoBot.Application.Ai;
 using CryptoBot.Application.Realtime;
 using Microsoft.Extensions.Logging;
@@ -8,41 +7,44 @@ using Microsoft.Extensions.Options;
 namespace CryptoBot.Infrastructure.Ai;
 
 /// <summary>
-/// S74-C：全域常駐 AI 對話 service 實作 — Scoped 生命週期、與 Blazor Server circuit 綁定。
+/// S74-C / S75：全域常駐 AI 對話 service 實作 — Scoped 生命週期、與 Blazor Server circuit 綁定。
 ///
-/// 走 <c>gemini -p &quot;&lt;prompt&gt;&quot; --session-id &lt;uuid&gt;</c> 單發模式：
+/// S75 取代 S74-C 的 <c>gemini -p &quot;&lt;prompt&gt;&quot; --session-id &lt;uuid&gt;</c> 單發模式，
+/// 改用 <see cref="IGeminiAcpClient"/>（<c>gemini --acp</c> 長連接 JSON-RPC 2.0 IPC）：
 /// <list type="bullet">
-///   <item>避開 TTY / stdin redirect 限制（S74-B 走 Process 持久 stdin 的失敗教訓）。</item>
-///   <item>--session-id 讓 gemini 自己保留 session 痕跡（將來支援 server-side recall 時受益）；
-///         C# 端仍自行 dump 對話歷史進 prompt，保證單發 -p 也能收到完整 context。</item>
-///   <item>prompt 字元數受 Win32 CreateProcess 命令列上限（~32K wchar）約束，
-///         <see cref="MaxPromptChars"/> 取保守值 + sliding window 從尾保留最近輪次。</item>
+///   <item>消除冷啟動延遲（per-prompt spawn ~1-3s → long-lived single process）。</item>
+///   <item>解除 Win32 CreateProcess 命令列上限（28K wchar）— ACP 走 stdin pipe 不受限。</item>
+///   <item>原生 session 持久化（ACP <c>session/new</c> sessionId 跨 prompt 共用）；C# 端 history 仍保留為 UI 渲染副本。</item>
 /// </list>
 ///
-/// 合約：<see cref="SendAsync"/> 永不拋；任何下游失敗（process / JSON / timeout）皆轉成
+/// 合約：<see cref="SendAsync"/> 永不拋；任何下游失敗（ACP / JSON / timeout）皆轉成
 /// 含錯誤訊息的 ai 訊息 append 至 <see cref="History"/>，不破壞對話迴圈。
 /// </summary>
 public sealed class GlobalAiChatService : IGlobalAiChatService
 {
     /// <summary>
-    /// 保守上限：Win32 CreateProcess 命令列總長 ≈ 32767 wchar；扣掉 flag + UUID + padding 後留 28K 給 prompt 本體。
-    /// 超出此值的舊歷史會被 sliding window 從前端丟棄。
+    /// Phase 2 保留 sliding window 上限作為 token 控制保險（不再受 Win32 CreateProcess 限制）。
+    /// 200K char 對應 ACP session 內合理 prompt 大小；超出此值的舊歷史會被 sliding window 從前端丟棄。
+    /// Phase 4 整合測試後可重新評估或移除（session/new 後 ACP 內 history 已 cross-prompt 持久、C# 端理論可省略 history dump）。
     /// </summary>
-    private const int MaxPromptChars = 28_000;
+    private const int MaxPromptChars = 200_000;
 
     private readonly List<ChatMessage> _history = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
 
     private readonly IStrategyParameterKeyCatalog _keyCatalog;
+    private readonly IGeminiAcpClient _acpClient;
     private readonly InteractiveCliAdvisorOptions _opts;
     private readonly ILogger<GlobalAiChatService> _logger;
 
     public GlobalAiChatService(
         IStrategyParameterKeyCatalog keyCatalog,
+        IGeminiAcpClient acpClient,
         IOptions<InteractiveCliAdvisorOptions> opts,
         ILogger<GlobalAiChatService> logger)
     {
         _keyCatalog = keyCatalog;
+        _acpClient = acpClient;
         _opts = opts.Value;
         _logger = logger;
     }
@@ -228,60 +230,36 @@ $@"你是 CryptoBot 的全域 AI 量化助理。請以對話形式輔助使用�
 - 純對話回應時**禁絕** JSON code fence，避免 UI 誤判為可套用。";
     }
 
+    /// <summary>
+    /// S75：透過 <see cref="IGeminiAcpClient"/> 送 prompt、聚合 stream chunks 為完整 reply。
+    ///
+    /// Phase 2 行為：
+    /// <list type="bullet">
+    ///   <item>同步聚合 <see cref="IGeminiAcpClient.SendPromptAsync"/> yield 的 chunks 為單一 string。</item>
+    ///   <item>逾時控制：以 <c>_opts.TimeoutSeconds</c> linked CTS 限制；逾時直接拋 <see cref="TimeoutException"/>，
+    ///         上層 SendAsync 捕捉並轉為錯誤 ai 訊息。</item>
+    ///   <item>無 cancel method（Phase 1 §7 親驗結論）— 逾時 / 取消僅在 C# 端中斷接收，
+    ///         in-flight prompt 無法在 ACP 端取消、會繼續直到完成（資源浪費）；Phase 3 加固改為 dispose + 重新 ensure session。</item>
+    /// </list>
+    /// </summary>
     private async Task<string> InvokeGeminiAsync(string prompt, CancellationToken ct)
     {
-        var psi = new ProcessStartInfo
-        {
-            FileName = _opts.Executable,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true,
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8,
-        };
-        psi.ArgumentList.Add("-p");
-        psi.ArgumentList.Add(prompt);
-        psi.ArgumentList.Add("--session-id");
-        psi.ArgumentList.Add(SessionUuid.ToString("D"));
-
-        using var process = new Process { StartInfo = psi };
-        var stdoutSb = new StringBuilder();
-        var stderrSb = new StringBuilder();
-        process.OutputDataReceived += (_, e) => { if (e.Data is not null) stdoutSb.AppendLine(e.Data); };
-        process.ErrorDataReceived += (_, e) => { if (e.Data is not null) stderrSb.AppendLine(e.Data); };
-
-        if (!process.Start())
-            throw new InvalidOperationException($"Process.Start 回 false（FileName={_opts.Executable}）。");
-
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(_opts.TimeoutSeconds));
 
+        var sb = new StringBuilder();
         try
         {
-            await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
+            await foreach (var chunk in _acpClient.SendPromptAsync(prompt, timeoutCts.Token).ConfigureAwait(false))
+            {
+                sb.Append(chunk);
+            }
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { /* ignore */ }
-            throw new TimeoutException($"GlobalAiChat 逾時（{_opts.TimeoutSeconds}s）— gemini -p 未在限時內回傳。");
-        }
-        catch (OperationCanceledException)
-        {
-            try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { /* ignore */ }
-            throw;
+            throw new TimeoutException($"GlobalAiChat 逾時（{_opts.TimeoutSeconds}s）— gemini --acp session/prompt 未在限時內完成。");
         }
 
-        if (process.ExitCode != 0)
-        {
-            var stderr = stderrSb.ToString().Trim();
-            throw new InvalidOperationException(
-                $"gemini -p 退出碼 {process.ExitCode}。stderr：{(string.IsNullOrEmpty(stderr) ? "(空)" : stderr)}");
-        }
-
-        return stdoutSb.ToString();
+        return sb.ToString();
     }
 }

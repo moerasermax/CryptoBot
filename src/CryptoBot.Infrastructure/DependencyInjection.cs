@@ -99,8 +99,13 @@ public static class DependencyInjection
 
         services.AddSingleton<IAiCredentialProvider, DbAiCredentialProvider>();
 
-        // S74-C / S74-D：CryptoBot Sidekick — Scoped per Blazor Server circuit。
+        // S75：gemini --acp 長連接 IPC client — Scoped per circuit（與 GlobalAiChatService 同生命週期）。
+        // dispose 時關閉 stdin → process clean exit，fallback Kill(entireProcessTree:true)。
+        services.AddScoped<IGeminiAcpClient, GeminiAcpClient>();
+
+        // S74-C / S74-D / S75：CryptoBot Sidekick — Scoped per Blazor Server circuit。
         // 注入 IStrategyParameterKeyCatalog（介面位於 Application；具體 adapter 由 ConsoleApp 端註冊）+
+        // IGeminiAcpClient (S75 重構, 取代 gemini -p single-shot) +
         // InteractiveCliAdvisorOptions（共用 gemini executable / timeout 設定）。
         services.AddScoped<IGlobalAiChatService, GlobalAiChatService>();
 
