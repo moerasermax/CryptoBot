@@ -145,7 +145,11 @@ public sealed class OptimizationOrchestrator
         if (req.SearchMethod == SearchMethod.Bayesian)
         {
             // 貝氏優化走 IAdaptiveSearchStrategy 路徑（序列、邊跑邊建議），strategy 由 DI 提供。
-            using var scope = _scopeFactory.CreateScope();
+            // BayesianSearchStrategy 只實作 IAsyncDisposable（DisposeAsync 走 DELETE /study/{id} 清理 sidecar），
+            // 必須用 CreateAsyncScope() + await using 讓 scope dispose 走 async path；
+            // CreateScope() + using（同步）會在 scope 結束時拋
+            //「類型僅實作了 IAsyncDisposable 介面。請使用 DisposeAsync 來釋放容器」。
+            await using var scope = _scopeFactory.CreateAsyncScope();
             var adaptive = scope.ServiceProvider.GetRequiredService<IAdaptiveSearchStrategy>();
             var budget = req.RandomBudget
                 ?? throw new InvalidOperationException(
