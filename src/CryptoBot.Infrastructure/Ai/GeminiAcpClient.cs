@@ -60,11 +60,21 @@ public sealed class GeminiAcpClient : IGeminiAcpClient
 
     public async Task EnsureSessionAsync(CancellationToken ct = default)
     {
-        if (_sessionId is not null) return;
+        // Phase 3：process 死偵測 — 若舊 process 已 exit (crash / kill / OS reap)，重置 session 強制 re-init。
+        if (_sessionId is not null && _process?.HasExited != true) return;
         await _initGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (_sessionId is not null) return;
+            if (_sessionId is not null && _process?.HasExited != true) return;
+            // 偵測到 stale session：清掉舊 state 後重 init。
+            if (_process?.HasExited == true)
+            {
+                _logger.LogWarning("[GeminiAcp] 偵測到 ACP process 已 exit (ExitCode={Code})，重置 session 後 re-init。", _process.ExitCode);
+                _sessionId = null;
+                try { _readLoopCts?.Cancel(); } catch { /* ignore */ }
+                try { _process.Dispose(); } catch { /* ignore */ }
+                _process = null;
+            }
             await InitProcessAndSessionAsync(ct).ConfigureAwait(false);
         }
         finally
@@ -106,14 +116,14 @@ public sealed class GeminiAcpClient : IGeminiAcpClient
         _readLoopCts = new CancellationTokenSource();
         _readLoopTask = Task.Run(() => ReadLoopAsync(_readLoopCts.Token));
 
-        // 4. send initialize / authenticate / session/new
-        var initResp = await SendRequestAsync("initialize", new { protocolVersion = 1 }, ct).ConfigureAwait(false);
+        // 4. send initialize / authenticate / session/new — 走 retry helper（429 / RESOURCE_EXHAUSTED 自動 backoff）
+        var initResp = await SendRequestWithRetryAsync("initialize", new { protocolVersion = 1 }, ct).ConfigureAwait(false);
         _logger.LogDebug("[GeminiAcp] initialize response received");
 
-        await SendRequestAsync("authenticate", new { methodId = "oauth-personal" }, ct).ConfigureAwait(false);
+        await SendRequestWithRetryAsync("authenticate", new { methodId = "oauth-personal" }, ct).ConfigureAwait(false);
         _logger.LogDebug("[GeminiAcp] authenticate (oauth-personal) ok");
 
-        var newResp = await SendRequestAsync(
+        var newResp = await SendRequestWithRetryAsync(
             "session/new",
             new { cwd = _tempDir, mcpServers = Array.Empty<object>() },
             ct).ConfigureAwait(false);
@@ -165,14 +175,38 @@ public sealed class GeminiAcpClient : IGeminiAcpClient
                 yield return chunk;
             }
 
-            // sendTask 已完成；await 觀察例外（若有）。
-            await sendTask.ConfigureAwait(false);
+            // sendTask 已完成；observe 例外（含 Phase 3 429 → 明確訊息轉換）。
+            await ObserveSendTaskAsync(sendTask).ConfigureAwait(false);
         }
         finally
         {
             _activeChunkChannel = null;
             channel.Writer.TryComplete();
             _promptGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Phase 3：observe sendTask + 429 → 明確訊息轉換。
+    ///
+    /// SendPromptAsync 內因 streaming + yield 互斥不能直接 try/catch 包 yield，
+    /// 故 await observe 放外 helper；429 (model overload) 包裝為 user-facing 訊息，
+    /// 上層 <see cref="GlobalAiChatService.SendAsync"/> 既有 catch 自動轉為 ai 訊息顯示。
+    ///
+    /// Phase 3 minimal：prompt path 不做 in-stream retry（retry 與 streaming UX 互斥；
+    /// 真正的 model fallback chain 需先補探 ACP setModel schema，列為 Phase 3.5 待辦）。
+    /// </summary>
+    private static async Task ObserveSendTaskAsync(Task<JsonElement> sendTask)
+    {
+        try
+        {
+            await sendTask.ConfigureAwait(false);
+        }
+        catch (InvalidOperationException ex) when (Is429Error(ex.Message))
+        {
+            throw new InvalidOperationException(
+                "Gemini model 暫時繁忙 (429 / RESOURCE_EXHAUSTED / MODEL_CAPACITY_EXHAUSTED)。建議：稍候 30s 重發、或 Phase 3.5 加 fallback model chain。",
+                ex);
         }
     }
 
@@ -197,6 +231,50 @@ public sealed class GeminiAcpClient : IGeminiAcpClient
 
         using var reg = ct.Register(() => tcs.TrySetCanceled(ct));
         return await tcs.Task.ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Phase 3：429 retry wrapper — 對齊 capsule §3 + IRON ⑪ 雙保險韌性。
+    ///
+    /// <list type="bullet">
+    ///   <item>**僅用於 init / auth / session.new 階段**（initialize/authenticate/session/new）；
+    ///         SendPromptAsync 內因 streaming 與 retry 互斥不採此 wrapper，改在 prompt path
+    ///         偵測 429 後拋明確訊息（上層 GlobalAiChatService 已 catch 轉 user-facing error）。</item>
+    ///   <item>退避策略：exp backoff 1s → 2s → 4s，3 次上限後拋原始錯誤。</item>
+    ///   <item>偵測：IRON ⑪ 雙保險 — errorCode 429 / message 含 RESOURCE_EXHAUSTED / MODEL_CAPACITY_EXHAUSTED 任一命中。</item>
+    /// </list>
+    /// </summary>
+    private async Task<JsonElement> SendRequestWithRetryAsync(string method, object @params, CancellationToken ct)
+    {
+        const int maxRetries = 3;
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return await SendRequestAsync(method, @params, ct).ConfigureAwait(false);
+            }
+            catch (InvalidOperationException ex) when (Is429Error(ex.Message) && attempt < maxRetries)
+            {
+                var delaySec = (int)Math.Pow(2, attempt); // 1s, 2s, 4s
+                _logger.LogWarning(
+                    "[GeminiAcp] 429 retry {Attempt}/{Max}, backoff {Delay}s, method={Method}",
+                    attempt + 1, maxRetries, delaySec, method);
+                await Task.Delay(TimeSpan.FromSeconds(delaySec), ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// IRON ⑪ 雙保險偵測：errorCode 429 / message 含 model overload 關鍵字任一命中。
+    /// 對齊 Phase 1 §6.4 已知 model overload 訊號（gemini-3-flash-preview / gemini-3.1-pro-preview MODEL_CAPACITY_EXHAUSTED）。
+    /// </summary>
+    private static bool Is429Error(string? message)
+    {
+        if (string.IsNullOrEmpty(message)) return false;
+        return message.Contains("\"code\":429", StringComparison.Ordinal)
+            || message.Contains("RESOURCE_EXHAUSTED", StringComparison.Ordinal)
+            || message.Contains("MODEL_CAPACITY_EXHAUSTED", StringComparison.Ordinal)
+            || message.Contains("rateLimitExceeded", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task ReadLoopAsync(CancellationToken ct)
