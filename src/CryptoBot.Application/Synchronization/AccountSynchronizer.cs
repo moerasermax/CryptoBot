@@ -164,6 +164,29 @@ public sealed class AccountSynchronizer : IAccountSynchronizer
             }
         }
 
+        // S77 fix (Bug 7): remote-only Position 偵測 — BingX 有 Open Position 但 local DB 缺。
+        //   觸發場景：(a) StrategyExecutor.cs:531-557 Position materialization 失敗（Bug 3 已加 log）、
+        //              (b) user 在 BingX UI 手動開倉、(c) 跨 process / 跨 deploy session 殘留。
+        //   修法：log error + 不自動補建（自動補建會缺 StrategyId/snapshot、有 corner case 風險）。
+        //   後續：user 看 log + manual SQL INSERT（依 S77 模式）或重啟 Strategy 觸發新開倉。
+        var remoteOnlyCount = 0;
+        foreach (var remote in remoteOpen.Where(r => r.Quantity > 0m))
+        {
+            var matched = localOpen.Any(l =>
+                l.Symbol.Equals(remote.Symbol) &&
+                l.Side == remote.Side &&
+                !l.IsClosed);
+            if (matched) continue;
+
+            remoteOnlyCount++;
+            _logger.LogError(
+                "[CRITICAL_SYNC] Reconcile: Remote-only Position detected — " +
+                "{Symbol} {Side} qty={Qty} entry={Entry} (BingX Open, DB MISSING). " +
+                "Likely cause: Position materialization failed (StrategyExecutor.cs:531-557) " +
+                "or user opened manually outside system. Manual SQL INSERT may be needed.",
+                remote.Symbol, remote.Side, remote.Quantity, remote.EntryPrice);
+        }
+
         await uow.SaveChangesAsync(ct).ConfigureAwait(false);
         _logger.LogInformation(
             "Reconciliation complete: refreshed {Orders} orders, closed {Orphans} orphan positions.",

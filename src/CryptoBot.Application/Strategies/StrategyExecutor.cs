@@ -551,9 +551,32 @@ public sealed class StrategyExecutor : IStrategyExecutor
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex,
-                    "Post-order position materialization failed for {Symbol} — AccountSynchronizer will retry via WS.",
+                // S77 fix (Bug 3): 升級為 LogError + critical broadcast — 既有 LogWarning 過於低調、
+                //   user 在 Dashboard 看不到「持倉隱形」警報；對齊 Bug 7 AccountSynchronizer
+                //   remote-only Position detection、形成完整 alert path。
+                _logger.LogError(ex,
+                    "[CRITICAL_SYNC] Post-order Position materialization FAILED for {Symbol} — " +
+                    "DB Order placed/filled but Position NOT created (持倉隱形 risk). " +
+                    "AccountSynchronizer reconcile tick will detect remote-only Position and alert. " +
+                    "Manual investigation: check StrategyExecutor.cs:531-549 path + DB Position vs Order.",
                     signal.Symbol);
+                try
+                {
+                    await _broadcaster.BroadcastStrategyEvaluationFailedAsync(new StrategyEvaluationFailedUpdate(
+                        StrategyId: _strategy.Id,
+                        StrategyName: _strategy.Name,
+                        OccurredAtUtc: DateTime.UtcNow,
+                        Symbol: signal.Symbol.BingXFormat,
+                        ErrorMessage: $"[CRITICAL_SYNC] Position materialization failed: {ex.Message}",
+                        TraceId: traceId),
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception broadcastEx)
+                {
+                    _logger.LogWarning(broadcastEx,
+                        "S77: critical broadcast also failed for materialization error on {Symbol}.",
+                        signal.Symbol);
+                }
             }
         }
 
@@ -689,6 +712,44 @@ public sealed class StrategyExecutor : IStrategyExecutor
             _logger.LogWarning(ex,
                 "S66-A: GetOrderByClientOrderIdAsync failed for Cid {Cid}; local DB keeps original record.",
                 clientOrderId);
+        }
+
+        // S77 fix (Bug 5/6): 偵測到 BingX 真實 Filled → 更新 DB Order + 記錄 cooldown
+        //   避免下次 tick 又生同訊號 → 又送同 ClientOrderId → 又 Duplicate → ERROR loop
+        //   (既有實作只 log + broadcast、不 sync DB、所以 strategy 重複觸發成 user-visible loop)
+        if (remote is not null && remote.Status == OrderStatus.Filled && remote.AveragePrice.HasValue)
+        {
+            try
+            {
+                // Order.RecordFill 是 incremental (newFilled = current + delta), 只補差額避免 over-fill
+                var alreadyFilled = order.FilledQuantity.Value;
+                var remoteFilled = remote.QuantityFilled;
+                if (remoteFilled > alreadyFilled)
+                {
+                    var delta = Quantity.Create(remoteFilled - alreadyFilled);
+                    var fillPrice = Price.Create(remote.AveragePrice.Value);
+                    // commission=0：BingX 真實 commission 不可得（remote snapshot 無此欄）；AccountSynchronizer 後續 reconcile 補
+                    order.RecordFill(delta, fillPrice, commission: 0m);
+
+                    var orderRepo = sp.GetRequiredService<IOrderRepository>();
+                    var uow = sp.GetRequiredService<IUnitOfWork>();
+                    await orderRepo.UpdateAsync(order, CancellationToken.None).ConfigureAwait(false);
+                    await uow.SaveChangesWithRetryAsync(ct: CancellationToken.None).ConfigureAwait(false);
+
+                    _cooldownTracker.RecordOrderPlaced(_strategy.Id);
+
+                    _logger.LogInformation(
+                        "S77 sync: Cid {Cid} reconciled to Filled (delta={Delta}, total={Total}/{Qty}, avg={Avg}). Cooldown recorded.",
+                        clientOrderId, delta.Value, order.FilledQuantity.Value, remote.Quantity, remote.AveragePrice);
+                }
+            }
+            catch (Exception syncEx)
+            {
+                _logger.LogError(syncEx,
+                    "S77 sync: Failed to reconcile DB Order {Id} ({Cid}) to remote Filled state — " +
+                    "AccountSynchronizer reconcile tick will retry.",
+                    order.Id, clientOrderId);
+            }
         }
 
         var remoteSummary = remote is null
