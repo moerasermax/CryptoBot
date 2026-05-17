@@ -2,6 +2,7 @@
 @using System.Globalization
 @using System.Net.Http.Json
 @using CryptoBot.Application.Ai
+@using CryptoBot.Application.Backtesting
 @using CryptoBot.Application.Backtesting.Search
 @using CryptoBot.Application.Realtime
 @using CryptoBot.ConsoleApp.Api
@@ -212,6 +213,16 @@
                            title="@(_searchMethod == SearchMethod.Bayesian ? "貝氏優化 trial 數（serial 序列；建議 ≥ 30 讓 sampler 收斂）" : "Random Search 取樣次數（每次從各維度獨立均勻抽一個值）")" />
                 </div>
             }
+            @* S77 P0-2: Top N 排行榜排序維度（預設 Sharpe）*@
+            <div class="field">
+                <span>Sort By</span>
+                <GlassDropdown TValue="OptimizationSortBy"
+                               Value="@_sortBy"
+                               ValueChanged="@(s => { _sortBy = s; return Task.CompletedTask; })"
+                               Items="@_sortByChoices"
+                               Label="@(s => SortByLabel(s))"
+                               Disabled="@State.IsRunning" />
+            </div>
         </div>
 
         @* S69 Phase 3：Bayesian 模式下的 sidecar 在線指示。null=探查中；true=online；false=offline + 啟動指引。 *@
@@ -388,7 +399,8 @@
                         <td>@row.MaxDrawdownPercent.ToString("N2")%</td>
                         <td>@(row.IsInfiniteRatio ? "∞" : row.ProfitToDrawdownRatio.ToString("N2"))</td>
                         <td class="@(row.SharpeRatio >= 0 ? "pos" : "neg")">@row.SharpeRatio.ToString("N2")</td>
-                        <td>@row.Fills</td>
+                        @* S77 P1-1: Fills 三級警告 <10 紅, 10-29 黃, 30-99 中性, >=100 綠 *@
+                        <td class="@FillsWarningClass(row.Fills)" title="@FillsWarningTooltip(row.Fills)">@row.Fills@(row.Fills < 30 ? " ⚠️" : row.Fills >= 100 ? " ✅" : "")</td>
                         <td>
                             @if (row.EquityCurve.Count > 0)
                             {
@@ -489,6 +501,40 @@
     private static readonly SearchMethod[] _searchMethodChoices = new[]
     {
         SearchMethod.Grid, SearchMethod.Random, SearchMethod.Bayesian,
+    };
+
+    // S77 P0-2: Top N 排行榜排序維度（預設 Sharpe — 取代既有寫死 P/DD, ClaudeDesktop bug report 要求）
+    private OptimizationSortBy _sortBy = OptimizationSortBy.Sharpe;
+    private static readonly OptimizationSortBy[] _sortByChoices = new[]
+    {
+        OptimizationSortBy.Sharpe,
+        OptimizationSortBy.ProfitToDrawdownRatio,
+        OptimizationSortBy.NetPnL,
+        OptimizationSortBy.ReturnPercent,
+    };
+    private static string SortByLabel(OptimizationSortBy s) => s switch
+    {
+        OptimizationSortBy.Sharpe => "Sharpe (預設)",
+        OptimizationSortBy.ProfitToDrawdownRatio => "P/DD",
+        OptimizationSortBy.NetPnL => "Net PnL",
+        OptimizationSortBy.ReturnPercent => "Return %",
+        _ => s.ToString(),
+    };
+
+    // S77 P1-1: Fills 三級警告 — 復用既有 pos/neg CSS class 避免新增 stylesheet 依賴
+    //   <10 紅 (neg) / 10-29 中性 + ⚠️ 圖示 / 30-99 中性 / >=100 綠 (pos)
+    private static string FillsWarningClass(int fills) => fills switch
+    {
+        < 10 => "neg",
+        >= 100 => "pos",
+        _ => "",
+    };
+    private static string FillsWarningTooltip(int fills) => fills switch
+    {
+        < 10 => $"⚠️ 樣本嚴重不足 ({fills} fills < 10)、結果極可能無統計意義",
+        < 30 => $"⚠️ 樣本不足 ({fills} fills < 30)、結果僅供參考",
+        >= 100 => $"✅ 樣本充足 ({fills} fills)、統計顯著",
+        _ => $"{fills} fills",
     };
 
     // S69 Phase 3：Sidecar 健康狀態。null=未探 / true=online / false=offline。
@@ -1063,6 +1109,7 @@
         {
             SearchMethod = _searchMethod,
             RandomBudget = needsBudget ? _randomBudget : null,
+            SortBy = _sortBy,  // S77 P0-2: 將排序維度傳到後端 (預設 Sharpe)
         };
 
         // 進度總數依搜尋方法切換 — Random/Bayesian=budget；Grid 沿用既有計算（form 內部產出的 Ranges 大小）。

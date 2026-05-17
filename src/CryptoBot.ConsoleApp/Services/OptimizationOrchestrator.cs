@@ -371,13 +371,22 @@ public sealed class OptimizationOrchestrator
     {
         // S32-T2：爆倉視為最差績效，但不可被 MinFillsForRanking 濾掉 — 即使成交數少也要讓使用者看到爆倉事實。
         //
-        // 排序規則：先把所有「有效」結果（非爆倉且成交數 ≥ 門檻）按 ProfitToDrawdownRatio 由大到小排，
-        // 爆倉結果一律壓到最底層；爆倉彼此之間再按 ReturnPercent（本應全是 -100%）做 tie-break。
-        // 這樣 Leaderboard Rank 1 永遠是最好的可交易結果，爆倉被清楚標註在尾端讓人看得到「這組必死」。
+        // S77 P0-2: 排序維度可選（預設 Sharpe）—
+        //   既有寫死 ProfitToDrawdownRatio（ClaudeDesktop 2026-05-17 bug report 指出未在 UI 標示）；
+        //   改為依 req.SortBy switch、預設 Sharpe（量化界通用）。
+        //   爆倉永遠壓底（OrderBy IsLiquidated）+ tie-break ReturnPercent 保留。
+        Func<OptimizationRun, decimal> sortKey = req.SortBy switch
+        {
+            OptimizationSortBy.Sharpe => r => r.Report.SharpeRatio,
+            OptimizationSortBy.ProfitToDrawdownRatio => r => ProfitToDrawdownRatio(r.Report),
+            OptimizationSortBy.NetPnL => r => r.Report.NetPnL,
+            OptimizationSortBy.ReturnPercent => r => r.Report.ReturnPercent,
+            _ => r => r.Report.SharpeRatio,
+        };
         var ranked = runs
             .Where(r => r.Report.IsLiquidated || r.Report.OrdersFilled >= MinFillsForRanking)
             .OrderBy(r => r.Report.IsLiquidated ? 1 : 0)
-            .ThenByDescending(r => ProfitToDrawdownRatio(r.Report))
+            .ThenByDescending(sortKey)
             .ThenByDescending(r => r.Report.ReturnPercent)
             .ToList();
 
@@ -529,7 +538,9 @@ public sealed record OptimizationRequest(
     // S67：可插拔搜尋演算法。預設 Grid 維持向後相容（舊 client / 未升級 form 不送這欄就走網格）。
     SearchMethod SearchMethod = SearchMethod.Grid,
     // Random 模式必填（取樣次數）；Grid 模式忽略。LabEndpoints.ValidateRequest 把關必填條件。
-    int? RandomBudget = null);
+    int? RandomBudget = null,
+    // S77 P0-2: Top N 排行榜排序維度（預設 Sharpe — 量化界通用，取代既有寫死 P/DD）
+    OptimizationSortBy SortBy = OptimizationSortBy.Sharpe);
 
 /// <summary>
 /// Leaderboard 套用請求 — 整包參數字典直接灌進 StrategyConfiguration.Parameters。
