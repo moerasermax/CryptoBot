@@ -88,7 +88,11 @@ public sealed class StrategyOptimizer
             }
         }).ConfigureAwait(false);
 
+        // S77 P0-1 fix: dedup by paramSet hash, 累積 TrialCount (Bayesian sampler 收斂後反覆 suggest 同 paramSet)
+        // 對齊 ClaudeDesktop 2026-05-17 bug report「每一列必須對應唯一的參數組合 / 等價組合 ×N」
         return results
+            .GroupBy(r => r.ParamSetHash())
+            .Select(g => g.First() with { TrialCount = g.Count() })
             .OrderByDescending(r => r.Report.NetPnL)
             .ToList();
     }
@@ -170,7 +174,11 @@ public sealed class StrategyOptimizer
             await strategy.DisposeAsync().ConfigureAwait(false);
         }
 
+        // S77 P0-1 fix: dedup by paramSet hash, 累積 TrialCount (Bayesian sampler 收斂後反覆 suggest 同 paramSet)
+        // 對齊 ClaudeDesktop 2026-05-17 bug report「每一列必須對應唯一的參數組合 / 等價組合 ×N」
         return results
+            .GroupBy(r => r.ParamSetHash())
+            .Select(g => g.First() with { TrialCount = g.Count() })
             .OrderByDescending(r => r.Report.NetPnL)
             .ToList();
     }

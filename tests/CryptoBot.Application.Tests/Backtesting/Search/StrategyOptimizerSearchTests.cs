@@ -37,7 +37,10 @@ public class StrategyOptimizerSearchTests
             maxDegreeOfParallelism: 1);
 
         Assert.Equal(17, calls);
-        Assert.Equal(17, runs.Count);
+        // S77 P0-1: dedup by paramSet hash 後 runs.Count 可能 < budget (RandomSearch with-replacement 偶有重複 paramSet),
+        // 但 TrialCount sum 必須對應原 trial 數
+        Assert.True(runs.Count <= 17, $"runs.Count {runs.Count} should be <= 17");
+        Assert.Equal(17, runs.Sum(r => r.TrialCount));
     }
 
     [Fact]
