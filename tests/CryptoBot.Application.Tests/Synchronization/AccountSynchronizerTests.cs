@@ -213,8 +213,10 @@ public class AccountSynchronizerTests
     // ─────────────── HandleAccountUpdate ───────────────
 
     [Fact]
-    public async Task AccountUpdate_PositionQuantityZero_ClosesLocalPosition()
+    public async Task AccountUpdate_PositionQuantityZero_NoTradeHistory_KeepsOpen()
     {
+        // S77：對齊 IM §S72 ground truth — 查無實證時保留 Open + 報錯，不結算（不假宣告獲利）。
+        // 舊行為（assertion=IsClosed=true）是 phantom close 真實根因；S77 已修。
         var market = new SyncFakeMarketDataStream();
         var exchange = new SyncFakeExchangeClient();
         var localPos = MakeOpenPosition(PositionSide.Long, qty: 1m, entry: 100m);
@@ -236,8 +238,8 @@ public class AccountSynchronizerTests
                     UnrealizedPnL: 0m, LiquidationPrice: 0m, Leverage: 1)
             }));
 
-        Assert.True(localPos.IsClosed);
-        Assert.Equal(1, uow.SaveChangesCalls);
+        // S77 fix：對齊 IM §S72 — 不假宣告平倉；保留 Open 等下次 reconcile 有實證再結算
+        Assert.False(localPos.IsClosed);
     }
 
     [Fact]
@@ -245,6 +247,7 @@ public class AccountSynchronizerTests
     {
         // S72：實證對帳紀律 — Quantity=0 時嚴禁用 MarkPrice 推算 ExitPrice（IM §S72 鐵則）。
         // 改為呼叫 GetTradeHistoryAsync 取真實成交。本測試驗證 GetMarkPrice 不被呼叫、改打 GetTradeHistory。
+        // S77 update：trade history 空時保留 Open（不結算）— 對齊 IM §S72 ground truth。
         var market = new SyncFakeMarketDataStream();
         var exchange = new SyncFakeExchangeClient { MarkPrice = Price.Create(123m) };
         var localPos = MakeOpenPosition(PositionSide.Long, qty: 1m, entry: 100m);
@@ -265,8 +268,8 @@ public class AccountSynchronizerTests
                     UnrealizedPnL: 0m, LiquidationPrice: 0m, Leverage: 1)
             }));
 
-        Assert.True(localPos.IsClosed);
-        Assert.Equal(1, exchange.GetTradeHistoryCalls);  // 走實證對帳路徑
+        Assert.False(localPos.IsClosed);                  // S77 fix：保留 Open 對齊 IM §S72
+        Assert.Equal(1, exchange.GetTradeHistoryCalls);  // 走實證對帳路徑（仍呼叫，只是查無 → 不結算）
         Assert.Equal(0, exchange.GetMarkPriceCalls);     // 嚴禁盲猜 MarkPrice
     }
 
@@ -351,10 +354,13 @@ public class AccountSynchronizerTests
     }
 
     [Fact]
-    public async Task Reconcile_OrphanWithoutEvidence_GoesToUnaccounted()
+    public async Task Reconcile_OrphanWithoutEvidence_KeepsOpen()
     {
-        // S72 §4 VCP：本地有 / 遠端不存在 + GetTradeHistoryAsync 查無實證 → 採隱式約定：
-        //   IsClosed=1、用 EntryPrice 平倉（grossPnL=0、不假宣告獲利）、廣播 [CRITICAL_SYNC]
+        // S77 fix：對齊 IM §S72 ground truth — 本地有 / 遠端不存在 + 查無實證 → 保留 Open、不結算。
+        // 舊行為（IsClosed=1 + ExitPrice=EntryPrice + RealizedPnL=0）是 phantom close root cause:
+        //   - 違反 IM §S72「『我看不到』≠『已平倉』」+「狀態變更必須以交易所 REST 實證為據」
+        //   - 配合 Position.Close PnL bug (RealizedPnL = grossPnL - TotalCommission) 會產生假宣告獲利 +Commission
+        // S77：改為保留 Open + 報 [CRITICAL_SYNC] 等下次 retry，user 端 GUI 平倉等場景由 manual 介入
         var market = new SyncFakeMarketDataStream();
         var exchange = new SyncFakeExchangeClient { MarkPrice = Price.Create(99m) };
         exchange.OpenPositions = Array.Empty<ExchangePositionInfo>();
@@ -372,13 +378,12 @@ public class AccountSynchronizerTests
             NullLogger<AccountSynchronizer>.Instance, capturingBroadcaster);
         await sut.ReconcileAsync();
 
-        Assert.True(orphan.IsClosed);
-        Assert.NotNull(orphan.ExitPrice);
-        Assert.Equal(100m, orphan.ExitPrice!.Value);     // 用 EntryPrice 確保 grossPnL=0
-        Assert.Equal(0m, orphan.RealizedPnL);            // 不假宣告獲利（commission=0、grossPnL=0）
-        Assert.Equal(0, exchange.GetMarkPriceCalls);     // 嚴禁盲猜
-        Assert.Equal(1, exchange.GetTradeHistoryCalls);
-        // [CRITICAL_SYNC] 廣播應觸發
+        Assert.False(orphan.IsClosed);                   // S77 fix：保留 Open
+        Assert.Null(orphan.ExitPrice);                   // 不設 ExitPrice（沒實證）
+        Assert.Equal(0m, orphan.RealizedPnL);            // 仍 0（未結算）
+        Assert.Equal(0, exchange.GetMarkPriceCalls);     // 嚴禁盲猜 MarkPrice
+        Assert.Equal(1, exchange.GetTradeHistoryCalls);  // 走實證對帳路徑（查無 → 不結算）
+        // [CRITICAL_SYNC] 廣播仍應觸發、提醒人工介入
         Assert.Single(capturingBroadcaster.CriticalEvents);
         Assert.Equal("PositionUnaccounted", capturingBroadcaster.CriticalEvents[0].Category);
     }

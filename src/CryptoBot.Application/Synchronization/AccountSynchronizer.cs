@@ -476,29 +476,34 @@ public sealed class AccountSynchronizer : IAccountSynchronizer
 
         if (closingTrades.Count == 0)
         {
-            // Unaccounted：實證查無 — 採隱式約定，用 EntryPrice 平倉確保 grossPnL=0、不假宣告獲利
+            // S77 fix: 對齊 IM §S72「『我看不到』≠『已平倉』」鐵則 + 「狀態變更必須以交易所 REST 實證為據」+
+            //         「查無實證時保留本地 Open + 報錯，不結算」(IM §S72 §B / §S72 預防鐵則 #1+#5)。
+            //
+            // 既有實作 `local.Close(local.EntryPrice, ...)` 是 phantom close 真實根因：
+            //   - BingX GetOpenPositions 短暫缺項（WS/REST 一致性偏差、API 漏接）
+            //     ≠ 部位真實已平倉
+            //   - GetTradeHistoryAsync 查無 closing trade ≠ 部位真實已平倉
+            //   - 用 EntryPrice 強制 close 違反 IM §S72 既有警示，
+            //     且配合 Position.Close PnL bug (commit S77) 會產生假宣告獲利 +Commission
+            //
+            // 修法：保留 Open + 廣播 critical alert + return false（不算成功處理）。
+            // 下次 reconcile tick 會 retry — BingX history 補上後就能走正常 evidenced close path。
+            // 若 user 確認 BingX 真實已平倉但 history 永遠缺項，由 user 手動 SQL 處理（IM §S72 §A 模式）。
             _logger.LogError(
                 "[CRITICAL_SYNC] {Source} Unaccounted: Position {Id} ({Symbol} {Side} qty={Qty} entry={Entry}) " +
-                "appears closed remotely but NO closing trade found in BingX history since {Since:u}. " +
-                "Closing locally with grossPnL=0 (Unaccounted convention) — manual investigation required.",
+                "appears closed remotely (GetOpenPositions 缺項) but NO closing trade found in BingX history since {Since:u}. " +
+                "Keeping Open per IM §S72 — will retry next tick. " +
+                "If persistent, manual investigation required (BingX history 漏接 or user 端 GUI 平倉未經 strategy).",
                 sourceTag, local.Id, local.Symbol, local.Side, local.Quantity.Value,
                 local.EntryPrice.Value, local.OpenedAt);
-
-            local.Close(local.EntryPrice, reason: $"{sourceTag} Unaccounted: no closing trade found");
-            await positionRepo.UpdateAsync(local, ct).ConfigureAwait(false);
-
-            if (_broadcaster is not null)
-            {
-                closedBroadcasts.Add(BuildPositionClosedPayload(local, local.EntryPrice));
-            }
 
             await BroadcastReconciliationCriticalAsync(
                 "PositionUnaccounted", local,
                 $"[{sourceTag}] No closing trade in BingX history since {local.OpenedAt:u}. " +
-                $"Closed locally with grossPnL=0 ({local.Quantity.Value} {local.Symbol.BingXFormat} {local.Side}).",
+                $"Keeping Open per IM §S72 (was previously phantom-closed with EntryPrice, fixed in S77).",
                 ct)
                 .ConfigureAwait(false);
-            return true;
+            return false;  // 不算成功處理，下次 tick 再 retry
         }
 
         // 有實證：以加權平均成交價結算

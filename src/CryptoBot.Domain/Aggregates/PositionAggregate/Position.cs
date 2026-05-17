@@ -322,7 +322,13 @@ public sealed class Position : AggregateRoot<Guid>
             : -diff * Quantity.Value;
 
         TotalCommission += closeCommission;
-        RealizedPnL = grossPnL - TotalCommission;
+        // S77 fix: TotalCommission 是 commission expense (負值，如 -44.14 = 開倉手續費 cost)。
+        // net PnL 應為 grossPnL + TotalCommission（commission 已是負、相加即扣手續費）。
+        // 既有 `grossPnL - TotalCommission` 是 phantom close 假宣告獲利 bug 的 root cause:
+        //   phantom case grossPnL=0 + TotalCommission=-44 → 0 - (-44) = +44 (反向變獲利)
+        //   真實虧損 case grossPnL=-82 + TotalCommission=-44 → -82 - (-44) = -38 (commission 反向當補貼)
+        // 對齊 IRON ⑤ 風控透明化 — RealizedPnL 必須是真實 net PnL，不可符號錯。
+        RealizedPnL = grossPnL + TotalCommission;
         IsClosed = true;
         ClosedAt = DateTime.UtcNow;
         CurrentPrice = exitPrice;
