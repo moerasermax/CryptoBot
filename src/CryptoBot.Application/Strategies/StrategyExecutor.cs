@@ -579,6 +579,68 @@ public sealed class StrategyExecutor : IStrategyExecutor
                 }
             }
         }
+        else if (!isOpenSignal && order.IsActive)
+        {
+            // S77 fix (Bug 8): Close signal Order Filled → 直接 close Position
+            //   既有設計：close 路徑交給 AccountSynchronizer.HandleAccountUpdate 偵測 remote.Quantity=0
+            //   實際問題：WS 漏接 / GetTradeHistory 拉不到 → Position 永遠 Open（user-visible bug）
+            //   修法：StrategyExecutor 送出 close Order Filled 後直接 call Position.Close()
+            //         加 belt-and-suspenders，AccountSynchronizer reconcile 仍作為 fallback
+            try
+            {
+                await Task.Delay(500, CancellationToken.None).ConfigureAwait(false);
+                await _exchange.RefreshOrderStatusAsync(order, CancellationToken.None).ConfigureAwait(false);
+                await orderRepo.UpdateAsync(order, CancellationToken.None).ConfigureAwait(false);
+
+                if (order.Status == OrderStatus.Filled && order.AverageFillPrice is not null)
+                {
+                    var openPositions = await positionRepo.GetOpenPositionsBySymbolAsync(
+                        signal.Symbol, CancellationToken.None).ConfigureAwait(false);
+                    var positionToClose = openPositions.FirstOrDefault(p =>
+                        p.Side == positionSide && !p.IsClosed);
+
+                    if (positionToClose is not null)
+                    {
+                        positionToClose.Close(
+                            exitPrice: order.AverageFillPrice,
+                            reason: $"Strategy {_strategy.Name} close signal ({signal.Reason})",
+                            closeCommission: order.Commission);
+                        await positionRepo.UpdateAsync(positionToClose, CancellationToken.None).ConfigureAwait(false);
+
+                        _logger.LogInformation(
+                            "S77 close path: Position {Id} ({Symbol} {Side}) closed at {Exit} via strategy close signal.",
+                            positionToClose.Id, signal.Symbol, positionSide, order.AverageFillPrice);
+                    }
+                    else
+                    {
+                        _logger.LogWarning(
+                            "S77 close path: Close signal Order Filled but NO matching Open Position " +
+                            "for {Symbol} {Side}. AccountSynchronizer reconcile will retry.",
+                            signal.Symbol, positionSide);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "[CRITICAL_SYNC] S77 close path FAILED for {Symbol} {Side} — " +
+                    "AccountSynchronizer reconcile (5min tick) will retry. " +
+                    "Position may remain Open until WS HandleAccountUpdate or PeriodicReconciliation succeeds.",
+                    signal.Symbol, positionSide);
+                try
+                {
+                    await _broadcaster.BroadcastStrategyEvaluationFailedAsync(new StrategyEvaluationFailedUpdate(
+                        StrategyId: _strategy.Id,
+                        StrategyName: _strategy.Name,
+                        OccurredAtUtc: DateTime.UtcNow,
+                        Symbol: signal.Symbol.BingXFormat,
+                        ErrorMessage: $"[CRITICAL_SYNC] Close path failed: {ex.Message}",
+                        TraceId: traceId),
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch { /* broadcast 失敗不擋主流程 */ }
+            }
+        }
 
         // 6) S99-S43 T4：SaveChanges 必須在 BroadcastTradeAsync 之前完成，
         //    否則 UI 收到 SignalR 事件去打 /api/dashboard/stats 時，DB 還看不到 Order/Position，
