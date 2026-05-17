@@ -203,6 +203,12 @@ public static class DependencyInjection
         services.AddScoped<IAiCredentialRepository, AiCredentialRepository>();
         services.AddScoped<IUnitOfWork, UnitOfWork>();
 
+        // S77 Bug 12: Domain event dispatcher + handlers (event-driven Position materialization)
+        services.AddScoped<CryptoBot.Application.Common.DomainEvents.IDomainEventDispatcher,
+            CryptoBot.Infrastructure.DomainEvents.DomainEventDispatcher>();
+        services.AddScoped<CryptoBot.Application.Common.DomainEvents.IDomainEventHandler<CryptoBot.Domain.Events.OrderFilledEvent>,
+            CryptoBot.Application.Trading.OrderFilledPositionMaterializer>();
+
         return services;
     }
 }

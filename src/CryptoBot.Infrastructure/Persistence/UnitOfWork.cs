@@ -1,8 +1,11 @@
+using CryptoBot.Application.Common.DomainEvents;
 using CryptoBot.Application.Common.Exceptions;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
+using CryptoBot.Domain.Common;
 using CryptoBot.Domain.Repositories;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 
@@ -19,24 +22,54 @@ public sealed class UnitOfWork : IUnitOfWork, IAsyncDisposable
 {
     private readonly AppDbContext _ctx;
     private readonly ILogger<UnitOfWork>? _logger;
+    private readonly IDomainEventDispatcher? _eventDispatcher;
     private IDbContextTransaction? _currentTx;
 
-    public UnitOfWork(AppDbContext ctx, ILogger<UnitOfWork>? logger = null)
+    public UnitOfWork(AppDbContext ctx, ILogger<UnitOfWork>? logger = null, IDomainEventDispatcher? eventDispatcher = null)
     {
         _ctx = ctx;
         _logger = logger;
+        _eventDispatcher = eventDispatcher;
     }
 
     public async Task<int> SaveChangesAsync(CancellationToken ct = default)
     {
         try
         {
-            return await _ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+            // S77 Bug 12: 收集 pending IDomainEvent before SaveChanges (after SaveChanges aggregate Id 才 stable)
+            var pendingEvents = CollectAndClearDomainEvents();
+            var result = await _ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+
+            // SaveChanges 成功後 dispatch events (避免 in-transaction 副作用 / 失敗回滾整 transaction)
+            if (_eventDispatcher is not null && pendingEvents.Count > 0)
+            {
+                await _eventDispatcher.DispatchAsync(pendingEvents, ct).ConfigureAwait(false);
+            }
+            return result;
         }
         catch (DbUpdateException ex) when (TryExtractDuplicateClientOrderId(ex, out var clientOrderId))
         {
             throw new DuplicateClientOrderIdException(clientOrderId, ex);
         }
+    }
+
+    /// <summary>
+    /// S77 Bug 12: 從 EF ChangeTracker 收集所有 AggregateRoot.DomainEvents、清空 entity 上的 list、
+    ///             回傳 events 供 dispatcher 在 SaveChanges 後 publish。
+    /// </summary>
+    private IReadOnlyList<IDomainEvent> CollectAndClearDomainEvents()
+    {
+        var aggregates = _ctx.ChangeTracker.Entries()
+            .Select(e => e.Entity)
+            .OfType<IAggregateRootWithEvents>()
+            .Where(ar => ar.DomainEvents.Count > 0)
+            .ToList();
+
+        if (aggregates.Count == 0) return Array.Empty<IDomainEvent>();
+
+        var events = aggregates.SelectMany(ar => ar.DomainEvents).ToList();
+        foreach (var ar in aggregates) ar.ClearDomainEvents();
+        return events;
     }
 
     /// <summary>
