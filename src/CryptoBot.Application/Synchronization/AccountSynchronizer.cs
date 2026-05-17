@@ -2,6 +2,7 @@ using CryptoBot.Application.Common.Interfaces;
 using CryptoBot.Application.Realtime;
 using CryptoBot.Domain.Aggregates.OrderAggregate;
 using CryptoBot.Domain.Aggregates.PositionAggregate;
+using CryptoBot.Domain.Aggregates.StrategyAggregate;
 using CryptoBot.Domain.Enums;
 using CryptoBot.Domain.Repositories;
 using CryptoBot.Domain.ValueObjects;
@@ -164,27 +165,142 @@ public sealed class AccountSynchronizer : IAccountSynchronizer
             }
         }
 
-        // S77 fix (Bug 7): remote-only Position 偵測 — BingX 有 Open Position 但 local DB 缺。
-        //   觸發場景：(a) StrategyExecutor.cs:531-557 Position materialization 失敗（Bug 3 已加 log）、
-        //              (b) user 在 BingX UI 手動開倉、(c) 跨 process / 跨 deploy session 殘留。
-        //   修法：log error + 不自動補建（自動補建會缺 StrategyId/snapshot、有 corner case 風險）。
-        //   後續：user 看 log + manual SQL INSERT（依 S77 模式）或重啟 Strategy 觸發新開倉。
-        var remoteOnlyCount = 0;
+        // S77 fix (Bug 7 + Bug 11 升級 — generic auto-rebuild):
+        //   遠端有 Open Position 但本地 DB 缺 → 從 DB Order 反查 + 自動補建 Position
+        //
+        //   觸發場景：
+        //     (a) StrategyExecutor.cs:531-557 Position materialization 失敗（catch 吞 exception 沒落地）
+        //     (b) user 在 BingX UI 手動開倉（無對應 DB Order → 不補建、僅 log）
+        //     (c) 跨 process / 跨 deploy session 殘留
+        //
+        //   修法策略（任何 symbol 通用）：
+        //     1. 找 DB 最近 Filled Open Orders（Buy+Long or Sell+Short）
+        //     2. 對齊 localOpen Position by Symbol+Side：缺則為 candidate
+        //     3. 對齊 remoteOpen confirm BingX 端真的還 Open：是則補建
+        //     4. 從 Order data 取 qty/entry/commission + Strategy data 反查 leverage/type/snapshot
+        //     5. Position.Open + AddAsync 落地
+        //   完全 generic — 任何 symbol（SOL/ETH/BTC/DOGE）皆 cover、不需 manual SQL。
+
+        // GetService (non-required) — test fake DI 可能沒註冊 IStrategyRepository、改用 defaults
+        var strategyRepo = sp.GetService<IStrategyRepository>();
+        var rebuiltCount = 0;
+        var unmatchedRemoteOnly = 0;
+
+        // 拉最近 100 筆 Order、filter Filled Open（避免回填古早歷史）
+        var recentOrders = await orderRepo.GetRecentAsync(100, ct).ConfigureAwait(false);
+        foreach (var order in recentOrders)
+        {
+            if (order.Status != OrderStatus.Filled) continue;
+            if (order.AverageFillPrice is null) continue;
+            if (order.FilledQuantity.Value <= 0m) continue;
+
+            // 判斷是否為「開倉」Order：Buy+Long 或 Sell+Short（close order: Sell+Long 或 Buy+Short）
+            var openSide = (order.Side, order.PositionSide) switch
+            {
+                (OrderSide.Buy, PositionSide.Long) => (PositionSide?)PositionSide.Long,
+                (OrderSide.Sell, PositionSide.Short) => PositionSide.Short,
+                _ => null,
+            };
+            if (openSide is null) continue;
+
+            // 已有對應 local Position → skip
+            var matchedLocal = localOpen.FirstOrDefault(p =>
+                p.Symbol.Equals(order.Symbol) && p.Side == openSide.Value);
+            if (matchedLocal is not null) continue;
+
+            // BingX remote 仍 Open（否則應走 close path、跳過避免補建已平倉的 Position）
+            var matchedRemote = remoteOpen.FirstOrDefault(r =>
+                r.Symbol.Equals(order.Symbol) &&
+                r.Side == openSide.Value &&
+                r.Quantity > 0m);
+            if (matchedRemote is null) continue;
+
+            // 從 Strategy 反查 leverage / strategyType / parametersSnapshot
+            Strategy? strategy = null;
+            Leverage leverage = Leverage.Conservative;
+            string? strategyType = null;
+            if (order.StrategyId.HasValue && strategyRepo is not null)
+            {
+                try
+                {
+                    strategy = await strategyRepo.GetByIdAsync(order.StrategyId.Value, ct).ConfigureAwait(false);
+                    if (strategy is not null)
+                    {
+                        leverage = strategy.Configuration.Leverage;
+                        strategyType = strategy.StrategyType;
+                    }
+                }
+                catch (Exception sEx)
+                {
+                    _logger.LogWarning(sEx,
+                        "[RECONCILE_REBUILD] Failed to resolve Strategy {StrategyId} for Order {Cid}; using defaults.",
+                        order.StrategyId.Value, order.ClientOrderId);
+                }
+            }
+
+            try
+            {
+                var newPosition = Position.Open(
+                    symbol: order.Symbol,
+                    side: openSide.Value,
+                    quantity: order.FilledQuantity,
+                    entryPrice: order.AverageFillPrice,
+                    leverage: leverage,
+                    marginMode: MarginMode.Isolated,
+                    stopLossPrice: null,
+                    takeProfitPrice: null,
+                    strategyId: order.StrategyId,
+                    strategyType: strategyType,
+                    parametersSnapshot: null);  // S77: snapshot 留 null（reconcile-rebuilt mark）
+                newPosition.AddCommission(order.Commission);
+
+                await positionRepo.AddAsync(newPosition, ct).ConfigureAwait(false);
+                rebuiltCount++;
+
+                _logger.LogWarning(
+                    "[RECONCILE_REBUILD] Auto-rebuilt missing Position from Filled Order: " +
+                    "{Symbol} {Side} qty={Qty} entry={Entry} (Order {Cid}). " +
+                    "Root cause: StrategyExecutor Position materialization failed (check earlier logs).",
+                    order.Symbol, openSide.Value, order.FilledQuantity.Value,
+                    order.AverageFillPrice.Value, order.ClientOrderId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "[CRITICAL_SYNC] Auto-rebuild from Order {Cid} FAILED — manual SQL INSERT may be needed.",
+                    order.ClientOrderId);
+            }
+        }
+
+        // BingX remote Open 但 DB Order 也沒（user 手動 BingX UI 開倉）— 不自動補建（缺 Order data 反查）
         foreach (var remote in remoteOpen.Where(r => r.Quantity > 0m))
         {
             var matched = localOpen.Any(l =>
-                l.Symbol.Equals(remote.Symbol) &&
-                l.Side == remote.Side &&
-                !l.IsClosed);
+                l.Symbol.Equals(remote.Symbol) && l.Side == remote.Side && !l.IsClosed);
             if (matched) continue;
 
-            remoteOnlyCount++;
+            // 檢查是否剛 rebuilt 過（避免重複 log）
+            var matchedRecent = recentOrders.Any(o =>
+                o.Status == OrderStatus.Filled &&
+                o.Symbol.Equals(remote.Symbol) &&
+                o.PositionSide == remote.Side &&
+                ((o.Side == OrderSide.Buy && remote.Side == PositionSide.Long) ||
+                 (o.Side == OrderSide.Sell && remote.Side == PositionSide.Short)));
+            if (matchedRecent) continue;
+
+            unmatchedRemoteOnly++;
             _logger.LogError(
-                "[CRITICAL_SYNC] Reconcile: Remote-only Position detected — " +
-                "{Symbol} {Side} qty={Qty} entry={Entry} (BingX Open, DB MISSING). " +
-                "Likely cause: Position materialization failed (StrategyExecutor.cs:531-557) " +
-                "or user opened manually outside system. Manual SQL INSERT may be needed.",
+                "[CRITICAL_SYNC] Reconcile: Remote-only Position with NO DB Order — " +
+                "{Symbol} {Side} qty={Qty} entry={Entry} (likely user manual BingX UI open). " +
+                "Manual SQL INSERT required (auto-rebuild skipped: no Order data to reference).",
                 remote.Symbol, remote.Side, remote.Quantity, remote.EntryPrice);
+        }
+
+        if (rebuiltCount > 0)
+        {
+            _logger.LogInformation(
+                "[RECONCILE_REBUILD] Auto-rebuilt {Count} missing Position(s) from Filled Orders.",
+                rebuiltCount);
         }
 
         await uow.SaveChangesAsync(ct).ConfigureAwait(false);
