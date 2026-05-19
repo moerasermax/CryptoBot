@@ -22,6 +22,7 @@ namespace CryptoBot.ConsoleApp.Services;
 ///   --symbol &lt;BASE-QUOTE&gt;        交易對（預設 BTC-USDT）
 ///   --interval &lt;1m|15m|1h|4h|1d&gt;  K 線週期（預設 1h）
 ///   --params Key=Val,Key=Val,...   策略參數（注入 StrategyConfiguration.Parameters）
+///   --lookback-days &lt;N&gt;          資料窗回看天數（預設 30；CAP-004 hotfix）
 /// 未帶任何 args → 沿用原 SmaCrossover 20/50 預設行為（向後相容）。
 ///
 /// 兩條路徑共用：<see cref="IHistoricalDataProvider"/> 下載 + <see cref="IHistoricalKlineStore"/> SQLite 快取。
@@ -48,9 +49,10 @@ public static class BacktestRunner
         var interval = ParseIntervalArg(args) ?? DefaultInterval;
         var strategyType = ParseStrategyArg(args, rootServices) ?? DefaultStrategyType;
         var overrideParams = ParseParamsArg(args);
+        var lookbackDays = ParseLookbackDaysArg(args) ?? LookbackDays;
 
         // 1) 先確保資料在 SQLite（單執行緒，避免下載期間撞 rate limit）
-        var (start, end) = await EnsureHistoricalDataAsync(rootServices, symbol, interval, ct).ConfigureAwait(false);
+        var (start, end) = await EnsureHistoricalDataAsync(rootServices, symbol, interval, lookbackDays, ct).ConfigureAwait(false);
 
         // 2) 分支
         return optimize
@@ -157,22 +159,36 @@ public static class BacktestRunner
         return map.Count == 0 ? null : map;
     }
 
+    /// <summary>
+    /// CAP-004：解析 <c>--lookback-days &lt;N&gt;</c>。沒帶 → null（呼叫端 fallback <see cref="LookbackDays"/>）；
+    /// 非正整數 → throw。
+    /// </summary>
+    private static int? ParseLookbackDaysArg(string[] args)
+    {
+        var raw = GetArgValue(args, "--lookback-days");
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        if (!int.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n)
+            || n <= 0)
+            throw new ArgumentException($"Invalid --lookback-days '{raw}': expected positive integer.");
+        return n;
+    }
+
     // ================================================================
     // 下載階段
     // ================================================================
     private static async Task<(DateTime start, DateTime end)> EnsureHistoricalDataAsync(
-        IServiceProvider rootServices, Symbol symbol, KlineInterval interval, CancellationToken ct)
+        IServiceProvider rootServices, Symbol symbol, KlineInterval interval, int lookbackDays, CancellationToken ct)
     {
         using var scope = rootServices.CreateScope();
         var provider = scope.ServiceProvider.GetRequiredService<IHistoricalDataProvider>();
         var store = scope.ServiceProvider.GetRequiredService<IHistoricalKlineStore>();
 
         var end = DateTime.UtcNow;
-        var start = end.AddDays(-LookbackDays);
+        var start = end.AddDays(-lookbackDays);
 
         Console.WriteLine();
         Console.WriteLine("=====================================================");
-        Console.WriteLine($"  CryptoBot Backtest — {symbol.BingXFormat} {interval}, last {LookbackDays} days");
+        Console.WriteLine($"  CryptoBot Backtest — {symbol.BingXFormat} {interval}, last {lookbackDays} days");
         Console.WriteLine($"  range: {start:yyyy-MM-dd HH:mm} → {end:yyyy-MM-dd HH:mm} UTC");
         Console.WriteLine("=====================================================");
 
