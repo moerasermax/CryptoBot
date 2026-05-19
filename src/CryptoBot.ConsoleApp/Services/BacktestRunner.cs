@@ -385,8 +385,25 @@ public static class BacktestRunner
         Console.WriteLine($"  Peak equity      (USDT) : {report.PeakEquity,14:N4}");
         Console.WriteLine($"  Max drawdown            : {report.MaxDrawdownPercent,13:N2} %");
         Console.WriteLine($"  Sharpe ratio (annualized): {report.SharpeRatio,13:N4}");
+        Console.WriteLine();
+        Console.WriteLine("  --- Per-Regime Breakdown ---");
+        PrintRegimeLine("Bull ", report.BullStats);
+        PrintRegimeLine("Range", report.RangeStats);
+        PrintRegimeLine("Bear ", report.BearStats);
+        Console.WriteLine("  -----------------------------");
         Console.WriteLine("=====================================================");
         Console.WriteLine();
+    }
+
+    private static void PrintRegimeLine(string label, RegimeBreakdown? stats)
+    {
+        if (stats is null)
+        {
+            Console.WriteLine($"  {label}  : (n/a)");
+            return;
+        }
+        Console.WriteLine(
+            $"  {label}  : Fills={stats.Fills,3} / Return={stats.Return,6:+0.00;-0.00;0.00}% / MaxDD={stats.MaxDrawdown,5:0.00}% / Sharpe={stats.SharpeRatio,7:+0.0000;-0.0000;0.0000}");
     }
 
     private static void PrintLeaderboard(IReadOnlyList<OptimizationRun> runs)

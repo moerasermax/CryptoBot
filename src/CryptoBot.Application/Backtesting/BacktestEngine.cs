@@ -37,6 +37,15 @@ public sealed class BacktestEngine
     private readonly IStrategy _strategy;
     private readonly ILogger<BacktestEngine> _logger;
 
+    // CAP-008：regime tracking instance state（每次 RunAsync 起始重置；BacktestEngine 為單次跑、
+    // RunOptimizationAsync 並行用獨立 instance scope、無 thread-safety 顧慮）。
+    private readonly RegimeClassifier _regimeClassifier = new();
+    private readonly List<Kline> _regimeWindow = new();
+    private readonly Dictionary<Guid, MarketRegime> _entryRegime = new();
+    private Dictionary<MarketRegime, RegimeAccumulator> _regimeStats = new();
+    private MarketRegime _currentRegime = MarketRegime.Range;
+    private decimal _initialBalanceForRegime;
+
     public BacktestEngine(
         IHistoricalKlineStore store,
         IBacktestClock clock,
@@ -65,6 +74,18 @@ public sealed class BacktestEngine
             options.Symbol, options.Interval, options.StartTime, options.EndTime, windowSize);
 
         var startingBalance = await _exchange.GetFuturesBalanceAsync("USDT", ct).ConfigureAwait(false);
+
+        // CAP-008: 重置 regime tracking state（每次跑獨立）
+        _regimeWindow.Clear();
+        _entryRegime.Clear();
+        _regimeStats = new Dictionary<MarketRegime, RegimeAccumulator>
+        {
+            [MarketRegime.Bull] = new(),
+            [MarketRegime.Range] = new(),
+            [MarketRegime.Bear] = new()
+        };
+        _currentRegime = MarketRegime.Range;
+        _initialBalanceForRegime = options.InitialBalance;
 
         var window = new LinkedList<Kline>();
         var fills = new List<Order>();
@@ -104,6 +125,13 @@ public sealed class BacktestEngine
             window.AddLast(kline);
             while (window.Count > windowSize) window.RemoveFirst();
             _clock.AdvanceTo(kline);
+
+            // CAP-008: regime classifier 需要遠大於 strategy window 的歷史視窗（默認 480 bars = 20 days × 1h）。
+            // 維護獨立 regimeWindow、容差 100 不頻繁 GC slice。
+            _regimeWindow.Add(kline);
+            if (_regimeWindow.Count > RegimeClassifier.MaLookbackBars + 100)
+                _regimeWindow.RemoveRange(0, _regimeWindow.Count - RegimeClassifier.MaLookbackBars);
+            _currentRegime = _regimeClassifier.Classify(_regimeWindow);
 
             // 讓每根 K 線都先把當前價餵給 open positions — 觸發止損/止盈時自動產生 Close 訊號
             TickOpenPositions(kline, openPositions, closedPositions, strategyId, options);
@@ -180,7 +208,11 @@ public sealed class BacktestEngine
             LastKlineTime: lastTime,
             Fills: fills,
             EquityCurve: equityCurve,
-            IsLiquidated: isLiquidated);
+            IsLiquidated: isLiquidated,
+            // CAP-008: per-regime breakdown
+            BullStats: _regimeStats[MarketRegime.Bull].ToBreakdown(_initialBalanceForRegime),
+            RangeStats: _regimeStats[MarketRegime.Range].ToBreakdown(_initialBalanceForRegime),
+            BearStats: _regimeStats[MarketRegime.Bear].ToBreakdown(_initialBalanceForRegime));
 
         _logger.LogInformation(
             "✅ [BACKTEST] Done. klines={N} signals={S} fills={F} openLeft={Open} closed={Closed} bal {From:F2} → {To:F2} ({Pct:F2}%) maxDD={DD:F2}%",
@@ -286,6 +318,9 @@ public sealed class BacktestEngine
                     strategyId: strategyId);
                 position.AddCommission(order.Commission);
                 openPositions.Add(position);
+                // CAP-008: stamp entry regime + bump per-regime Fills
+                _entryRegime[position.Id] = _currentRegime;
+                _regimeStats[_currentRegime].Fills++;
                 _logger.LogInformation(
                     "📈 [BACKTEST-OPEN] {Side} {Qty} {Symbol} @ {Price} SL={SL} TP={TP}",
                     positionSide, qty.Value, signal.Symbol.BingXFormat, fillPrice.Value,
@@ -300,6 +335,7 @@ public sealed class BacktestEngine
                 openPositions.Remove(closingPosition);
                 closedPositions.Add(closingPosition);
                 _clock.ApplyRealizedPnL(closingPosition.RealizedPnL);
+                UpdateRegimeOnClose(closingPosition);  // CAP-008
                 _logger.LogInformation(
                     "📉 [BACKTEST-CLOSE] {Side} {Qty} {Symbol} @ {Price} pnl={PnL:F4}",
                     positionSide, qty.Value, signal.Symbol.BingXFormat, fillPrice.Value, closingPosition.RealizedPnL);
@@ -344,6 +380,7 @@ public sealed class BacktestEngine
             openPositions.Remove(p);
             closedPositions.Add(p);
             _clock.ApplyRealizedPnL(p.RealizedPnL);
+            UpdateRegimeOnClose(p);  // CAP-008
             _logger.LogInformation(
                 "🛑 [BACKTEST-SLTP] {Side} {Qty} {Symbol} @ {Price} pnl={PnL:F4} ({Reason})",
                 p.Side, p.Quantity.Value, p.Symbol.BingXFormat, snapshotPrice.Value, p.RealizedPnL,
@@ -369,4 +406,58 @@ public sealed class BacktestEngine
             SignalType.CloseShort => (OrderSide.Buy,  PositionSide.Short),
             _ => throw new InvalidOperationException($"Unexpected signal type {type} at order mapping stage."),
         };
+
+    /// <summary>
+    /// CAP-008：平倉時依「進場 regime」累積 RealizedPnL / TradeReturn / drawdown
+    /// 到對應 regime tracker。trade 計入「進場時 regime」是設計選擇（CAP-008 §4.3）。
+    /// </summary>
+    private void UpdateRegimeOnClose(Position closed)
+    {
+        if (!_entryRegime.TryGetValue(closed.Id, out var entryReg)) return;
+        var acc = _regimeStats[entryReg];
+        acc.RealizedPnL += closed.RealizedPnL;
+        var tradeReturnPct = _initialBalanceForRegime == 0m
+            ? 0m
+            : closed.RealizedPnL / _initialBalanceForRegime * 100m;
+        acc.TradeReturns.Add(tradeReturnPct);
+        if (acc.RealizedPnL > acc.RunningPeak) acc.RunningPeak = acc.RealizedPnL;
+        var ddAbs = acc.RunningPeak - acc.RealizedPnL;
+        var ddPct = _initialBalanceForRegime == 0m ? 0m : ddAbs / _initialBalanceForRegime * 100m;
+        if (ddPct > acc.MaxDrawdownPct) acc.MaxDrawdownPct = ddPct;
+        _entryRegime.Remove(closed.Id);
+    }
+
+    /// <summary>
+    /// CAP-008：per-regime accumulator — 累積 trade 數 / RealizedPnL / drawdown / returns 序列。
+    /// 平倉時更新（依「進場時 regime」累積、不依平倉時 regime — 一致性簡化）。
+    /// </summary>
+    private sealed class RegimeAccumulator
+    {
+        public int Fills { get; set; }
+        public decimal RealizedPnL { get; set; }
+        public decimal RunningPeak { get; set; }
+        public decimal MaxDrawdownPct { get; set; }
+        public List<decimal> TradeReturns { get; } = new();
+
+        public RegimeBreakdown ToBreakdown(decimal initialBalance)
+        {
+            var returnPct = initialBalance == 0m ? 0m : decimal.Round(RealizedPnL / initialBalance * 100m, 2);
+            decimal sharpe = 0m;
+            if (TradeReturns.Count >= 2)
+            {
+                decimal sum = 0m;
+                foreach (var r in TradeReturns) sum += r;
+                var mean = sum / TradeReturns.Count;
+                decimal sumSq = 0m;
+                foreach (var r in TradeReturns) { var d = r - mean; sumSq += d * d; }
+                var variance = sumSq / (TradeReturns.Count - 1);
+                if (variance > 0m)
+                {
+                    var stdDev = (decimal)Math.Sqrt((double)variance);
+                    sharpe = decimal.Round((mean / stdDev) * (decimal)Math.Sqrt(TradeReturns.Count), 4);
+                }
+            }
+            return new RegimeBreakdown(Fills, returnPct, decimal.Round(MaxDrawdownPct, 2), sharpe);
+        }
+    }
 }

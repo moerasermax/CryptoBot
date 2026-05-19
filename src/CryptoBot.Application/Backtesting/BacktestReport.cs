@@ -9,6 +9,17 @@ namespace CryptoBot.Application.Backtesting;
 /// 由 BacktestEngine 依期望 K 線數動態下採樣至 ≤ <see cref="Backtesting.BacktestEngine.MaxEquityPoints"/> 點，
 /// 避免長週期回測記憶體爆炸。
 /// </summary>
+/// <summary>
+/// CAP-008：per-regime stats — Fills / Return % / MaxDrawdown % / Sharpe。
+/// 三段（Bull / Range / Bear）由 <see cref="Backtesting.RegimeClassifier"/> 在 K 線跑過程中
+/// 累積、由 <c>BacktestEngine</c> 在進場時 stamp regime 並於平倉時計入該 regime tracker。
+/// </summary>
+public sealed record RegimeBreakdown(
+    int Fills,
+    decimal Return,           // %
+    decimal MaxDrawdown,      // %
+    decimal SharpeRatio);
+
 public sealed record BacktestReport(
     int TotalKlines,
     int SignalsTriggered,
@@ -21,7 +32,10 @@ public sealed record BacktestReport(
     DateTime? LastKlineTime,
     IReadOnlyList<Order> Fills,
     IReadOnlyList<EquityPoint> EquityCurve,
-    bool IsLiquidated = false)
+    bool IsLiquidated = false,
+    RegimeBreakdown? BullStats = null,
+    RegimeBreakdown? RangeStats = null,
+    RegimeBreakdown? BearStats = null)
 {
     public decimal NetPnL => EndingBalance - StartingBalance;
 
