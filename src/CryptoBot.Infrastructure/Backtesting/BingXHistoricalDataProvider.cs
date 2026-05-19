@@ -102,6 +102,13 @@ public sealed class BingXHistoricalDataProvider : IHistoricalDataProvider
     /// 網路錯誤（<see cref="HttpRequestException"/> / <see cref="SocketException"/>）、
     /// 以及非 caller-cancel 的 <see cref="TaskCanceledException"/>（SDK 內部逾時）皆會重試。
     /// 其他例外（程式錯誤、Domain 驗證）直接往上拋。
+    ///
+    /// CAP-006：每 batch 自己的 endTime = startTime + step × BatchLimit（截到 totalEnd 邊界）。
+    /// BingX REST <c>/openApi/swap/v3/quote/klines</c> 對 (startTime, endTime, limit) 同傳時返回
+    /// endTime 前最近 limit 根；若直接傳整個 lookback 的 end、第 1 batch 即拿到 [end-limit*step, end]
+    /// 約 42 天（1h × 1000）、cursor 推進到 end+step > end → paginate while 第 2 圈終止、永遠只跑 1 batch。
+    /// 設 batch 自己的 endTime 強制 batch 範圍 = [cursor, cursor + limit*step]、多輪 paginate
+    /// 推進直至覆蓋整個 [start, end]。
     /// </summary>
     private async Task<IReadOnlyList<Kline>> FetchBatchWithRetryAsync(
         Symbol symbol,
@@ -112,6 +119,10 @@ public sealed class BingXHistoricalDataProvider : IHistoricalDataProvider
         CancellationToken ct)
     {
         var backoff = InitialBackoff;
+
+        var step = interval.ToTimeSpan();
+        var batchEnd = cursor + step * BatchLimit;
+        if (batchEnd > end) batchEnd = end;
 
         for (var attempt = 1; attempt <= MaxAttempts; attempt++)
         {
@@ -124,7 +135,7 @@ public sealed class BingXHistoricalDataProvider : IHistoricalDataProvider
                     interval,
                     limit: BatchLimit,
                     startTime: cursor,
-                    endTime: end,
+                    endTime: batchEnd,
                     ct: ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (IsTransient(ex) && !ct.IsCancellationRequested)
