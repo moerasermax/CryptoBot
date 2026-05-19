@@ -1,6 +1,5 @@
 using CryptoBot.Application.Backtesting;
 using CryptoBot.Application.Strategies;
-using CryptoBot.Application.Strategies.SmaCrossover;
 using CryptoBot.Domain.Aggregates.MarketDataAggregate;
 using CryptoBot.Domain.Aggregates.StrategyAggregate;
 using CryptoBot.Domain.Enums;
@@ -12,19 +11,27 @@ using Microsoft.Extensions.Logging;
 namespace CryptoBot.ConsoleApp.Services;
 
 /// <summary>
-/// CLI 入口：<c>dotnet run -- backtest</c> 及其變體（<c>--optimize</c>）的一次性流程。
+/// CLI 入口：<c>dotnet run -- backtest</c> 及其變體的一次性流程。
 ///
 /// 子路徑：
-///   - 單次回測（預設）：下載 7d BTC-USDT 15m → SMA20/50 → 印單份報告
+///   - 單次回測（預設）：下載 30d 資料 → 指定策略跑一次 → 印單份報告（含 Sharpe）
 ///   - 參數優化（<c>--optimize</c>）：展開 FastSma × SlowSma 笛卡兒積，Parallel.ForEachAsync 掃完後印排行榜
+///
+/// CAP-003 Phase 0a — 支援 CLI args：
+///   --strategy &lt;type&gt;            策略類型字串（不分大小寫、允許 dash，如 trend-following ↔ TrendFollowing）
+///   --symbol &lt;BASE-QUOTE&gt;        交易對（預設 BTC-USDT）
+///   --interval &lt;1m|15m|1h|4h|1d&gt;  K 線週期（預設 1h）
+///   --params Key=Val,Key=Val,...   策略參數（注入 StrategyConfiguration.Parameters）
+/// 未帶任何 args → 沿用原 SmaCrossover 20/50 預設行為（向後相容）。
 ///
 /// 兩條路徑共用：<see cref="IHistoricalDataProvider"/> 下載 + <see cref="IHistoricalKlineStore"/> SQLite 快取。
 /// 多執行緒時每個 worker 自己 CreateScope 拿到獨立 <c>AppDbContext</c>。
 /// </summary>
 public static class BacktestRunner
 {
-    private static readonly Symbol BtcUsdt = Symbol.Parse("BTC-USDT");
+    private static readonly Symbol DefaultSymbol = Symbol.Parse("BTC-USDT");
     private const KlineInterval DefaultInterval = KlineInterval.OneHour;
+    private const string DefaultStrategyType = "SmaCrossover";
     private const int LookbackDays = 30;
     private const int DefaultWarmupBars = 120; // 蓋過最長 SlowSma=100 +餘裕
     private const decimal InitialBalance = 10_000m;
@@ -36,20 +43,125 @@ public static class BacktestRunner
     {
         var optimize = args.Any(a => string.Equals(a, "--optimize", StringComparison.OrdinalIgnoreCase));
 
-        // 1) 先確保 7 天 BTC-USDT 15m 資料在 SQLite（單執行緒，避免下載期間撞 rate limit）
-        var (start, end) = await EnsureHistoricalDataAsync(rootServices, ct).ConfigureAwait(false);
+        // CAP-003 Phase 0a：解析 CLI args
+        var symbol = ParseSymbolArg(args) ?? DefaultSymbol;
+        var interval = ParseIntervalArg(args) ?? DefaultInterval;
+        var strategyType = ParseStrategyArg(args, rootServices) ?? DefaultStrategyType;
+        var overrideParams = ParseParamsArg(args);
+
+        // 1) 先確保資料在 SQLite（單執行緒，避免下載期間撞 rate limit）
+        var (start, end) = await EnsureHistoricalDataAsync(rootServices, symbol, interval, ct).ConfigureAwait(false);
 
         // 2) 分支
         return optimize
-            ? await RunOptimizationAsync(rootServices, start, end, ct).ConfigureAwait(false)
-            : await RunSingleAsync(rootServices, start, end, ct).ConfigureAwait(false);
+            ? await RunOptimizationAsync(rootServices, symbol, interval, start, end, ct).ConfigureAwait(false)
+            : await RunSingleAsync(rootServices, symbol, interval, strategyType, overrideParams, start, end, ct).ConfigureAwait(false);
+    }
+
+    // ================================================================
+    // Args 解析（CAP-003 Phase 0a）
+    // ================================================================
+
+    /// <summary>取 <c>--&lt;name&gt; &lt;value&gt;</c> 形式的下一個 token，沒帶或在結尾則回 null。</summary>
+    private static string? GetArgValue(string[] args, string name)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
+                return args[i + 1];
+        }
+        return null;
+    }
+
+    private static Symbol? ParseSymbolArg(string[] args)
+    {
+        var raw = GetArgValue(args, "--symbol");
+        return string.IsNullOrWhiteSpace(raw) ? null : Symbol.Parse(raw);
+    }
+
+    private static KlineInterval? ParseIntervalArg(string[] args)
+    {
+        var raw = GetArgValue(args, "--interval");
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "1m" => KlineInterval.OneMinute,
+            "3m" => KlineInterval.ThreeMinutes,
+            "5m" => KlineInterval.FiveMinutes,
+            "15m" => KlineInterval.FifteenMinutes,
+            "30m" => KlineInterval.ThirtyMinutes,
+            "1h" => KlineInterval.OneHour,
+            "2h" => KlineInterval.TwoHours,
+            "4h" => KlineInterval.FourHours,
+            "8h" => KlineInterval.EightHours,
+            "12h" => KlineInterval.TwelveHours,
+            "1d" => KlineInterval.OneDay,
+            _ => throw new ArgumentException(
+                $"Unknown --interval '{raw}'. Supported: 1m / 3m / 5m / 15m / 30m / 1h / 2h / 4h / 8h / 12h / 1d.")
+        };
+    }
+
+    /// <summary>
+    /// 解析 <c>--strategy</c>：先 case-insensitive 完整比對 KnownTypes；不中再 normalize（移 dash + ToLower）後比對。
+    /// 既不阻擋 PascalCase（"TrendFollowing"），也容忍 kebab-case（"trend-following"）。
+    /// </summary>
+    private static string? ParseStrategyArg(string[] args, IServiceProvider rootServices)
+    {
+        var raw = GetArgValue(args, "--strategy");
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+
+        using var scope = rootServices.CreateScope();
+        var factory = scope.ServiceProvider.GetRequiredService<IStrategyFactory>();
+        var known = factory.KnownTypes;
+
+        // Pass 1: 大小寫不敏感完全匹配
+        foreach (var k in known)
+        {
+            if (string.Equals(k, raw, StringComparison.OrdinalIgnoreCase))
+                return k;
+        }
+
+        // Pass 2: 移除 dash 後不分大小寫匹配（trend-following → TrendFollowing）
+        var normalized = raw.Replace("-", "", StringComparison.Ordinal).Replace("_", "", StringComparison.Ordinal);
+        foreach (var k in known)
+        {
+            if (string.Equals(k, normalized, StringComparison.OrdinalIgnoreCase))
+                return k;
+        }
+
+        throw new ArgumentException(
+            $"Unknown --strategy '{raw}'. Known: [{string.Join(", ", known)}].");
+    }
+
+    /// <summary>
+    /// 解析 <c>--params "FastEmaPeriod=7,SlowEmaPeriod=45,RsiPeriod=17,RsiMidline=45"</c>。
+    /// 值以 InvariantCulture 解析為 decimal — 避免 zh-TW locale 把 "." 當千位分隔。
+    /// </summary>
+    private static IReadOnlyDictionary<string, decimal>? ParseParamsArg(string[] args)
+    {
+        var raw = GetArgValue(args, "--params");
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+
+        var map = new Dictionary<string, decimal>(StringComparer.Ordinal);
+        foreach (var pair in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var eq = pair.IndexOf('=');
+            if (eq <= 0 || eq == pair.Length - 1)
+                throw new ArgumentException($"Bad --params entry '{pair}'. Expect 'Key=Value'.");
+            var key = pair[..eq].Trim();
+            var valStr = pair[(eq + 1)..].Trim();
+            if (!decimal.TryParse(valStr, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var val))
+                throw new ArgumentException($"Bad --params value for '{key}': '{valStr}' not a decimal.");
+            map[key] = val;
+        }
+        return map.Count == 0 ? null : map;
     }
 
     // ================================================================
     // 下載階段
     // ================================================================
     private static async Task<(DateTime start, DateTime end)> EnsureHistoricalDataAsync(
-        IServiceProvider rootServices, CancellationToken ct)
+        IServiceProvider rootServices, Symbol symbol, KlineInterval interval, CancellationToken ct)
     {
         using var scope = rootServices.CreateScope();
         var provider = scope.ServiceProvider.GetRequiredService<IHistoricalDataProvider>();
@@ -60,19 +172,19 @@ public static class BacktestRunner
 
         Console.WriteLine();
         Console.WriteLine("=====================================================");
-        Console.WriteLine($"  CryptoBot Backtest — BTC-USDT {DefaultInterval}, last {LookbackDays} days");
+        Console.WriteLine($"  CryptoBot Backtest — {symbol.BingXFormat} {interval}, last {LookbackDays} days");
         Console.WriteLine($"  range: {start:yyyy-MM-dd HH:mm} → {end:yyyy-MM-dd HH:mm} UTC");
         Console.WriteLine("=====================================================");
 
         var totalDownloaded = 0;
-        await foreach (var batch in provider.DownloadAsync(BtcUsdt, DefaultInterval, start, end, ct).ConfigureAwait(false))
+        await foreach (var batch in provider.DownloadAsync(symbol, interval, start, end, ct).ConfigureAwait(false))
         {
-            await store.UpsertAsync(BtcUsdt, DefaultInterval, batch, ct).ConfigureAwait(false);
+            await store.UpsertAsync(symbol, interval, batch, ct).ConfigureAwait(false);
             totalDownloaded += batch.Count;
         }
         Console.WriteLine($"📥 Downloaded + stored {totalDownloaded} klines.");
 
-        var storedCount = await store.CountRangeAsync(BtcUsdt, DefaultInterval, start, end, ct).ConfigureAwait(false);
+        var storedCount = await store.CountRangeAsync(symbol, interval, start, end, ct).ConfigureAwait(false);
         Console.WriteLine($"💾 SQLite store now contains {storedCount} klines in range.");
 
         return (start, end);
@@ -82,23 +194,37 @@ public static class BacktestRunner
     // 單次回測
     // ================================================================
     private static async Task<int> RunSingleAsync(
-        IServiceProvider rootServices, DateTime start, DateTime end, CancellationToken ct)
+        IServiceProvider rootServices,
+        Symbol symbol,
+        KlineInterval interval,
+        string strategyType,
+        IReadOnlyDictionary<string, decimal>? overrideParams,
+        DateTime start, DateTime end, CancellationToken ct)
     {
-        var options = BuildOptions(start, end, DefaultWarmupBars);
-        var config = BuildConfig(fastPeriod: 20, slowPeriod: 50, warmupBars: DefaultWarmupBars);
+        var options = BuildOptions(symbol, interval, start, end, DefaultWarmupBars);
+        var parameters = overrideParams ?? DefaultSmaParameters();
+        var config = BuildConfigFromParameters(symbol, interval, parameters, DefaultWarmupBars);
 
         using var scope = rootServices.CreateScope();
-        var report = await RunOnceAsync(scope.ServiceProvider, options, config, ct).ConfigureAwait(false);
+        var factory = scope.ServiceProvider.GetRequiredService<IStrategyFactory>();
+        var strategy = factory.Get(strategyType);
+
+        Console.WriteLine($"  Strategy                : {strategyType}");
+        Console.WriteLine($"  Parameters              : {{ {string.Join(", ", parameters.Select(p => $"{p.Key}={p.Value:N4}"))} }}");
+
+        var report = await RunOnceAsync(scope.ServiceProvider, options, config, strategy, ct).ConfigureAwait(false);
 
         PrintReport(report);
         return 0;
     }
 
     // ================================================================
-    // 參數優化
+    // 參數優化（SmaCrossover 笛卡兒積 — 目前 optimize 路徑仍特定於 SMA；
+    //          symbol/interval 已可由 --symbol/--interval 覆寫）
     // ================================================================
     private static async Task<int> RunOptimizationAsync(
-        IServiceProvider rootServices, DateTime start, DateTime end, CancellationToken ct)
+        IServiceProvider rootServices, Symbol symbol, KlineInterval interval,
+        DateTime start, DateTime end, CancellationToken ct)
     {
         var loggerFactory = rootServices.GetRequiredService<ILoggerFactory>();
         var optimizer = new StrategyOptimizer(loggerFactory.CreateLogger<StrategyOptimizer>());
@@ -132,12 +258,18 @@ public static class BacktestRunner
                         EquityCurve: Array.Empty<EquityPoint>());
                 }
 
-                var options = BuildOptions(start, end, DefaultWarmupBars);
-                var config = BuildConfig(fast, slow, DefaultWarmupBars);
+                var options = BuildOptions(symbol, interval, start, end, DefaultWarmupBars);
+                var config = BuildConfigFromParameters(symbol, interval, new Dictionary<string, decimal>
+                {
+                    ["FastSmaPeriod"] = fast,
+                    ["SlowSmaPeriod"] = slow,
+                }, DefaultWarmupBars);
 
                 // 關鍵：每組參數都開自己的 DI scope，才能各自拿到乾淨的 AppDbContext / Store
                 using var scope = rootServices.CreateScope();
-                return await RunOnceAsync(scope.ServiceProvider, options, config, token).ConfigureAwait(false);
+                var factory = scope.ServiceProvider.GetRequiredService<IStrategyFactory>();
+                var strategy = factory.Get(DefaultStrategyType); // SmaCrossover
+                return await RunOnceAsync(scope.ServiceProvider, options, config, strategy, token).ConfigureAwait(false);
             },
             ct: ct).ConfigureAwait(false);
 
@@ -152,13 +284,13 @@ public static class BacktestRunner
         IServiceProvider scopedServices,
         BacktestOptions options,
         StrategyConfiguration config,
+        IStrategy strategy,
         CancellationToken ct)
     {
         var store = scopedServices.GetRequiredService<IHistoricalKlineStore>();
         var loggerFactory = scopedServices.GetRequiredService<ILoggerFactory>();
 
         var simulator = new BacktestSimulator(options, loggerFactory.CreateLogger<BacktestSimulator>());
-        IStrategy strategy = new SmaCrossoverStrategy();
 
         var engine = new BacktestEngine(
             store: store,
@@ -170,10 +302,10 @@ public static class BacktestRunner
         return await engine.RunAsync(options, config, Guid.NewGuid(), ct).ConfigureAwait(false);
     }
 
-    private static BacktestOptions BuildOptions(DateTime start, DateTime end, int warmup) => new()
+    private static BacktestOptions BuildOptions(Symbol symbol, KlineInterval interval, DateTime start, DateTime end, int warmup) => new()
     {
-        Symbol = BtcUsdt.BingXFormat,
-        Interval = DefaultInterval,
+        Symbol = symbol.BingXFormat,
+        Interval = interval,
         StartTime = start,
         EndTime = end,
         InitialBalance = InitialBalance,
@@ -182,17 +314,21 @@ public static class BacktestRunner
         WarmupBars = warmup,
     };
 
-    private static StrategyConfiguration BuildConfig(int fastPeriod, int slowPeriod, int warmupBars) =>
+    private static StrategyConfiguration BuildConfigFromParameters(
+        Symbol symbol, KlineInterval interval,
+        IReadOnlyDictionary<string, decimal> parameters, int warmupBars) =>
         StrategyConfiguration.Create(
-            symbol: BtcUsdt,
-            interval: DefaultInterval,
+            symbol: symbol,
+            interval: interval,
             leverage: Leverage.Conservative,
             maxKlineWindow: warmupBars,
-            parameters: new Dictionary<string, decimal>
-            {
-                ["FastSmaPeriod"] = fastPeriod,
-                ["SlowSmaPeriod"] = slowPeriod,
-            });
+            parameters: parameters);
+
+    private static IReadOnlyDictionary<string, decimal> DefaultSmaParameters() => new Dictionary<string, decimal>
+    {
+        ["FastSmaPeriod"] = 20m,
+        ["SlowSmaPeriod"] = 50m,
+    };
 
     // ================================================================
     // 輸出
@@ -213,6 +349,7 @@ public static class BacktestRunner
         Console.WriteLine($"  Return                  : {report.ReturnPercent,13:N2} %");
         Console.WriteLine($"  Peak equity      (USDT) : {report.PeakEquity,14:N4}");
         Console.WriteLine($"  Max drawdown            : {report.MaxDrawdownPercent,13:N2} %");
+        Console.WriteLine($"  Sharpe ratio (annualized): {report.SharpeRatio,13:N4}");
         Console.WriteLine("=====================================================");
         Console.WriteLine();
     }
