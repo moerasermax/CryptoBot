@@ -23,6 +23,7 @@ namespace CryptoBot.ConsoleApp.Services;
 ///   --interval &lt;1m|15m|1h|4h|1d&gt;  K 線週期（預設 1h）
 ///   --params Key=Val,Key=Val,...   策略參數（注入 StrategyConfiguration.Parameters）
 ///   --lookback-days &lt;N&gt;          資料窗回看天數（預設 30；CAP-004 hotfix）
+///   --end-date &lt;YYYY-MM-DD&gt;       資料窗結束日（UTC；預設 now；CAP-007 Walk-Forward IS/OOS 切片）
 /// 未帶任何 args → 沿用原 SmaCrossover 20/50 預設行為（向後相容）。
 ///
 /// 兩條路徑共用：<see cref="IHistoricalDataProvider"/> 下載 + <see cref="IHistoricalKlineStore"/> SQLite 快取。
@@ -50,9 +51,10 @@ public static class BacktestRunner
         var strategyType = ParseStrategyArg(args, rootServices) ?? DefaultStrategyType;
         var overrideParams = ParseParamsArg(args);
         var lookbackDays = ParseLookbackDaysArg(args) ?? LookbackDays;
+        var endDate = ParseEndDateArg(args) ?? DateTime.UtcNow;
 
         // 1) 先確保資料在 SQLite（單執行緒，避免下載期間撞 rate limit）
-        var (start, end) = await EnsureHistoricalDataAsync(rootServices, symbol, interval, lookbackDays, ct).ConfigureAwait(false);
+        var (start, end) = await EnsureHistoricalDataAsync(rootServices, symbol, interval, lookbackDays, endDate, ct).ConfigureAwait(false);
 
         // 2) 分支
         return optimize
@@ -173,17 +175,34 @@ public static class BacktestRunner
         return n;
     }
 
+    /// <summary>
+    /// CAP-007：解析 <c>--end-date &lt;YYYY-MM-DD&gt;</c>（資料窗結束日、UTC）。沒帶 → null
+    /// （呼叫端 fallback <see cref="DateTime.UtcNow"/>）。格式錯 → throw。
+    /// 用於 Walk-Forward IS/OOS 切片（QUANT-OPT § ⑤）— IS 用過去某日為 end、OOS 用 now 為 end。
+    /// </summary>
+    private static DateTime? ParseEndDateArg(string[] args)
+    {
+        var raw = GetArgValue(args, "--end-date");
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        if (!DateTime.TryParseExact(raw, "yyyy-MM-dd",
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                out var parsed))
+            throw new ArgumentException($"Invalid --end-date '{raw}': expected format yyyy-MM-dd.");
+        return parsed;
+    }
+
     // ================================================================
     // 下載階段
     // ================================================================
     private static async Task<(DateTime start, DateTime end)> EnsureHistoricalDataAsync(
-        IServiceProvider rootServices, Symbol symbol, KlineInterval interval, int lookbackDays, CancellationToken ct)
+        IServiceProvider rootServices, Symbol symbol, KlineInterval interval, int lookbackDays, DateTime endDate, CancellationToken ct)
     {
         using var scope = rootServices.CreateScope();
         var provider = scope.ServiceProvider.GetRequiredService<IHistoricalDataProvider>();
         var store = scope.ServiceProvider.GetRequiredService<IHistoricalKlineStore>();
 
-        var end = DateTime.UtcNow;
+        var end = endDate;
         var start = end.AddDays(-lookbackDays);
 
         Console.WriteLine();
