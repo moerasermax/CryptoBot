@@ -23,7 +23,7 @@ dotnet run --project src/CryptoBot.ConsoleApp
 
 ```json
 "Security": {
-  "AllowedIPs": [ "127.0.0.1", "::1", "192.168.0.99", "114.39.88.182" ]
+  "AllowedIPs": [ "127.0.0.1", "::1", "192.168.0.99", "YOUR_HOME_IP" ]
 }
 ```
 
