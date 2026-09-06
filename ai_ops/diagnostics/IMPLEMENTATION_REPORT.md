@@ -1004,7 +1004,7 @@ if (!isBacktest)
 #### T2. 白名單無需改動
 `IpWhitelistMiddleware.InvokeAsync` 本來就讀 `context.Connection.RemoteIpAddress`（L52）— `UseForwardedHeaders` 會**就地改寫**這個欄位，所以中介層邏輯不必動。
 
-`appsettings.json :: Security.AllowedIPs` 已保留 `127.0.0.1` + `::1`（dev 本機），加上 `192.168.0.99`、`114.39.88.182`（使用者自家 IP）。手機 / 公司 IP 的加入由使用者按指引自行編輯。
+`appsettings.json :: Security.AllowedIPs` 已保留 `127.0.0.1` + `::1`（dev 本機），加上 `192.168.0.99`、`YOUR_HOME_IP`（使用者自家 IP）。手機 / 公司 IP 的加入由使用者按指引自行編輯。
 
 #### T3. 啟動腳本 + 指引
 
